@@ -168,8 +168,8 @@ preserve ownership boundaries, and provide focused regression evidence.
 
 ## Releases
 
-Prebuilt Windows packages will be published through GitHub Releases.
-No repository URL, release version or download link is assigned by this preparation.
+No prebuilt binary release is currently published.
+Future Windows packages will be distributed through GitHub Releases.
 
 ## License and dependencies
 
