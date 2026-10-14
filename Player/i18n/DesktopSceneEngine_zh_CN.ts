@@ -2,7 +2,50 @@
 <!DOCTYPE TS>
 <TS version="2.1" language="zh_CN">
 <context>
+    <name>ApplicationCoordinator</name>
+    <message>
+        <source>Close All</source>
+        <translation>全部关闭</translation>
+    </message>
+    <message>
+        <source>Closing: %1</source>
+        <translation>正在关闭：%1</translation>
+    </message>
+    <message>
+        <source>Close outcome not confirmed: %1</source>
+        <translation>关闭结果尚未确认：%1</translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation>关闭</translation>
+    </message>
+    <message>
+        <source>Deploy</source>
+        <translation>部署</translation>
+    </message>
+    <message>
+        <source>Undeploy</source>
+        <translation>取消部署</translation>
+    </message>
+    <message>
+        <source>Show</source>
+        <translation>显示</translation>
+    </message>
+    <message>
+        <source>Launcher</source>
+        <translation>启动器</translation>
+    </message>
+    <message>
+        <source> — Disconnected</source>
+        <translation> — 已断开连接</translation>
+    </message>
+</context>
+<context>
     <name>MainWindow</name>
+    <message>
+        <source>Hide to System Tray</source>
+        <translation>隐藏到系统托盘</translation>
+    </message>
     <message>
         <source>Desktop Background</source>
         <translation>桌面背景</translation>
@@ -815,6 +858,10 @@ The source file will not be deleted.</source>
 </context>
 <context>
     <name>LauncherWindow</name>
+    <message>
+        <source>Hide to System Tray</source>
+        <translation>隐藏到系统托盘</translation>
+    </message>
     <message>
         <source>DesktopSceneEngine Launcher</source>
         <translation>DesktopSceneEngine 启动器</translation>

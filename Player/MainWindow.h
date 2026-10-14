@@ -15,6 +15,8 @@
 #include "TimelinePreviewSource.h"
 #include "TimelinePreviewWorker.h"
 #include "WorkspaceModel.h"
+#include "SessionPresentation.h"
+#include "DesktopDeployment.h"
 
 #include <QMainWindow>
 #include <QHash>
@@ -83,6 +85,10 @@ public:
     [[nodiscard]] bool initializeEngine();
 
     void setAcceptedCloseCallback(std::function<void()> callback) { acceptedCloseCallback_ = std::move(callback); }
+    DesktopSceneEngine::Player::SessionPresentation& trayPresentation() { return trayPresentation_; }
+    [[nodiscard]] DesktopSceneEngine::Player::DesktopDeploymentProjection desktopDeploymentProjection() const;
+    [[nodiscard]] DesktopSceneEngine::Player::DesktopDeploymentResult requestDesktopDeployment(
+        DesktopSceneEngine::Player::DesktopDeploymentIntent intent);
 
 protected:
 
@@ -104,6 +110,8 @@ private:
     friend class MainWindowPlaybackSequenceTestAccess;
     friend class MainWindowDesktopPresentationTestAccess;
     std::function<void()> acceptedCloseCallback_;
+    DesktopSceneEngine::Player::SessionPresentation trayPresentation_{*this};
+    QToolButton* hideToTrayButton_ = nullptr;
 
     class RenderWidget;
     class TimelineHoverPopup;

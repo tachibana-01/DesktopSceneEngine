@@ -565,6 +565,7 @@ MainWindow::MainWindow(
 
 MainWindow::~MainWindow()
 {
+    trayPresentation_.beginTeardown();
     workspaceModel_.setAuthoredChangedCallback({});
     shutdownEngine();
     closeAllBackgroundMusicWindows();
@@ -851,6 +852,7 @@ void MainWindow::updateDocumentTitle()
 
 MainWindow::UnsavedChangesChoice MainWindow::promptForUnsavedChanges()
 {
+    trayPresentation_.surfaceCloseInteraction(); // Only a tray Close that actually needs interaction surfaces its hidden owner.
     const QMessageBox::StandardButton button = QMessageBox::warning(
         this,
         tr("Unsaved Changes"),
@@ -1083,6 +1085,18 @@ void MainWindow::createWorkspace()
     auto* layout = new QVBoxLayout(central);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
+
+    auto* presentationRow = new QHBoxLayout();
+    presentationRow->setContentsMargins(4, 2, 4, 2);
+    presentationRow->addStretch();
+    hideToTrayButton_ = new QToolButton(central);
+    hideToTrayButton_->setObjectName(QStringLiteral("sessionHideToTray"));
+    hideToTrayButton_->setText(QString::fromUtf8("⌄"));
+    hideToTrayButton_->setAutoRaise(true);
+    hideToTrayButton_->setMinimumSize(28, 24);
+    presentationRow->addWidget(hideToTrayButton_);
+    layout->addLayout(presentationRow);
+    trayPresentation_.bindButton(*hideToTrayButton_);
 
     workspaceSplitter_ = new QSplitter(Qt::Horizontal, central);
     workspaceSplitter_->setChildrenCollapsible(false);
@@ -1432,17 +1446,38 @@ bool MainWindow::hasDesktopPresentation() const noexcept
 void MainWindow::updateDesktopDeploymentButton()
 {
     if (deployDisplayButton_ == nullptr) return;
-    const bool retained = hasDesktopPresentation();
-    const bool deployedOrDesired = retained || desktopDeploymentDesired_;
-    deployDisplayButton_->setText(deployedOrDesired ? tr("Undeploy") : tr("Deploy"));
-    deployDisplayButton_->setEnabled(engineInitialized_ && !desktopReplacementInProgress_
-        && (deployedOrDesired || displaySelection_.boundDisplay().has_value()));
+    const auto projection = desktopDeploymentProjection();
+    deployDisplayButton_->setText(projection.retained ? tr("Undeploy") : tr("Deploy"));
+    deployDisplayButton_->setEnabled(projection.retained ? projection.canUndeploy : projection.canDeploy);
 }
 
 void MainWindow::toggleDesktopDeployment()
 {
-    if (!engineInitialized_ || desktopReplacementInProgress_) return;
-    if (desktopDeploymentDesired_ || hasDesktopPresentation())
+    using DesktopSceneEngine::Player::DesktopDeploymentIntent;
+    (void)requestDesktopDeployment(desktopDeploymentProjection().retained
+        ? DesktopDeploymentIntent::Undeploy : DesktopDeploymentIntent::Deploy);
+}
+
+DesktopSceneEngine::Player::DesktopDeploymentProjection MainWindow::desktopDeploymentProjection() const
+{
+    const bool retained = desktopDeploymentDesired_ || hasDesktopPresentation();
+    const bool ready = engineInitialized_ && !desktopReplacementInProgress_
+        && !trayPresentation_.closePending() && !trayPresentation_.ending();
+    return {retained, ready && (retained || displaySelection_.boundDisplay().has_value()), ready};
+}
+
+DesktopSceneEngine::Player::DesktopDeploymentResult MainWindow::requestDesktopDeployment(
+    DesktopSceneEngine::Player::DesktopDeploymentIntent intent)
+{
+    using DesktopSceneEngine::Player::DesktopDeploymentIntent;
+    using DesktopSceneEngine::Player::DesktopDeploymentResult;
+    const auto projection = desktopDeploymentProjection();
+    if (!engineInitialized_ || desktopReplacementInProgress_ || trayPresentation_.closePending()
+        || trayPresentation_.ending()) return DesktopDeploymentResult::Rejected;
+    if ((intent == DesktopDeploymentIntent::Deploy) == projection.retained)
+        return DesktopDeploymentResult::AlreadySatisfied;
+    bool completed = false;
+    if (intent == DesktopDeploymentIntent::Undeploy)
     {
         // Cancel intent BEFORE detach/destroy, including any queued or recursive
         // native notification. Failed detach retains the borrowed HWND and ID.
@@ -1450,15 +1485,19 @@ void MainWindow::toggleDesktopDeployment()
         cancelDesktopPresentationReconciliation();
         {
             QScopedValueRollback<bool> removing(desktopReplacementInProgress_, true);
-            (void)removeDesktopPresentation();
+            completed = removeDesktopPresentation();
         }
     }
     else
     {
+        refreshDisplaySelection(); // Target-local fresh exact-bound capability, not the tray's cached projection.
+        if (!displaySelection_.boundDisplay().has_value()) return DesktopDeploymentResult::Rejected;
         desktopDeploymentDesired_ = true;
-        if (!reconcileDesktopPresentation(false)) desktopDeploymentDesired_ = false;
+        completed = reconcileDesktopPresentation(false);
+        if (!completed) desktopDeploymentDesired_ = false;
     }
     updateDesktopDeploymentButton();
+    return completed ? DesktopDeploymentResult::Completed : DesktopDeploymentResult::Failure;
 }
 
 void MainWindow::identifyBoundDisplay()
@@ -4105,6 +4144,8 @@ void MainWindow::selectCanvasOutsideMode(CanvasOutsideMode mode)
 
 void MainWindow::retranslateUi()
 {
+    hideToTrayButton_->setToolTip(tr("Hide to System Tray"));
+    hideToTrayButton_->setAccessibleName(tr("Hide to System Tray"));
     updateDocumentTitle();
 
     if (fileMenu_ != nullptr)
@@ -5580,6 +5621,7 @@ void MainWindow::closeAfterDecision(
     QMainWindow::closeEvent(event);
     if (event->isAccepted())
     {
+        trayPresentation_.beginTeardown();
         if (acceptedCloseCallback_) acceptedCloseCallback_();
         shutdownEngine();
         closeAllBackgroundMusicWindows();

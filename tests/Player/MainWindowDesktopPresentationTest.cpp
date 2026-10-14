@@ -1,4 +1,7 @@
 #include "MainWindow.h"
+#include "ApplicationCoordinator.h"
+#include "LauncherWindow.h"
+#include "BackgroundMusicWindow.h"
 #include "MainWindowTestDisplay.h"
 #include "CanvasChromeFrame.h"
 #include "Infrastructure/Persistence/ProjectFile.h"
@@ -13,11 +16,22 @@
 #include <QDoubleSpinBox>
 #include <QFile>
 #include <QImage>
+#include <QElapsedTimer>
+#include <QThread>
+#include <QPixmap>
 #include <QLabel>
 #include <QScopedValueRollback>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QTemporaryDir>
 #include <QToolButton>
+#include <QSettings>
+#include <QtEndian>
+#include <QProcess>
+#include <QAbstractNativeEventFilter>
+#include <QMessageBox>
+#include <QFileDialog>
+#include <QAbstractButton>
 #include <Windows.h>
 #include <dxgi.h>
 #include <algorithm>
@@ -25,6 +39,33 @@
 #include <iostream>
 #include <memory>
 #include <vector>
+
+class ApplicationCoordinatorTestAccess
+{
+public:
+    static QMenu& menu(DesktopSceneEngine::Player::ApplicationCoordinator& c) { return c.trayMenu_; }
+    static QLocalSocket& control(DesktopSceneEngine::Player::SessionCoordinatorJoin& j) { return j.socket_; }
+    static QUuid epoch(DesktopSceneEngine::Player::SessionCoordinatorJoin& j) { return j.coordinatorEpoch_; }
+    static quint64 revision(DesktopSceneEngine::Player::SessionCoordinatorJoin& j) { return j.deploymentRevision_; }
+    static void click(DesktopSceneEngine::Player::ApplicationCoordinator& c)
+    { QMetaObject::invokeMethod(&c.tray_, "activated", Qt::DirectConnection, Q_ARG(QSystemTrayIcon::ActivationReason, QSystemTrayIcon::Trigger)); }
+    static bool allDone(DesktopSceneEngine::Player::ApplicationCoordinator& c) { return c.showAllSnapshot_.empty(); }
+    static void icon(DesktopSceneEngine::Player::ApplicationCoordinator& c, QIcon icon)
+    { c.tray_.setIcon(std::move(icon)); c.updateTray(); }
+    static void observe(DesktopSceneEngine::Player::ApplicationCoordinator& c, QByteArray& frames)
+    {
+        QObject::connect(&c.server_, &QLocalServer::newConnection, &c, [&c, &frames] {
+            for (auto* socket : c.findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
+                if (!socket->property("s5Observed").toBool())
+                {
+                    socket->setProperty("s5Observed", true);
+                    QObject::connect(socket, &QLocalSocket::readyRead, &c, [socket, &frames] {
+                        if (socket->property("sessionControl").toBool()) frames += socket->peek(socket->bytesAvailable());
+                    }); // Registered before the real control consumer; never consumes or manufactures a reply.
+                }
+        });
+    }
+};
 
 class MainWindowDesktopPresentationTestAccess
 {
@@ -84,6 +125,13 @@ public:
     static void pause(MainWindow& window) { window.togglePlaybackPause(); }
     static void next(MainWindow& window) { window.navigateScene(false); }
     static auto& model(MainWindow& window) { return window.workspaceModel_; }
+    static const auto& document(const MainWindow& window) { return window.documentState_; }
+    static void cleanDocument(MainWindow& window)
+    { window.documentState_.markClean(window.workspaceModel_.authoredRevision()); window.updateDocumentTitle(); }
+    static void documentPath(MainWindow& window, const QString& path)
+    { window.documentState_.currentPath = std::filesystem::path(path.toStdWString()); window.updateDocumentTitle(); }
+    static auto* bgm(MainWindow& window, DesktopSceneEngine::Player::PlaylistId id)
+    { return window.openBackgroundMusicWindow(id); }
     static void newDocument(MainWindow& window) { window.createNewDocument(); }
     static bool load(MainWindow& window, const std::filesystem::path& path)
     {
@@ -133,6 +181,12 @@ public:
         sendNative(window, taskbar);
         QCoreApplication::processEvents();
     }
+};
+
+class LauncherWindowTestAccess
+{
+public:
+    static void settings(DesktopSceneEngine::Player::LauncherWindow& window) { window.openSettings(); }
 };
 
 namespace DesktopSceneEngine::Rendering
@@ -393,6 +447,1032 @@ bool previewHealthy(MainWindow& window)
     return Access::engine(window).isInitialized() && preview.isValid()
         && !gpu.presentationTargetInfo(preview).failed
         && gpu.presentationTargetDiagnosticsForTesting(preview).presentAttemptCount == before + 1;
+}
+
+bool verifyTrayDeployment(Player::ApplicationTranslationState& translation)
+{
+    using namespace Player;
+    CreationControl control;
+    const auto scope = *currentInteractiveInstanceScope();
+    const auto launcherSlot = *InstanceSlot::fromProcessMode(LauncherProcessMode{}, scope);
+    const auto sessionSlot = *InstanceSlot::fromProcessMode(DisplaySessionProcessMode{control.shell.display.id}, scope);
+    InstanceAdmissionLease launcherLease, sessionLease;
+    if (launcherLease.acquire(launcherSlot) != InstanceAdmissionOutcome::Acquired
+        || sessionLease.acquire(sessionSlot) != InstanceAdmissionOutcome::Acquired) return false;
+    InstanceActivationEndpoint launcherActivation(launcherSlot), sessionActivation(sessionSlot);
+    if (!launcherActivation.listen() || !sessionActivation.listen()) return false;
+    QPixmap icon(16, 16); icon.fill(Qt::green); QApplication::setWindowIcon(QIcon(icon));
+    ApplicationCoordinator coordinator(launcherSlot, launcherActivation, true, [] {});
+    if (!coordinator.listen()) return false;
+    MainWindow window{control.shell.display.id, translation};
+    control.install(window);
+    if (!initializeDeployed(window)) return false;
+    QTemporaryDir mediaFiles;
+    QImage image(64, 40, QImage::Format_RGBA8888); image.fill(Qt::green);
+    const auto mediaPath = mediaFiles.filePath("tray-deployed.png");
+    auto& model = Access::model(window);
+    const auto playlist = model.addPlaylist();
+    if (!image.save(mediaPath)) return false;
+    const auto item = model.addItem(playlist, WorkspaceMediaType::Image, mediaPath);
+    if (!item || !model.setImageDisplayDuration(*item, 30) || !Access::start(window, playlist, *item)) return false;
+    Access::pause(window);
+    if (!Access::engine(window).seek(7)) return false;
+    sessionActivation.bindReadyRole(window, [&] { (void)window.trayPresentation().restore(); });
+    SessionCoordinatorJoin join(sessionSlot, launcherSlot);
+    join.enableControl(window.trayPresentation()); join.start(window, false);
+    const auto wait = [](const std::function<bool()>& condition) {
+        QElapsedTimer time; time.start();
+        while (!condition() && time.elapsed() < 5000) { QCoreApplication::processEvents(); QThread::msleep(5); }
+        return condition();
+    };
+    if (!wait([&] { return join.qualified(); })) return false;
+    auto& engine = Access::engine(window);
+    const auto preview = Access::preview(window), desktop = Access::desktop(window);
+    const auto host = Access::host(window).nativeHandle();
+    const auto revision = Access::model(window).authoredRevision();
+    const auto canvas = Access::model(window).desktopCanvas().aspectRatio;
+    const auto scene = Gpu::scene(engine), playback = Gpu::playback(engine), media = Gpu::media(engine);
+    const auto renderer = &backend(window);
+    const auto position = engine.playbackTime();
+    const bool desired = Access::desired(window), continuation = Access::continuationArmed(window);
+    auto* button = window.findChild<QToolButton*>("sessionHideToTray");
+    if (!button || !button->isEnabled()) return false;
+    button->click();
+    if (!wait([&] { return !window.isVisible(); })) return false;
+    Access::native(window, false); // Existing desktop reconciliation while Hidden; no Explorer restart.
+    if (!require(!window.isVisible() && previewHealthy(window) && Access::preview(window) == preview
+        && Access::desktop(window) == desktop && Access::host(window).nativeHandle() == host
+        && Access::desired(window) == desired && Access::continuationArmed(window) == continuation
+        && Access::model(window).authoredRevision() == revision && Access::model(window).desktopCanvas().aspectRatio == canvas
+        && Gpu::scene(engine) == scene && Gpu::playback(engine) == playback && Gpu::media(engine) == media
+        && &backend(window) == renderer && backend(window).presentationTargetCountForTesting() == 2,
+        "S2 Hidden retains both actual GPU targets/host/intent/recovery/Canvas/runtime; Preview remains healthy")) return false;
+    coordinator.showSession(join.incarnation());
+    if (!wait([&] { return window.isVisible(); })) return false;
+    if (!require(Access::desktop(window) == desktop && Access::host(window).nativeHandle() == host
+        && Access::preview(window) == preview && Access::desired(window) && control.attempts == 1
+        && engine.isPaused() && engine.playbackTime() == position && model.activeItemId() == item
+        && previewHealthy(window), "S2 Show restores the same deployed endpoint without reconstruction")) return false;
+    join.stop(); sessionActivation.beginShutdown(); Access::shutdown(window);
+    return require(!Access::engine(window).isInitialized() && !Access::host(window).isValid()
+        && control.shell.intact(), "Test-owned desktop endpoint tears down safely; real Explorer untouched");
+}
+
+bool verifyTrayDeploymentControl(Player::ApplicationTranslationState& translation, const QString& scenario)
+{
+    using namespace Player;
+    CreationControl control;
+    const auto scope = *currentInteractiveInstanceScope();
+    const auto launcherSlot = *InstanceSlot::fromProcessMode(LauncherProcessMode{}, scope);
+    const auto sessionSlot = *InstanceSlot::fromProcessMode(DisplaySessionProcessMode{control.shell.display.id}, scope);
+    InstanceAdmissionLease launcherLease, sessionLease;
+    if (!require(launcherLease.acquire(launcherSlot) == InstanceAdmissionOutcome::Acquired
+            && sessionLease.acquire(sessionSlot) == InstanceAdmissionOutcome::Acquired, "S4 native admission prerequisite")) return false;
+    InstanceActivationEndpoint launcherActivation(launcherSlot), sessionActivation(sessionSlot);
+    if (!launcherActivation.listen() || !sessionActivation.listen()) return false;
+    QPixmap icon(16, 16); icon.fill(Qt::green); QApplication::setWindowIcon(QIcon(icon));
+    QTemporaryDir files;
+    QSettings settings(files.filePath("preferences.ini"), QSettings::IniFormat);
+    ApplicationPreferencesStore preferences(settings);
+    ApplicationCoordinator coordinator(launcherSlot, launcherActivation, false, [] {});
+    if (!coordinator.listen()) return false;
+    coordinator.setLauncherFactory([&] {
+        auto* launcher = new LauncherWindow(translation, preferences);
+        launcher->setAcceptedCloseCallback([&, launcher] { coordinator.retireLauncher(*launcher); }); return launcher;
+    });
+    if (!coordinator.showLauncher()) return false;
+    MainWindow window{control.shell.display.id, translation};
+    control.install(window);
+    if (!require(control.shell.valid && control.shell.intact() && initialize(window), "S4 test-owned shell/Engine ready")) return false;
+    sessionActivation.bindReadyRole(window, [&] { (void)window.trayPresentation().restore(); });
+    SessionCoordinatorJoin join(sessionSlot, launcherSlot);
+    join.enableControl(window.trayPresentation());
+    join.enableDesktopDeployment([&] { return window.desktopDeploymentProjection(); },
+        [&](DesktopDeploymentIntent intent) { return window.requestDesktopDeployment(intent); });
+    join.start(window, false);
+    const auto wait = [](const std::function<bool()>& condition) {
+        QElapsedTimer time; time.start();
+        while (!condition() && time.elapsed() < 5000) { QCoreApplication::processEvents(); QThread::msleep(5); }
+        return condition();
+    };
+    if (!require(wait([&] { return join.qualified(); }) && coordinator.sessionCount() == 1, "S4 actual native control qualified")) return false;
+    const auto action = [&]() -> QAction* {
+        for (auto* entry : ApplicationCoordinatorTestAccess::menu(coordinator).actions())
+            if (entry->data().toUuid() == join.incarnation() && entry->menu()->actions().size() > 1)
+                return entry->menu()->actions()[1];
+        return nullptr;
+    };
+    if (!require(wait([&] { return action() && action()->isEnabled(); }),
+        "S4 RED A: actual Session submenu must expose deployment capability action")) return false;
+    const auto hwnd = window.winId(); const auto incarnation = join.incarnation();
+    QTemporaryDir content;
+    QImage image(80, 50, QImage::Format_RGBA8888); image.fill(Qt::green);
+    const auto file = content.filePath("s4.png");
+    auto& model = Access::model(window); auto& engine = Access::engine(window);
+    const auto playlist = model.addPlaylist();
+    if (!image.save(file)) return false;
+    const auto item = model.addItem(playlist, WorkspaceMediaType::Image, file);
+    if (!item || !model.setImageDisplayDuration(*item, 30) || !Access::start(window, playlist, *item)) return false;
+    Access::pause(window); if (!engine.seek(7)) return false;
+    const auto authoredRevision = model.authoredRevision(); const auto preview = Access::preview(window);
+    const auto canvas = model.desktopCanvas().aspectRatio;
+    const bool dirty = Access::document(window).isDirty(model.authoredRevision());
+    const auto projectPath = Access::document(window).currentPath;
+    const auto scene = Gpu::scene(engine), clock = Gpu::playback(engine), media = Gpu::media(engine);
+    const auto statePreserved = [&] {
+        return window.winId() == hwnd && join.incarnation() == incarnation && model.authoredRevision() == authoredRevision
+            && Access::document(window).isDirty(model.authoredRevision()) == dirty && Access::document(window).currentPath == projectPath
+            && model.desktopCanvas().aspectRatio == canvas && model.activeItemId() == item
+            && Access::bound(window) == control.shell.display.id && Access::preview(window) == preview
+            && Gpu::scene(engine) == scene && Gpu::playback(engine) == clock && Gpu::media(engine) == media
+            && engine.isPaused() && engine.playbackTime() == 7;
+    };
+    QPointer<QAction> staleDeploy = action();
+    if (scenario == "hidden" || scenario == "failure" || scenario == "disconnect-flight" || scenario == "loss")
+    {
+        window.findChild<QToolButton*>("sessionHideToTray")->click();
+        if (!require(wait([&] { return !window.isVisible(); }), "S4 real Hidden prerequisite")) return false;
+    }
+    if (scenario == "minimized") window.showMinimized();
+    bool hiddenBefore = !window.isVisible(); const bool minimizedBefore = window.isMinimized();
+    if (scenario == "stale" || scenario == "disconnected")
+    {
+        if (!require(Access::clickDeploymentButton(window) && Access::desktop(window).isValid(), "S4 real local deployment prerequisite")) return false;
+        if (scenario == "disconnected")
+        {
+            control.missing = true; Access::native(window, false);
+            if (!require(Access::desired(window) && !Access::desktop(window).isValid() && Access::button(window, "Undeploy"), "S4 unresolved retained-intent prerequisite")) return false;
+        }
+    }
+    const char* red = scenario == "menu" ? "S4 RED A: actual Session submenu must expose deployment capability action"
+        : scenario == "visible" ? "S4 RED B: actual tray Deploy must attach the existing Session desktop endpoint"
+        : scenario == "hidden" ? "S4 RED C: real Hidden Session requires tray Deploy/Undeploy without Show"
+        : scenario == "stale" ? "S4 RED D: stale menu must dispatch explicit Deploy, never reverse current intent"
+        : "S4 RED E: disconnected retained intent must project actionable Undeploy";
+    if (!require((scenario == "stale" ? staleDeploy.data() : action()) != nullptr, red)) return false;
+    const auto finished = [&](DesktopDeploymentResult expected) {
+        return wait([&] { return coordinator.sessionDeploymentResult(incarnation) == expected; });
+    };
+    const auto publish = [&] { join.publishDesktopDeployment(); return wait([&] {
+        return action() && action()->text() == QCoreApplication::translate("ApplicationCoordinator", Access::desired(window)
+            || Access::desktop(window).isValid() || Access::host(window).nativeHandle() ? "Undeploy" : "Deploy"); }); };
+    if (scenario == "menu")
+    {
+        QList<QAction*> entries;
+        for (auto* entry : ApplicationCoordinatorTestAccess::menu(coordinator).actions())
+            if (entry->menu()) entries.push_back(entry); // S6 adds top-level actions; S4 still verifies role topology.
+        if (!require(entries.size() == 2 && entries[0]->menu()->actions().size() == 3
+            && entries[0]->menu()->actions()[1]->isSeparator()
+            && action()->text() == QCoreApplication::translate("ApplicationCoordinator", "Deploy"), "S4 deployment remains Session-only within S5 Show/separator/Close menus")) return false;
+    }
+    if (scenario == "stale")
+    {
+        staleDeploy->trigger();
+        if (!require(finished(DesktopDeploymentResult::AlreadySatisfied) && control.attempts == 1
+            && Access::desktop(window).isValid() && Access::desired(window), "S4 stale Deploy is AlreadySatisfied, never Toggle")) return false;
+    }
+    else if (scenario == "disconnected")
+    {
+        if (!publish() || !require(action()->isEnabled(), "S4 retained disconnected intent can Undeploy")) return false;
+        action()->trigger();
+        if (!require(finished(DesktopDeploymentResult::Completed) && !Access::desired(window)
+            && !Access::continuationArmed(window), "S4 Undeploy cancels real unresolved recovery intent")) return false;
+        if (!publish() || !require(!action()->isEnabled(), "S4 unresolved Deploy disabled by local capability")) return false;
+        coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Deploy);
+        if (!require(finished(DesktopDeploymentResult::Rejected) && control.attempts == 2, "S4 fresh local capability rejects unresolved Deploy")) return false;
+    }
+    else if (scenario == "failure")
+    {
+        control.forcedStatus = DesktopPresentationHostStatus::NativeFailure;
+        action()->trigger();
+        if (!require(finished(DesktopDeploymentResult::Failure) && control.attempts == 1 && !Access::desired(window)
+            && !Access::desktop(window).isValid() && !window.isVisible(), "S4 host failure is terminal, no Show or retry")) return false;
+        Access::native(window, true); QCoreApplication::processEvents();
+        if (!require(control.attempts == 1, "S4 failed initial Deploy has no retained retry authority")) return false;
+    }
+    else if (scenario == "showall")
+    {
+        action()->trigger(); ApplicationCoordinatorTestAccess::click(coordinator);
+        if (!require(finished(DesktopDeploymentResult::Completed)
+            && wait([&] { return ApplicationCoordinatorTestAccess::allDone(coordinator); })
+            && Access::desktop(window).isValid() && control.attempts == 1, "S4 independent Show All and Deploy do not toggle or duplicate endpoint")) return false;
+        coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Undeploy);
+        if (!finished(DesktopDeploymentResult::Completed)) return false;
+    }
+    else if (scenario == "rapid")
+    {
+        action()->trigger();
+        coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Undeploy);
+        if (!require(finished(DesktopDeploymentResult::Completed) && control.attempts == 1 && !Access::desired(window)
+            && !Access::desktop(window).isValid() && !Access::host(window).nativeHandle(), "S4 fresh Deploy immediately followed by explicit Undeploy executes each desired intent once")) return false;
+    }
+    else if (scenario == "loss")
+    {
+        action()->trigger(); join.stop();
+        if (!require(wait([&] { return window.isVisible() && !action()->isEnabled(); })
+            && control.attempts <= 1 && engine.isInitialized(), "S4 control loss safely surfaces through eligibility, not deployment, without retry")) return false;
+        hiddenBefore = false;
+    }
+    else if (scenario == "unavailable" || scenario == "unavailable-flight")
+    {
+        QLocalSocket* nativePeer = nullptr;
+        std::unique_ptr<QSignalBlocker> blockedReply;
+        if (scenario == "unavailable-flight")
+        {
+            for (auto* socket : coordinator.findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
+                if (socket->property("sessionControl").toBool()) nativePeer = socket;
+            if (!require(nativePeer, "S4 actual authenticated socket for held deployment reply")) return false;
+            blockedReply = std::make_unique<QSignalBlocker>(nativePeer);
+        }
+        action()->trigger();
+        if (blockedReply)
+        {
+            if (!require(wait([&] {
+                const auto bytes = nativePeer->peek(nativePeer->bytesAvailable());
+                for (qsizetype offset = 0; offset + 42 <= bytes.size(); offset += 42)
+                    if (bytes[offset] == 'F' && bytes[offset + 41] == static_cast<char>(DesktopDeploymentResult::Completed)) return true;
+                return false;
+            }), "S4 hold a genuine target Completed frame, not a fabricated success ACK")) return false;
+        }
+        else if (!require(finished(DesktopDeploymentResult::Completed), "S4 real previous Deploy completed")) return false;
+        const auto target = Access::desktop(window); const auto host = Access::host(window).nativeHandle();
+        if (!require(target.isValid() && host && control.attempts == 1, "S4 real endpoint exists before recovery becomes unavailable")) return false;
+        ApplicationCoordinatorTestAccess::icon(coordinator, {}); // Actual tray capability loss, not a mocked deployment result.
+        coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Undeploy);
+        if (!require(coordinator.sessionDeploymentResult(incarnation) == DesktopDeploymentResult::Unavailable,
+            "S4 P2 RED: new unavailable intent cannot retain the previous request's result")) return false;
+        if (blockedReply)
+        {
+            blockedReply.reset();
+            QMetaObject::invokeMethod(nativePeer, "readyRead", Qt::DirectConnection); // Consume genuine buffered target frames.
+            if (!require(coordinator.sessionDeploymentResult(incarnation) == DesktopDeploymentResult::Unavailable,
+                "S4 older real Completed must not overwrite the newer unavailable request")) return false;
+        }
+        QCoreApplication::processEvents();
+        if (!require(Access::desktop(window) == target && Access::host(window).nativeHandle() == host
+            && Access::desired(window) && control.attempts == 1 && !action()->isEnabled()
+            && action()->text() == QCoreApplication::translate("ApplicationCoordinator", "Undeploy"),
+            "S4 unavailable request sends nothing, preserves retained endpoint/projection, and does not retry")) return false;
+        ApplicationCoordinatorTestAccess::icon(coordinator, QApplication::windowIcon());
+        coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Undeploy);
+        if (!require(finished(DesktopDeploymentResult::Completed) && !Access::desktop(window).isValid()
+            && !Access::host(window).nativeHandle() && !Access::desired(window), "S4 subsequent available explicit Undeploy remains operational")) return false;
+    }
+    else
+    {
+        if (scenario == "disconnect-flight") control.missing = true; // Actual target changes after menu but before delivery.
+        action()->trigger();
+        if (scenario == "disconnect-flight")
+        {
+            if (!require(finished(DesktopDeploymentResult::Rejected) && control.attempts == 0
+                && !window.isVisible(), "S4 in-flight disconnect locally rejects stale Deploy without Show")) return false;
+        }
+        else
+        {
+            if (scenario == "busy")
+            {
+                const auto creator = Access::creator(window);
+                Access::creator(window) = [&, creator](DesktopPresentationHost& host, const DisplayId& id) {
+                    if (!require(window.requestDesktopDeployment(DesktopDeploymentIntent::Undeploy) == DesktopDeploymentResult::Rejected,
+                        "S4 existing replacement guard rejects reentrant opposite intent without queue")) return DesktopPresentationHostStatus::NativeFailure;
+                    return creator(host, id);
+                };
+            }
+            if (!require(finished(DesktopDeploymentResult::Completed) && Access::desktop(window).isValid()
+                && Access::desired(window) && control.attempts == 1, "S4 RED B/C: real tray Deploy creates one actual endpoint")) return false;
+            const auto target = Access::desktop(window); const auto host = Access::host(window).nativeHandle();
+            coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Deploy);
+            if (!require(finished(DesktopDeploymentResult::AlreadySatisfied) && Access::desktop(window) == target
+                && Access::host(window).nativeHandle() == host && control.attempts == 1, "S4 repeated explicit Deploy keeps the same endpoint")) return false;
+            if (!publish()) return false;
+            if (scenario == "translation")
+            {
+                Access::language(window, UiLanguage::SimplifiedChinese);
+                if (!publish() || !require(action()->text() == QString::fromUtf8("取消部署"), "S4 actual translated Undeploy menu")) return false;
+            }
+            if (scenario == "revision")
+            {
+                QByteArray frame(1, 'T'); frame += ApplicationCoordinatorTestAccess::epoch(join).toRfc4122(); frame += incarnation.toRfc4122();
+                const auto offset = frame.size(); frame.resize(offset + 8); qToBigEndian<quint64>(1, frame.data() + offset); frame += char{6};
+                if (!require(ApplicationCoordinatorTestAccess::revision(join) > 1, "S4 actual projection revision advanced")) return false;
+                QLocalSocket* nativePeer = nullptr;
+                for (auto* socket : coordinator.findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
+                    if (socket->property("sessionControl").toBool()) nativePeer = socket;
+                if (!require(nativePeer, "S4 real authenticated server-side socket")) return false;
+                bool consumed = false;
+                const auto observed = QObject::connect(nativePeer, &QLocalSocket::readyRead, &coordinator, [&] { consumed = true; });
+                ApplicationCoordinatorTestAccess::control(join).write(frame); ApplicationCoordinatorTestAccess::control(join).flush();
+                if (!require(wait([&] { return consumed; }), "S4 stale frame consumed by real server handler before assertion")) return false;
+                QObject::disconnect(observed);
+                if (!require(action()->text() == QCoreApplication::translate("ApplicationCoordinator", "Undeploy"), "S4 stale revision cannot rewind retained projection")) return false;
+            }
+            if (scenario == "detach")
+            {
+                QScopedValueRollback<bool> rejection(Gpu::initialized(engine), false);
+                action()->trigger();
+                if (!require(finished(DesktopDeploymentResult::Failure) && !Access::desired(window)
+                    && Access::desktop(window) == target && Access::host(window).nativeHandle() == host, "S4 detach failure retains borrowed HWND/target, not false completion")) return false;
+            }
+            if (!publish()) return false;
+            if (scenario == "sequential")
+            {
+                coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Deploy);
+                coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Undeploy);
+            }
+            else action()->trigger();
+            if (!require(finished(DesktopDeploymentResult::Completed) && !Access::desired(window)
+                && !Access::desktop(window).isValid() && !Access::host(window).nativeHandle(), "S4 actual tray Undeploy removes endpoint without Show")) return false;
+            coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Undeploy);
+            if (!require(finished(DesktopDeploymentResult::AlreadySatisfied) && control.attempts == 1, "S4 repeated explicit Undeploy is no-op")) return false;
+        }
+    }
+    if (!require(statePreserved() && (!window.isVisible()) == hiddenBefore && window.isMinimized() == minimizedBefore
+        && previewHealthy(window), "S4 Project/dirty/Canvas/playback/runtime/DisplayId/presentation preserved")) return false;
+    join.stop(); sessionActivation.beginShutdown(); Access::shutdown(window);
+    if (scenario == "translation") Access::language(window, UiLanguage::English);
+    return require(control.shell.intact(), "S4 test-owned shell stays healthy; Explorer untouched");
+}
+
+class S5WindowObservation final : public QObject
+{
+public:
+    int closes = 0, shows = 0;
+    bool eventFilter(QObject*, QEvent* event) override
+    {
+        if (event->type() == QEvent::Close) ++closes;
+        if (event->type() == QEvent::Show) ++shows;
+        return false;
+    }
+};
+
+bool verifyTrayClose(Player::ApplicationTranslationState& translation, const QString& scenario)
+{
+    using namespace Player;
+    CreationControl control;
+    const auto scope = *currentInteractiveInstanceScope();
+    const auto launcherSlot = *InstanceSlot::fromProcessMode(LauncherProcessMode{}, scope);
+    const auto sessionSlot = *InstanceSlot::fromProcessMode(DisplaySessionProcessMode{control.shell.display.id}, scope);
+    InstanceAdmissionLease launcherLease, sessionLease;
+    if (launcherLease.acquire(launcherSlot) != InstanceAdmissionOutcome::Acquired
+        || sessionLease.acquire(sessionSlot) != InstanceAdmissionOutcome::Acquired) return false;
+    InstanceActivationEndpoint launcherActivation(launcherSlot), sessionActivation(sessionSlot);
+    if (!launcherActivation.listen() || !sessionActivation.listen()) return false;
+    QPixmap icon(16, 16); icon.fill(Qt::green); QApplication::setWindowIcon(QIcon(icon));
+    QTemporaryDir files;
+    QSettings settings(files.filePath("preferences.ini"), QSettings::IniFormat);
+    ApplicationPreferencesStore preferences(settings);
+    QByteArray observedFrames;
+    ApplicationCoordinator coordinator(launcherSlot, launcherActivation, false, [] {});
+    if (!coordinator.listen()) return false;
+    ApplicationCoordinatorTestAccess::observe(coordinator, observedFrames);
+    coordinator.setLauncherFactory([&] {
+        auto* launcher = new LauncherWindow(translation, preferences);
+        launcher->setAcceptedCloseCallback([&, launcher] { coordinator.retireLauncher(*launcher); }); return launcher;
+    });
+    if (!coordinator.showLauncher()) return false;
+    MainWindow window{control.shell.display.id, translation};
+    control.install(window);
+    if (!require(control.shell.valid && control.shell.intact() && initialize(window), "S5 real test-owned shell/Engine prerequisite")) return false;
+    sessionActivation.bindReadyRole(window, [&] { (void)window.trayPresentation().restore(); });
+    SessionCoordinatorJoin join(sessionSlot, launcherSlot);
+    join.enableControl(window.trayPresentation());
+    join.enableDesktopDeployment([&] { return window.desktopDeploymentProjection(); },
+        [&](DesktopDeploymentIntent intent) { return window.requestDesktopDeployment(intent); });
+    int accepted = 0; bool activationStoppedBeforeEngine = false;
+    window.setAcceptedCloseCallback([&] {
+        ++accepted; sessionActivation.beginShutdown();
+        activationStoppedBeforeEngine = Access::engine(window).isInitialized();
+    });
+    join.start(window, false);
+    const auto wait = [](const std::function<bool()>& condition) {
+        QElapsedTimer time; time.start();
+        while (!condition() && time.elapsed() < 5000) { QCoreApplication::processEvents(); QThread::msleep(5); }
+        return condition();
+    };
+    if (!require(wait([&] { return join.qualified(); }) && coordinator.sessionCount() == 1, "S5 real native control qualified")) return false;
+    const auto closeAction = [&](const QUuid& role) -> QAction* {
+        for (auto* entry : ApplicationCoordinatorTestAccess::menu(coordinator).actions())
+            if (entry->data().toUuid() == role)
+                for (auto* action : entry->menu()->actions())
+                    if (action->text() == QCoreApplication::translate("ApplicationCoordinator", "Close")) return action;
+        return nullptr;
+    };
+    const auto hasOutcome = [&](quint8 expected) {
+        for (qsizetype offset = 0; offset + 42 <= observedFrames.size(); offset += 42)
+            if (observedFrames[offset] == 'O' && static_cast<quint8>(observedFrames[offset + 41]) == expected) return true;
+        return false;
+    };
+    if (scenario == "query" || scenario == "query-old")
+    {
+        QLocalSocket* nativePeer = nullptr;
+        for (auto* socket : coordinator.findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
+            if (socket->property("sessionControl").toBool()) nativePeer = socket;
+        if (!require(nativePeer, "S5 authenticated native QueryState channel")) return false;
+        if (scenario == "query-old")
+        {
+            window.findChild<QToolButton*>("sessionHideToTray")->click();
+            if (!require(wait([&] { return window.trayPresentation().hiddenToTray() && !window.isVisible(); }),
+                "S5 old-key observation starts from genuinely qualified hidden role")) return false;
+            const RoleCloseKey oldKey{QUuid::createUuid(), 17};
+            observedFrames.clear();
+            coordinator.reconcileRoleClose(join.incarnation(), oldKey);
+            const auto postQueryState = [&]() -> std::optional<QUuid> {
+                bool resultSeen = false;
+                for (qsizetype offset = 0; offset + 42 <= observedFrames.size(); offset += 42)
+                {
+                    if (observedFrames[offset] == 'O' && QUuid::fromRfc4122(observedFrames.mid(offset + 1, 16)) == oldKey.generation
+                        && qFromBigEndian<quint64>(observedFrames.constData() + offset + 33) == oldKey.request) resultSeen = true;
+                    if (resultSeen && observedFrames[offset] == 'V') return QUuid::fromRfc4122(observedFrames.mid(offset + 1, 16));
+                }
+                return std::nullopt;
+            };
+            const bool oldQueryDelivered = wait([&] { return postQueryState().has_value() || !join.qualified(); });
+            if (!require(oldQueryDelivered
+                && postQueryState() == ApplicationCoordinatorTestAccess::epoch(join) && join.qualified()
+                && window.trayPresentation().hiddenToTray() && !window.isVisible() && Access::engine(window).isInitialized()
+                && !window.trayPresentation().closeOperation()
+                && coordinator.roleCloseOperation(join.incarnation())->key == oldKey
+                && coordinator.roleCloseOperation(join.incarnation())->result == RoleCloseResult::Uncertain,
+                "S5 prior-key query retains original Uncertain without poisoning current epoch/control or executing Close")) return false;
+            join.stop(); sessionActivation.beginShutdown(); Access::shutdown(window); return true;
+        }
+        QByteArray query(1, 'K'); query += ApplicationCoordinatorTestAccess::epoch(join).toRfc4122(); query += join.incarnation().toRfc4122();
+        const auto offset = query.size(); query.resize(offset + 8); qToBigEndian<quint64>(17, query.data() + offset); query += char{0};
+        nativePeer->write(query); nativePeer->flush();
+        if (!require(wait([&] { return hasOutcome(5) || !join.qualified(); }) && hasOutcome(5),
+            "S5 RED G: actual same-request QueryState must return Uncertain without executing unknown Close")) return false;
+        join.stop(); sessionActivation.beginShutdown(); Access::shutdown(window);
+        return true;
+    }
+    auto& model = Access::model(window); auto& engine = Access::engine(window);
+    const auto playlist = model.addPlaylist();
+    QImage image(80, 50, QImage::Format_RGBA8888); image.fill(Qt::green);
+    const auto mediaPath = files.filePath("s5.png");
+    if (!image.save(mediaPath)) return false;
+    const auto item = model.addItem(playlist, WorkspaceMediaType::Image, mediaPath);
+    if (!item || !model.setImageDisplayDuration(*item, 30) || !Access::start(window, playlist, *item)) return false;
+    Access::pause(window); if (!engine.seek(7)) return false;
+    const bool launcherCase = scenario == "menu" || scenario.startsWith("launcher-");
+    const bool clean = launcherCase || scenario == "clean" || scenario == "minimized-clean" || scenario == "hidden-clean";
+    const bool saving = scenario == "visible-save" || scenario == "hidden-save";
+    const bool discarding = scenario == "visible-discard" || scenario == "hidden-discard";
+    const bool accepting = clean || saving || discarding;
+    if (clean) Access::cleanDocument(window);
+    if (!clean && !require(Access::document(window).isDirty(model.authoredRevision()), "S5 genuinely dirty document prerequisite")) return false;
+    if (scenario == "save-failure") Access::documentPath(window, files.path()); // Existing directory: real save must fail.
+    if (saving) Access::documentPath(window, files.filePath("saved.json"));
+    const bool hidden = scenario.startsWith("hidden-") || scenario == "save-as-cancel" || scenario == "save-failure"
+        || scenario == "control-loss" || scenario == "show-pending" || scenario == "showall-pending"
+        || scenario == "duplicate" || scenario == "pending-wait" || scenario == "uncertain" || scenario == "deploy-race";
+    if (hidden)
+    {
+        if (!clean && !Access::clickDeploymentButton(window)) return false;
+        window.findChild<QToolButton*>("sessionHideToTray")->click();
+        if (!require(wait([&] { return !window.isVisible(); }), "S5 real HiddenToTray prerequisite")) return false;
+    }
+    if (scenario == "minimized-clean") window.showMinimized();
+    const auto hwnd = window.winId(); const auto incarnation = join.incarnation();
+    const auto authored = model.authoredRevision(); const auto preview = Access::preview(window);
+    const auto desktop = Access::desktop(window); const auto host = Access::host(window).nativeHandle();
+    const auto scene = Gpu::scene(engine), clock = Gpu::playback(engine), media = Gpu::media(engine);
+    const auto path = Access::document(window).currentPath; const auto canvas = model.desktopCanvas().aspectRatio;
+    const char* red = scenario == "menu" ? "S5 RED A: real primary-role submenu must expose ordinary Close"
+        : scenario == "clean" ? "S5 RED B: real tray clean Close must enter existing accepted teardown"
+        : scenario == "hidden-cancel" ? "S5 RED C: hidden dirty tray Close must run ordinary Cancel and restore hidden"
+        : scenario == "save-as-cancel" || scenario == "save-failure" ? "S5 RED D: hidden tray Close must use ordinary Save As / error abort"
+        : scenario == "modal" ? "S5 RED E: actual Close must have fresh modal admission with no late execution"
+        : "S5 RED F: real hidden clean tray Close must accept without Show";
+    if (!require(closeAction(incarnation), red)) return false;
+    if (!require(wait([&] { return closeAction(incarnation) && closeAction(incarnation)->isEnabled(); }),
+        "S5 initial target capability must reach the actual menu before triggering Close")) return false;
+    if (launcherCase)
+    {
+        QPointer<QWidget> launcher = coordinator.launcherWindow();
+        if (!require(closeAction(coordinator.launcherIncarnation()), "S5 Launcher Close action exists")) return false;
+        QList<QAction*> entries;
+        for (auto* entry : ApplicationCoordinatorTestAccess::menu(coordinator).actions())
+            if (entry->menu()) entries.push_back(entry); // Keep S5's ordinary per-role Close contract.
+        if (!require(entries.size() == 2 && entries[0]->menu()->actions().size() == 3
+            && entries[0]->menu()->actions()[1]->isSeparator() && entries[1]->menu()->actions().size() == 4
+            && entries[1]->menu()->actions()[2]->isSeparator(), "S5 exact per-role separators/actions alongside S6 top-level All Close")) return false;
+        if (scenario == "launcher-minimized") launcher->showMinimized();
+        if (scenario == "launcher-hidden") launcher->findChild<QToolButton*>("launcherHideToTray")->click();
+        if (scenario == "launcher-settings")
+        {
+            bool observed = false, rejected = false;
+            QTimer probe; probe.setInterval(10);
+            QObject::connect(&probe, &QTimer::timeout, launcher, [&] {
+                auto* settingsDialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                if (!settingsDialog || settingsDialog->parentWidget() != launcher) return;
+                observed = true;
+                (void)coordinator.requestRoleClose(coordinator.launcherIncarnation());
+                const auto operation = coordinator.roleCloseOperation(coordinator.launcherIncarnation());
+                rejected = operation && operation->result == RoleCloseResult::Rejected;
+                settingsDialog->reject();
+            });
+            probe.start(); LauncherWindowTestAccess::settings(*static_cast<LauncherWindow*>(launcher.data())); probe.stop();
+            if (!require(observed && rejected && launcher,
+                "S5 Launcher modal admission rejects without ordinary destruction")) return false;
+            QCoreApplication::processEvents();
+            if (!require(launcher && coordinator.launcherWindow() == launcher, "S5 rejected Launcher Close does not execute later")) return false;
+        }
+        if (!require(wait([&] { return closeAction(coordinator.launcherIncarnation())->isEnabled(); }),
+            "S5 new Launcher Close awaits current enabled projection after modal resolves")) return false;
+        S5WindowObservation launcherObservation; launcher->installEventFilter(&launcherObservation);
+        const auto oldIncarnation = coordinator.launcherIncarnation();
+        closeAction(coordinator.launcherIncarnation())->trigger();
+        if (!require(wait([&] { return launcher.isNull(); }) && coordinator.sessionCount() == 1
+            && engine.isInitialized() && launcherObservation.closes == 1
+            && (scenario != "launcher-hidden" || launcherObservation.shows == 0), "S5 Launcher ordinary destruction preserves Session/coordinator without hidden flash")) return false;
+        const auto operation = coordinator.roleCloseOperation(oldIncarnation);
+        if (!require(operation && operation->result == RoleCloseResult::CloseAccepted, "S5 Launcher Accepted retained for exact retired incarnation")) return false;
+        join.stop(); sessionActivation.beginShutdown(); Access::shutdown(window);
+        return true;
+    }
+    S5WindowObservation observation; window.installEventFilter(&observation);
+    if (scenario == "modal" || scenario == "bgm-modal" || scenario == "native-modal" || scenario == "bgm-native-modal")
+    {
+        auto* stale = closeAction(incarnation);
+        QWidget* owner = &window;
+        if (scenario.startsWith("bgm-"))
+        {
+            owner = Access::bgm(window, playlist);
+            if (!require(owner && !window.isAncestorOf(owner), "S5 parentless actual BGM editor prerequisite")) return false;
+            owner->show();
+        }
+        if (scenario.endsWith("native-modal"))
+        {
+            QFileDialog modal(owner, "S5 real native modal"); modal.setFileMode(QFileDialog::ExistingFile);
+            QTimer probe; probe.setInterval(10); bool nativeSeen = false, submitted = false;
+            QObject::connect(&probe, &QTimer::timeout, &modal, [&] {
+                const auto popup = GetLastActivePopup(reinterpret_cast<HWND>(owner->winId()));
+                wchar_t name[32]{}; if (popup) GetClassNameW(popup, name, 32);
+                if (wcscmp(name, L"#32770") != 0 || !IsWindowVisible(popup) || IsWindowEnabled(reinterpret_cast<HWND>(owner->winId()))) return;
+                nativeSeen = true;
+                if (!submitted) { submitted = true; (void)coordinator.requestRoleClose(incarnation); }
+                const auto operation = coordinator.roleCloseOperation(incarnation);
+                if (operation && operation->result == RoleCloseResult::Rejected) modal.reject();
+            });
+            probe.start(); QTimer::singleShot(5000, &modal, &QFileDialog::reject); modal.exec(); probe.stop();
+            if (!require(nativeSeen && hasOutcome(4), "S5 actual Windows native modal rejects Close through nested control delivery")) return false;
+        }
+        else
+        {
+            QDialog modal(owner); modal.setWindowModality(Qt::ApplicationModal); modal.show();
+            stale->trigger();
+            if (!require(wait([&] { return hasOutcome(4); }), "S5 fresh process-aware modal admission rejection")) return false;
+            modal.hide();
+        }
+        QCoreApplication::processEvents();
+        if (!require(engine.isInitialized() && accepted == 0 && observation.closes == 0,
+            "S5 rejected Close never executes after modal resolves")) return false;
+    }
+    else
+    {
+        bool dirtyPrompt = false, saveAs = false, error = false, pendingProof = clean;
+        bool auxiliarySubmitted = false, pendingDeadlineProof = scenario != "pending-wait", fixtureTimedOut = false;
+        QElapsedTimer pendingTime;
+        QLocalSocket* nativePeer = nullptr;
+        std::unique_ptr<QSignalBlocker> blockedReply;
+        if (scenario == "uncertain")
+        {
+            for (auto* socket : coordinator.findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
+                if (socket->property("sessionControl").toBool()) nativePeer = socket;
+            if (!require(nativePeer, "S5 real delivery barrier before actual Close")) return false;
+            blockedReply = std::make_unique<QSignalBlocker>(nativePeer);
+        }
+        QTimer dialogs; dialogs.setInterval(10);
+        QObject::connect(&dialogs, &QTimer::timeout, &window, [&] {
+            for (auto* top : QApplication::topLevelWidgets())
+            {
+                if (auto* fileDialog = qobject_cast<QFileDialog*>(top); fileDialog && fileDialog->isVisible())
+                { saveAs = true; fileDialog->reject(); return; }
+                if (auto* message = qobject_cast<QMessageBox*>(top); message && message->isVisible())
+                {
+                    if (message->standardButtons().testFlag(QMessageBox::Save))
+                    {
+                        dirtyPrompt = true;
+                        const auto operation = coordinator.roleCloseOperation(incarnation);
+                        if (!operation) return;
+                        if (scenario != "uncertain" && operation->result != RoleCloseResult::Pending) return;
+                        pendingProof = window.trayPresentation().closePending() && engine.isInitialized() && accepted == 0;
+                        if (!pendingTime.isValid()) pendingTime.start();
+                        if (scenario == "pending-wait" && pendingTime.elapsed() < SessionQualificationLifetimeMs + 150) return;
+                        if (scenario == "pending-wait") pendingDeadlineProof = operation->result == RoleCloseResult::Pending;
+                        if (!auxiliarySubmitted)
+                        {
+                            auxiliarySubmitted = true;
+                            if (scenario == "control-loss") join.stop();
+                            if (scenario == "show-pending") coordinator.showSession(incarnation);
+                            if (scenario == "showall-pending") ApplicationCoordinatorTestAccess::click(coordinator);
+                            if (scenario == "deploy-race") coordinator.requestSessionDeployment(incarnation, DesktopDeploymentIntent::Undeploy);
+                            if (scenario == "duplicate")
+                            {
+                                coordinator.reconcileRoleClose(incarnation, operation->key);
+                                if (!require(coordinator.roleCloseOperation(incarnation)->result == RoleCloseResult::Pending,
+                                    "S5 explicit same-key query must preserve known Pending until new evidence"))
+                                { fixtureTimedOut = true; message->button(QMessageBox::Cancel)->click(); return; }
+                                pendingProof = pendingProof && !coordinator.requestRoleClose(incarnation)
+                                    && window.trayPresentation().requestClose(operation->key) == RoleCloseResult::Pending
+                                    && window.trayPresentation().requestClose({operation->key.generation, operation->key.request + 100}) == RoleCloseResult::Rejected
+                                    && coordinator.roleCloseOperation(incarnation)->key == operation->key;
+                                (void)window.close(); // Ordinary x collision uses QWidget's real in-progress Close guard.
+                                pendingProof = pendingProof && observation.closes == 1 && window.trayPresentation().closePending();
+                                for (auto* socket : coordinator.findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
+                                    if (socket->property("sessionControl").toBool())
+                                    {
+                                        QByteArray replay(1, 'C'); replay += operation->key.generation.toRfc4122(); replay += incarnation.toRfc4122();
+                                        const auto offset = replay.size(); replay.resize(offset + 8);
+                                        qToBigEndian<quint64>(operation->key.request, replay.data() + offset); replay += char{0};
+                                        socket->write(replay); socket->flush();
+                                    }
+                            }
+                        }
+                        if (scenario == "show-pending")
+                        {
+                            bool showCompleted = false;
+                            for (qsizetype offset = 0; offset + 42 <= observedFrames.size(); offset += 42)
+                                if (observedFrames[offset] == 'D' && observedFrames[offset + 41] == 1) showCompleted = true;
+                            if (!showCompleted) return;
+                        }
+                        if (scenario == "showall-pending" && !ApplicationCoordinatorTestAccess::allDone(coordinator)) return;
+                        if (scenario == "deploy-race" && coordinator.sessionDeploymentResult(incarnation) != DesktopDeploymentResult::Rejected) return;
+                        if (scenario == "duplicate")
+                        {
+                            int receipts = 0, pendingResults = 0;
+                            for (qsizetype offset = 0; offset + 42 <= observedFrames.size(); offset += 42)
+                            {
+                                if (observedFrames[offset] == 'J') ++receipts;
+                                if (observedFrames[offset] == 'O' && observedFrames[offset + 41] == static_cast<char>(RoleCloseResult::Pending)) ++pendingResults;
+                            }
+                            if (receipts < 2 || pendingResults < 3) return; // Genuine replay + same-key query were consumed inside the real dialog loop.
+                        }
+                        const auto choice = saving || scenario == "save-as-cancel" || scenario == "save-failure" ? QMessageBox::Save
+                            : discarding ? QMessageBox::Discard : QMessageBox::Cancel;
+                        message->button(choice)->click(); return;
+                    }
+                    else { error = true; message->button(QMessageBox::Ok)->click(); return; }
+                }
+            }
+        });
+        QTimer safety; safety.setSingleShot(true);
+        QObject::connect(&safety, &QTimer::timeout, &window, [&] {
+            fixtureTimedOut = true;
+            for (auto* top : QApplication::topLevelWidgets())
+            {
+                if (auto* file = qobject_cast<QFileDialog*>(top); file && file->isVisible()) { file->reject(); return; }
+                if (auto* message = qobject_cast<QMessageBox*>(top); message && message->isVisible())
+                {
+                    if (auto* cancel = message->button(QMessageBox::Cancel)) cancel->click();
+                    else if (auto* ok = message->button(QMessageBox::Ok)) ok->click();
+                    return;
+                }
+            }
+        }); // Test safety only; a timeout is a failure, never a production decision.
+        safety.start(8000); dialogs.start(); closeAction(incarnation)->trigger();
+        const auto submitted = coordinator.roleCloseOperation(incarnation);
+        if (!require(submitted.has_value(), "S5 coordinator records exact request before target executes")) return false;
+        const bool completed = wait([&] { return accepting ? accepted == 1
+            : scenario == "control-loss" || scenario == "uncertain"
+                ? window.trayPresentation().queryClose(submitted->key) == RoleCloseResult::CloseAborted : hasOutcome(3); });
+        dialogs.stop(); safety.stop();
+        if (blockedReply)
+        {
+            const auto realAbortedFrames = [&] {
+                const auto frames = nativePeer->peek(nativePeer->bytesAvailable());
+                int count = 0;
+                for (qsizetype offset = 0; offset + 42 <= frames.size(); offset += 42)
+                    if (frames[offset] == 'O' && frames[offset + 41] == static_cast<char>(RoleCloseResult::CloseAborted)) ++count;
+                return count;
+            };
+            if (!require(wait([&] { return realAbortedFrames() == 2; }), "S5 both genuine completion reports held before QueryState")) return false;
+            auto* deadline = nativePeer->findChild<QTimer*>("roleCloseDeliveryDeadline");
+            if (!require(deadline && completed, "S5 actual Close completed locally while result delivery held")) return false;
+            QMetaObject::invokeMethod(deadline, "timeout", Qt::DirectConnection);
+            const auto operation = coordinator.roleCloseOperation(incarnation);
+            if (!require(operation && operation->key == submitted->key && operation->result == RoleCloseResult::Uncertain
+                && !coordinator.requestRoleClose(incarnation), "S5 delivery uncertainty is not Cancel/Accepted/Rejected and cannot resend Close")) return false;
+            if (!require(wait([&] { return realAbortedFrames() >= 3; }), "S5 actual target consumed same-request query and produced a genuine retained result")) return false;
+            blockedReply.reset(); QMetaObject::invokeMethod(nativePeer, "readyRead", Qt::DirectConnection);
+            if (!require(wait([&] { return coordinator.roleCloseOperation(incarnation)->result == RoleCloseResult::CloseAborted; })
+                && coordinator.roleCloseOperation(incarnation)->key == submitted->key, "S5 same-request reconciliation observes real abort without executing twice")) return false;
+        }
+        if (!require(completed && pendingProof && pendingDeadlineProof && !fixtureTimedOut && observation.closes == 1,
+            "S5 one actual ordinary closeEvent, genuine Pending and no user decision timeout")) return false;
+        if (accepting)
+        {
+            if (!require(!engine.isInitialized() && accepted == 1 && activationStoppedBeforeEngine
+                && (!clean || !dirtyPrompt) && (!clean || !hidden || observation.shows == 0), "S5 accepted teardown once; hidden clean has no Show")) return false;
+            if (!require(wait([&] { return hasOutcome(2); }), "S5 CloseAccepted is reported only after real Engine/BGM teardown")) return false;
+            const auto acceptedOperation = coordinator.roleCloseOperation(incarnation);
+            if (!require(acceptedOperation && !coordinator.requestRoleClose(incarnation)
+                && coordinator.roleCloseOperation(incarnation)->key == acceptedOperation->key
+                && coordinator.roleCloseOperation(incarnation)->result == RoleCloseResult::CloseAccepted,
+                "S5 accepted role cannot admit another Close or overwrite its terminal receipt before retirement")) return false;
+            if (saving && !require(QFile::exists(files.filePath("saved.json")) && !Access::document(window).isDirty(authored), "S5 actual successful save uses existing document lifecycle")) return false;
+        }
+        else
+        {
+            if (!require(dirtyPrompt && accepted == 0 && engine.isInitialized() && window.winId() == hwnd
+                && join.incarnation() == incarnation && model.authoredRevision() == authored
+                && Access::document(window).currentPath == path && Access::document(window).isDirty(authored)
+                && model.desktopCanvas().aspectRatio == canvas && model.activeItemId() == item
+                && Access::bound(window) == control.shell.display.id && Access::preview(window) == preview
+                && Access::desktop(window) == desktop && Access::host(window).nativeHandle() == host
+                && Gpu::scene(engine) == scene && Gpu::playback(engine) == clock && Gpu::media(engine) == media
+                && engine.isPaused() && engine.playbackTime() == 7
+                && (!window.isVisible()) == (hidden && scenario != "control-loss"),
+                "S5 actual abort preserves dirty/Project/Canvas/runtime/clock/deployment/DisplayId and pre-Close presentation")) return false;
+            if (scenario == "save-as-cancel" && !require(saveAs, "S5 actual Save As interaction reached")) return false;
+            if (scenario == "save-failure" && !require(error, "S5 actual save error feedback reached")) return false;
+            if (scenario == "control-loss" && !require(wait([&] { return coordinator.roleCloseOperation(incarnation)->result == RoleCloseResult::Uncertain; }),
+                "S5 disconnected coordinator cannot invent the locally aborted result")) return false;
+        }
+    }
+    window.removeEventFilter(&observation);
+    join.stop(); sessionActivation.beginShutdown(); Access::shutdown(window);
+    return require(control.shell.intact(), "S5 test-owned shell healthy; no Explorer mutation");
+}
+
+constexpr UINT S4PeerClose = WM_APP + 174;
+class S4PeerHarness final : public QAbstractNativeEventFilter
+{
+public:
+    MainWindow* window = nullptr;
+    HWND hwnd = nullptr;
+    bool nativeEventFilter(const QByteArray&, void* native, qintptr* result) override
+    {
+        const auto* message = static_cast<MSG*>(native);
+        // Never call winId() for unrelated native teardown messages: it can
+        // recreate a dying QWidget HWND and recursively enter the native filter.
+        if (!window || message->hwnd != hwnd || message->message != S4PeerClose) return false;
+        QTimer::singleShot(0, window, [] {
+            if (auto* prompt = qobject_cast<QMessageBox*>(QApplication::activeModalWidget()))
+                if (auto* discard = prompt->button(QMessageBox::Discard))
+                    discard->click();
+        });
+        window->close();
+        if (result) *result = 0; return true;
+    }
+};
+
+int runS4DeploymentPeer(Player::ApplicationTranslationState& translation, bool cleanClose = false)
+{
+    using namespace Player;
+    CreationControl control;
+    const auto scope = *currentInteractiveInstanceScope();
+    const auto launcherSlot = *InstanceSlot::fromProcessMode(LauncherProcessMode{}, scope);
+    const auto sessionSlot = *InstanceSlot::fromProcessMode(DisplaySessionProcessMode{control.shell.display.id}, scope);
+    InstanceAdmissionLease admission;
+    if (admission.acquire(sessionSlot) != InstanceAdmissionOutcome::Acquired) return 1;
+    InstanceActivationEndpoint activation(sessionSlot);
+    if (!activation.listen()) return 1;
+    MainWindow window(control.shell.display.id, translation); control.install(window);
+    if (!initialize(window)) return 1;
+    QTemporaryDir files;
+    QImage image(64, 40, QImage::Format_RGBA8888); image.fill(Qt::green);
+    const auto file = files.filePath("peer.png"); auto& model = Access::model(window); auto& engine = Access::engine(window);
+    const auto playlist = model.addPlaylist(); if (!image.save(file)) return 1;
+    const auto item = model.addItem(playlist, WorkspaceMediaType::Image, file);
+    if (!item || !model.setImageDisplayDuration(*item, 30) || !Access::start(window, playlist, *item)) return 1;
+    Access::pause(window); if (!engine.seek(7)) return 1;
+    if (cleanClose) Access::cleanDocument(window);
+    activation.bindReadyRole(window, [&] { (void)window.trayPresentation().restore(); });
+    SessionCoordinatorJoin join(sessionSlot, launcherSlot);
+    join.enableControl(window.trayPresentation());
+    join.enableDesktopDeployment([&] { return window.desktopDeploymentProjection(); }, [&](DesktopDeploymentIntent intent) {
+        const auto result = window.requestDesktopDeployment(intent);
+        std::cout << "S4 PEER ENDPOINT " << Access::desktop(window).isValid() << " attempts=" << control.attempts << std::endl;
+        return result;
+    });
+    int acceptedCloses = 0;
+    window.setAcceptedCloseCallback([&] {
+        ++acceptedCloses;
+        join.beginRoleTeardown(); activation.beginShutdown();
+        QTimer::singleShot(0, &join, [&] { join.drainAndStop([] { QCoreApplication::quit(); }); });
+    });
+    const auto hwnd = window.winId(); const auto revision = model.authoredRevision();
+    const auto canvas = model.desktopCanvas().aspectRatio; const auto preview = Access::preview(window);
+    const bool dirty = Access::document(window).isDirty(model.authoredRevision());
+    const auto projectPath = Access::document(window).currentPath;
+    const auto scene = Gpu::scene(engine), clock = Gpu::playback(engine), media = Gpu::media(engine);
+    join.start(window, false);
+    bool ready = false;
+    S5WindowObservation closeObservation; window.installEventFilter(&closeObservation);
+    QTimer check; check.setInterval(10);
+    QObject::connect(&check, &QTimer::timeout, &window, [&] {
+        if (!engine.isInitialized()) return;
+        if (window.winId() != hwnd || model.authoredRevision() != revision || model.activeItemId() != item
+            || Access::document(window).isDirty(model.authoredRevision()) != dirty || Access::document(window).currentPath != projectPath
+            || model.desktopCanvas().aspectRatio != canvas || Access::preview(window) != preview
+            || Gpu::scene(engine) != scene || Gpu::playback(engine) != clock || Gpu::media(engine) != media
+            || !engine.isPaused() || engine.playbackTime() != 7 || Access::bound(window) != control.shell.display.id)
+        { std::cerr << "S4 PEER STATE LOST" << std::endl; QCoreApplication::exit(2); }
+        if (!ready && join.qualified())
+        {
+            window.findChild<QToolButton*>("sessionHideToTray")->click();
+            if (!window.isVisible())
+            {
+                ready = true;
+                closeObservation.shows = 0;
+                std::cout << "S4 PEER READY " << static_cast<quintptr>(hwnd) << " " << join.incarnation().toString().toStdString() << std::endl;
+            }
+        }
+    });
+    S4PeerHarness harness; harness.window = &window; harness.hwnd = reinterpret_cast<HWND>(hwnd);
+    QApplication::instance()->installNativeEventFilter(&harness);
+    check.start(); QTimer::singleShot(30000, &window, [] { QCoreApplication::exit(3); });
+    const auto result = QApplication::exec();
+    QApplication::instance()->removeNativeEventFilter(&harness);
+    window.removeEventFilter(&closeObservation);
+    if (cleanClose && !require(result == 0 && acceptedCloses == 1 && closeObservation.closes == 1
+        && closeObservation.shows == 0 && !engine.isInitialized(), "S5 peer hidden clean ordinary Close once, no Show, explicit process exit")) return 4;
+    return result;
+}
+
+bool verifyS5ClosePeer(Player::ApplicationTranslationState& translation, const QString& scenario)
+{
+    using namespace Player;
+    const auto slot = *InstanceSlot::fromProcessMode(LauncherProcessMode{}, *currentInteractiveInstanceScope());
+    InstanceAdmissionLease admission;
+    if (admission.acquire(slot) != InstanceAdmissionOutcome::Acquired) return false;
+    InstanceActivationEndpoint activation(slot); if (!activation.listen()) return false;
+    QPixmap icon(16, 16); icon.fill(Qt::green); QApplication::setWindowIcon(QIcon(icon));
+    QTemporaryDir files; QSettings settings(files.filePath("preferences.ini"), QSettings::IniFormat);
+    ApplicationPreferencesStore preferences(settings);
+    int drained = 0;
+    ApplicationCoordinator coordinator(slot, activation, true, [&] { ++drained; }); if (!coordinator.listen()) return false;
+    const bool last = scenario == "peer-last" || scenario == "peer-pending-death";
+    if (!last)
+    {
+        coordinator.setLauncherFactory([&] {
+            auto* w = new LauncherWindow(translation, preferences);
+            w->setAcceptedCloseCallback([&, w] { coordinator.retireLauncher(*w); }); return w;
+        });
+        if (!coordinator.showLauncher()) return false;
+    }
+    const auto wait = [](const std::function<bool()>& condition) {
+        QElapsedTimer time; time.start();
+        while (!condition() && time.elapsed() < 6000) { QCoreApplication::processEvents(); QThread::msleep(5); }
+        return condition();
+    };
+    QProcess child; QByteArray output; HWND hwnd = nullptr; QUuid incarnation;
+    const auto read = [&] { output += child.readAllStandardOutput(); output += child.readAllStandardError(); };
+    const auto start = [&] {
+        output.clear(); child.start(QCoreApplication::applicationFilePath(), {scenario == "peer-pending-death" ? "--s4-deployment-peer" : "--s5-close-peer"});
+        if (!child.waitForStarted(5000) || !wait([&] { read(); return output.contains("S4 PEER READY ") || child.state() == QProcess::NotRunning; })) return false;
+        const auto parts = output.mid(output.indexOf("S4 PEER READY ") + 14).split('\n').first().trimmed().split(' ');
+        if (parts.size() != 2 || child.state() != QProcess::Running) return false;
+        hwnd = reinterpret_cast<HWND>(parts[0].toULongLong()); incarnation = QUuid(QString::fromUtf8(parts[1]));
+        DWORD pid = 0;
+        return IsWindow(hwnd) && !IsWindowVisible(hwnd) && GetWindowThreadProcessId(hwnd, &pid)
+            && pid == child.processId() && !incarnation.isNull() && output.count("Desktop Scene Engine initialized.") == 1;
+    };
+    const auto action = [&]() -> QAction* {
+        for (auto* entry : ApplicationCoordinatorTestAccess::menu(coordinator).actions())
+            if (entry->data().toUuid() == incarnation && entry->menu()->actions().size() == 4) return entry->menu()->actions().back();
+        return nullptr;
+    };
+    const auto close = [&] {
+        if (!wait([&] { return action() && action()->isEnabled(); })) return false;
+        action()->trigger();
+        return wait([&] { return child.state() == QProcess::NotRunning && coordinator.sessionCount() == 0; })
+            && child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0;
+    };
+    bool ok = start();
+    if (ok && scenario == "peer-pending-death")
+    {
+        ok = wait([&] { return action() && action()->isEnabled(); });
+        if (ok) action()->trigger();
+        ok = ok && wait([&] { const auto op = coordinator.roleCloseOperation(incarnation); return op && op->result == RoleCloseResult::Pending; });
+        if (ok)
+        {
+            child.kill(); child.waitForFinished(5000); // Intentional crash of this admitted test child; NOT Close implementation or success cleanup.
+            ok = wait([&] { const auto op = coordinator.roleCloseOperation(incarnation); return coordinator.sessionCount() == 0
+                && op && op->result == RoleCloseResult::RoleGone; }) && wait([&] { return drained == 1; });
+        }
+    }
+    else if (ok && scenario == "peer-late")
+    {
+        QLocalSocket* peer = nullptr;
+        for (auto* socket : coordinator.findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
+            if (socket->property("sessionControl").toBool()) peer = socket;
+        if (!peer) ok = false;
+        else
+        {
+            QSignalBlocker hold(peer);
+            const auto old = incarnation;
+            ok = close(); // Verified process death proceeds independently of held real outcome frames.
+            bool realAccepted = false;
+            const auto frames = peer->peek(peer->bytesAvailable());
+            for (qsizetype offset = 0; offset + 42 <= frames.size(); offset += 42)
+                if (frames[offset] == 'O' && frames[offset + 41] == static_cast<char>(RoleCloseResult::CloseAccepted)) realAccepted = true;
+            ok = ok && realAccepted && start() && incarnation != old;
+            hold.unblock(); hold.dismiss(); QMetaObject::invokeMethod(peer, "readyRead", Qt::DirectConnection);
+            ok = ok && wait([&] { return action() && action()->isEnabled(); })
+                && !coordinator.roleCloseOperation(incarnation) && child.state() == QProcess::Running && !IsWindowVisible(hwnd)
+                && close();
+        }
+    }
+    else if (ok)
+    {
+        QObject retiredActionOwner; QPointer<QAction> oldAction;
+        ok = wait([&] { return action() && action()->isEnabled(); });
+        if (ok) { oldAction = action(); oldAction->setParent(&retiredActionOwner); }
+        const auto old = incarnation;
+        ok = ok && close();
+        if (last) ok = ok && wait([&] { return drained == 1; });
+        else if (ok)
+        {
+            ok = start() && incarnation != old;
+            if (ok)
+            {
+                oldAction->setEnabled(true); oldAction->trigger(); // Genuine retained stale-enabled QAction, same exact old incarnation.
+                ok = wait([&] { return action() && action()->isEnabled(); }) && !coordinator.roleCloseOperation(incarnation)
+                    && child.state() == QProcess::Running && !IsWindowVisible(hwnd) && close();
+            }
+        }
+    }
+    if (child.state() != QProcess::NotRunning) { child.kill(); child.waitForFinished(5000); } // Test-owned failure cleanup, never success proof.
+    if (!ok) { read(); std::cerr << output.constData(); }
+    return require(ok, "S5 actual independent hidden Session ordinary Close/result/drain/replacement/death safety");
+}
+
+bool verifyS4DeploymentPeer(Player::ApplicationTranslationState& translation)
+{
+    using namespace Player;
+    const auto slot = *InstanceSlot::fromProcessMode(LauncherProcessMode{}, *currentInteractiveInstanceScope());
+    InstanceAdmissionLease admission;
+    if (admission.acquire(slot) != InstanceAdmissionOutcome::Acquired) return false;
+    InstanceActivationEndpoint activation(slot); if (!activation.listen()) return false;
+    QPixmap icon(16, 16); icon.fill(Qt::green); QApplication::setWindowIcon(QIcon(icon));
+    QTemporaryDir files; QSettings settings(files.filePath("preferences.ini"), QSettings::IniFormat);
+    ApplicationPreferencesStore preferences(settings);
+    ApplicationCoordinator coordinator(slot, activation, false, [] {}); if (!coordinator.listen()) return false;
+    coordinator.setLauncherFactory([&] {
+        auto* w = new LauncherWindow(translation, preferences);
+        w->setAcceptedCloseCallback([&, w] { coordinator.retireLauncher(*w); }); return w;
+    });
+    if (!coordinator.showLauncher()) return false;
+    const auto wait = [](const std::function<bool()>& condition) {
+        QElapsedTimer time; time.start();
+        while (!condition() && time.elapsed() < 6000) { QCoreApplication::processEvents(); QThread::msleep(5); }
+        return condition();
+    };
+    QProcess child; QByteArray output;
+    HWND hwnd = nullptr; QUuid incarnation;
+    const auto read = [&] { output += child.readAllStandardOutput(); output += child.readAllStandardError(); };
+    const auto start = [&] {
+        output.clear(); child.start(QCoreApplication::applicationFilePath(), {"--s4-deployment-peer"});
+        if (!child.waitForStarted(5000) || !wait([&] { read(); return output.contains("S4 PEER READY ") || child.state() == QProcess::NotRunning; })) return false;
+        const auto parts = output.mid(output.indexOf("S4 PEER READY ") + 14).split('\n').first().trimmed().split(' ');
+        if (parts.size() != 2 || child.state() != QProcess::Running) { std::cerr << output.constData(); return false; }
+        hwnd = reinterpret_cast<HWND>(parts[0].toULongLong()); incarnation = QUuid(QString::fromUtf8(parts[1]));
+        DWORD owner = 0; GetWindowThreadProcessId(hwnd, &owner);
+        return IsWindow(hwnd) && !IsWindowVisible(hwnd) && owner == child.processId() && coordinator.sessionCount() == 1;
+    };
+    const auto close = [&] {
+        if (!PostMessageW(hwnd, S4PeerClose, 0, 0) || !wait([&] { return child.state() == QProcess::NotRunning; })) return false;
+        read(); return child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0
+            && output.count("Desktop Scene Engine initialized.") == 1
+            && !output.contains("S4 PEER STATE LOST") && wait([&] { return coordinator.sessionCount() == 0; });
+    };
+    const auto deploymentAction = [&]() -> QAction* {
+        for (auto* a : ApplicationCoordinatorTestAccess::menu(coordinator).actions())
+            if (a->data().toUuid() == incarnation && a->menu()->actions().size() == 4) return a->menu()->actions()[1];
+        return nullptr;
+    };
+    const auto exercise = [&] {
+        if (!wait([&] { return deploymentAction() && deploymentAction()->isEnabled(); })) return false;
+        deploymentAction()->trigger();
+        if (!wait([&] { read(); return coordinator.sessionDeploymentResult(incarnation) == DesktopDeploymentResult::Completed
+            && output.contains("S4 PEER ENDPOINT 1 attempts=1"); })) return false;
+        if (IsWindowVisible(hwnd) || !IsWindow(hwnd)) return false;
+        deploymentAction()->trigger();
+        if (!wait([&] { read(); return coordinator.sessionDeploymentResult(incarnation) == DesktopDeploymentResult::Completed
+            && output.contains("S4 PEER ENDPOINT 0 attempts=1"); })) return false;
+        return !IsWindowVisible(hwnd) && IsWindow(hwnd);
+    };
+    bool ok = start();
+    QObject retiredActionOwner;
+    QPointer<QAction> oldAction;
+    QUuid oldIncarnation;
+    if (ok)
+    {
+        ok = wait([&] { return deploymentAction() && deploymentAction()->isEnabled(); });
+        if (ok) { oldAction = deploymentAction(); oldAction->setParent(&retiredActionOwner); oldIncarnation = incarnation; }
+        ok = ok && exercise() && close() && start();
+    }
+    if (ok)
+    {
+        oldAction->trigger();
+        if (!wait([&] { return deploymentAction() && deploymentAction()->isEnabled(); })) ok = false;
+        read(); ok = ok && oldIncarnation != incarnation && !output.contains("[Tray] Deployment result=") && !IsWindowVisible(hwnd);
+        ok = ok && exercise() && close();
+    }
+    if (child.state() != QProcess::NotRunning) { child.kill(); child.waitForFinished(5000); } // Test-owned failure cleanup only.
+    if (!ok) { read(); std::cerr << output.constData(); }
+    return require(ok, "S4 real independent child native tray Deploy/Undeploy and stale replacement action preserve one Engine/session/hidden HWND");
 }
 
 bool verifyCanvasOutsideSessionLifecycle(Player::ApplicationTranslationState& translation)
@@ -1782,6 +2862,29 @@ int main(int argc, char** argv)
 {
     QApplication application(argc, argv);
     Player::ApplicationTranslationState translation;
+    if (argc == 2 && std::string_view(argv[1]) == "--s5-close-peer")
+    { application.setQuitOnLastWindowClosed(false); return runS4DeploymentPeer(translation, true); }
+    if (argc == 2 && QString::fromLocal8Bit(argv[1]).startsWith("--tray-close-peer-"))
+    { application.setQuitOnLastWindowClosed(false); return verifyS5ClosePeer(translation, QString::fromLocal8Bit(argv[1]).mid(13)) ? 0 : 1; }
+    if (argc == 2 && QString::fromLocal8Bit(argv[1]).startsWith("--tray-close-"))
+    {
+        application.setQuitOnLastWindowClosed(false);
+        return verifyTrayClose(translation, QString::fromLocal8Bit(argv[1]).mid(13)) ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--s4-deployment-peer")
+    { application.setQuitOnLastWindowClosed(false); return runS4DeploymentPeer(translation); }
+    if (argc == 2 && std::string_view(argv[1]) == "--tray-deployment-peer")
+    { application.setQuitOnLastWindowClosed(false); return verifyS4DeploymentPeer(translation) ? 0 : 1; }
+    if (argc == 2 && QString::fromLocal8Bit(argv[1]).startsWith("--tray-deployment-"))
+    {
+        application.setQuitOnLastWindowClosed(false);
+        return verifyTrayDeploymentControl(translation, QString::fromLocal8Bit(argv[1]).mid(18)) ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--tray-deployed")
+    {
+        application.setQuitOnLastWindowClosed(false);
+        return verifyTrayDeployment(translation) ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--live-deployed-scale")
         return verifyLiveDeployedScaleUpdate(translation) ? 0 : 1;
     if (argc == 2 && std::string_view(argv[1]) == "--live-deployed-position")

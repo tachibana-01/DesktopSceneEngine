@@ -4716,21 +4716,43 @@ if(WIN32)
 
     add_executable(DesktopSceneEngine_InstanceProductionProcessTest
         Player/InstanceProductionProcessTest.cpp
+        ${CMAKE_SOURCE_DIR}/Player/InstanceAdmission.cpp
         ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp)
     target_include_directories(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
     target_compile_features(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE cxx_std_20)
     target_compile_options(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
     target_compile_definitions(DesktopSceneEngine_InstanceProductionProcessTest
         PRIVATE P0_PLAYER_EXECUTABLE="$<TARGET_FILE:DesktopSceneEngine_QtPlayer>")
-    target_link_libraries(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE DesktopSceneEngine::Engine Qt6::Core user32)
+    target_link_libraries(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE DesktopSceneEngine::Engine Qt6::Core user32 advapi32 ole32 oleaut32 uiautomationcore)
     add_dependencies(DesktopSceneEngine_InstanceProductionProcessTest DesktopSceneEngine_QtPlayer)
-    foreach(case launcher session launcher-race session-race different restart crash launcher-crash normal-close)
+    foreach(case launcher session launcher-race session-race different restart crash launcher-crash launcher-crash-bootstrap launcher-crash-unobserved-teardown normal-close coordinator-lifetime coordinator-direct session-visibility hidden-close-exit)
         add_test(NAME DesktopSceneEngine_InstanceProduction_${case} COMMAND DesktopSceneEngine_InstanceProductionProcessTest ${case})
         set_tests_properties(DesktopSceneEngine_InstanceProduction_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
     endforeach()
 
+    add_executable(DesktopSceneEngine_ApplicationCoordinatorTest
+        Player/ApplicationCoordinatorTest.cpp
+        ${CMAKE_SOURCE_DIR}/Player/ApplicationCoordinator.cpp
+        ${CMAKE_SOURCE_DIR}/Player/SessionPresentation.cpp
+        ${CMAKE_SOURCE_DIR}/Player/InstanceActivation.cpp
+        ${CMAKE_SOURCE_DIR}/Player/InstanceAdmission.cpp
+        ${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp
+        ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp
+        ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp)
+    target_include_directories(DesktopSceneEngine_ApplicationCoordinatorTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
+    target_compile_features(DesktopSceneEngine_ApplicationCoordinatorTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_ApplicationCoordinatorTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_ApplicationCoordinatorTest
+        PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network advapi32 user32)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_ApplicationCoordinatorTest)
+    foreach(case ui-lifetime protocol-lifetime bootstrap-timeout unavailable-join pending-teardown)
+        add_test(NAME DesktopSceneEngine_Coordinator_${case} COMMAND DesktopSceneEngine_ApplicationCoordinatorTest ${case})
+        set_tests_properties(DesktopSceneEngine_Coordinator_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
+
     add_executable(DesktopSceneEngine_InstanceSessionLifecycleTest
         Player/InstanceSessionLifecycleTest.cpp
+        ${CMAKE_SOURCE_DIR}/Player/ApplicationCoordinator.cpp
         ${CMAKE_SOURCE_DIR}/Player/Player.manifest
         ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
         ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
@@ -4759,7 +4781,42 @@ if(WIN32)
     add_dependencies(DesktopSceneEngine_InstanceSessionLifecycleTest DesktopSceneEngine_QtPlayer)
     deploy_ffmpeg_dlls(DesktopSceneEngine_InstanceSessionLifecycleTest)
     add_test(NAME DesktopSceneEngine_InstanceSessionLifecycleTest COMMAND DesktopSceneEngine_InstanceSessionLifecycleTest)
+    foreach(case tray-core tray-state tray-loss tray-expiry tray-epoch tray-stale tray-maximized tray-playing tray-modal tray-native-modal tray-unqualified tray-unavailable tray-retire-control tray-pending tray-ending tray-delayed-batch tray-expired-permit tray-backpressure)
+        add_test(NAME DesktopSceneEngine_SessionPresentation_${case} COMMAND DesktopSceneEngine_InstanceSessionLifecycleTest ${case})
+        set_tests_properties(DesktopSceneEngine_SessionPresentation_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
     set_tests_properties(DesktopSceneEngine_InstanceSessionLifecycleTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+
+    get_target_property(tray_role_sources DesktopSceneEngine_InstanceSessionLifecycleTest SOURCES)
+    list(REMOVE_ITEM tray_role_sources Player/InstanceSessionLifecycleTest.cpp)
+    add_executable(DesktopSceneEngine_TrayRolePresentationTest Player/TrayRolePresentationTest.cpp ${tray_role_sources})
+    set_target_properties(DesktopSceneEngine_TrayRolePresentationTest PROPERTIES AUTOMOC ON)
+    target_include_directories(DesktopSceneEngine_TrayRolePresentationTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
+    target_compile_features(DesktopSceneEngine_TrayRolePresentationTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_TrayRolePresentationTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_TrayRolePresentationTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network advapi32 user32)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_TrayRolePresentationTest)
+    add_dependencies(DesktopSceneEngine_TrayRolePresentationTest DesktopSceneEngine_QtPlayer_lrelease)
+    add_custom_command(TARGET DesktopSceneEngine_TrayRolePresentationTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:DesktopSceneEngine_TrayRolePresentationTest>/i18n
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
+            $<TARGET_FILE_DIR:DesktopSceneEngine_TrayRolePresentationTest>/i18n VERBATIM)
+    foreach(case menu launcher all lifecycle ordering modal qualification snapshot terminal-loss replacement overlap unavailable nonactivation native-modal-all application-modal-all drain-join)
+        add_test(NAME DesktopSceneEngine_TrayRoles_${case} COMMAND DesktopSceneEngine_TrayRolePresentationTest ${case})
+        set_tests_properties(DesktopSceneEngine_TrayRoles_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
+
+    add_executable(DesktopSceneEngine_TrayControlPresentationTest Player/TrayControlPresentationTest.cpp ${tray_role_sources})
+    set_target_properties(DesktopSceneEngine_TrayControlPresentationTest PROPERTIES AUTOMOC ON)
+    target_include_directories(DesktopSceneEngine_TrayControlPresentationTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
+    target_compile_features(DesktopSceneEngine_TrayControlPresentationTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_TrayControlPresentationTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_TrayControlPresentationTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network advapi32 user32)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_TrayControlPresentationTest)
+    foreach(scale 1 1.5 2)
+        add_test(NAME DesktopSceneEngine_TrayControl_dpi-${scale} COMMAND DesktopSceneEngine_TrayControlPresentationTest)
+        set_tests_properties(DesktopSceneEngine_TrayControl_dpi-${scale} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60 ENVIRONMENT "QT_SCALE_FACTOR=${scale}")
+    endforeach()
 
     add_executable(DesktopSceneEngine_GlobalLanguageSettingsTest
         Player/GlobalLanguageSettingsTest.cpp
@@ -4819,7 +4876,26 @@ if(WIN32)
     target_compile_options(DesktopSceneEngine_MainWindowDesktopPresentationTest
         PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
     target_link_libraries(DesktopSceneEngine_MainWindowDesktopPresentationTest
-        PRIVATE DesktopSceneEngine::Engine Qt6::Widgets user32)
+        PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network user32 advapi32)
+    target_sources(DesktopSceneEngine_MainWindowDesktopPresentationTest PRIVATE
+        ${CMAKE_SOURCE_DIR}/Player/ApplicationCoordinator.cpp
+        ${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp
+        ${CMAKE_SOURCE_DIR}/Player/InstanceAdmission.cpp
+        ${CMAKE_SOURCE_DIR}/Player/InstanceActivation.cpp
+        ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp)
+    add_test(NAME DesktopSceneEngine_SessionPresentation_tray-deployed
+        COMMAND DesktopSceneEngine_MainWindowDesktopPresentationTest --tray-deployed)
+    foreach(case menu visible hidden stale disconnected minimized failure disconnect-flight revision detach sequential showall loss peer rapid busy translation unavailable unavailable-flight)
+        add_test(NAME DesktopSceneEngine_TrayDeployment_${case}
+            COMMAND DesktopSceneEngine_MainWindowDesktopPresentationTest --tray-deployment-${case})
+        set_tests_properties(DesktopSceneEngine_TrayDeployment_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
+    set_tests_properties(DesktopSceneEngine_SessionPresentation_tray-deployed PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    foreach(case menu launcher-minimized launcher-hidden launcher-settings clean minimized-clean hidden-clean visible-cancel visible-save visible-discard hidden-save hidden-discard hidden-cancel save-as-cancel save-failure modal bgm-modal native-modal bgm-native-modal query query-old control-loss show-pending showall-pending duplicate pending-wait uncertain deploy-race peer-last peer-replacement peer-late peer-pending-death)
+        add_test(NAME DesktopSceneEngine_TrayClose_${case}
+            COMMAND DesktopSceneEngine_MainWindowDesktopPresentationTest --tray-close-${case})
+        set_tests_properties(DesktopSceneEngine_TrayClose_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
     add_dependencies(DesktopSceneEngine_MainWindowDesktopPresentationTest
         DesktopSceneEngine_QtPlayer_lrelease)
     add_custom_command(TARGET DesktopSceneEngine_MainWindowDesktopPresentationTest POST_BUILD
@@ -4832,4 +4908,70 @@ if(WIN32)
     deploy_ffmpeg_dlls(DesktopSceneEngine_MainWindowDesktopPresentationTest)
     add_test(NAME DesktopSceneEngine_MainWindowDesktopPresentationTest
         COMMAND DesktopSceneEngine_MainWindowDesktopPresentationTest)
+
+    # Real independent Session children, ordinary Close and current coordinator.
+    get_target_property(tray_close_all_sources DesktopSceneEngine_MainWindowDesktopPresentationTest SOURCES)
+    list(REMOVE_ITEM tray_close_all_sources Player/MainWindowDesktopPresentationTest.cpp)
+    add_executable(DesktopSceneEngine_TrayCloseAllTest Player/TrayCloseAllTest.cpp ${tray_close_all_sources})
+    set_target_properties(DesktopSceneEngine_TrayCloseAllTest PROPERTIES AUTOMOC ON)
+    target_include_directories(DesktopSceneEngine_TrayCloseAllTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
+    target_compile_features(DesktopSceneEngine_TrayCloseAllTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_TrayCloseAllTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_TrayCloseAllTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network user32 advapi32)
+    add_dependencies(DesktopSceneEngine_TrayCloseAllTest DesktopSceneEngine_QtPlayer_lrelease)
+    add_custom_command(TARGET DesktopSceneEngine_TrayCloseAllTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:DesktopSceneEngine_TrayCloseAllTest>/i18n
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
+            $<TARGET_FILE_DIR:DesktopSceneEngine_TrayCloseAllTest>/i18n VERBATIM)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_TrayCloseAllTest)
+    foreach(case action order cancel later replacement busy pending uncertain all-abort save-as save-failure bgm-busy preexisting-close preexisting-request unavailable launcher-recreate pending-death ordinary-overlap old-result full-accept launcher-only discard save late-drain hidden translation)
+        add_test(NAME DesktopSceneEngine_TrayCloseAll_${case} COMMAND DesktopSceneEngine_TrayCloseAllTest ${case})
+        set_tests_properties(DesktopSceneEngine_TrayCloseAll_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
 endif()
+
+if(TARGET DesktopSceneEngine_TrayCloseAllTest)
+    get_target_property(tray_recovery_sources DesktopSceneEngine_TrayCloseAllTest SOURCES)
+    list(REMOVE_ITEM tray_recovery_sources Player/TrayCloseAllTest.cpp)
+    add_executable(DesktopSceneEngine_TrayRecoveryTest Player/TrayRecoveryTest.cpp ${tray_recovery_sources})
+    set_target_properties(DesktopSceneEngine_TrayRecoveryTest PROPERTIES AUTOMOC ON)
+    target_include_directories(DesktopSceneEngine_TrayRecoveryTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
+    target_compile_features(DesktopSceneEngine_TrayRecoveryTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_TrayRecoveryTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_TrayRecoveryTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network user32 advapi32 ole32 oleaut32)
+    add_dependencies(DesktopSceneEngine_TrayRecoveryTest DesktopSceneEngine_QtPlayer)
+    qt_add_resources(DesktopSceneEngine_TrayRecoveryTest s7_application_icon
+        PREFIX "/icons" BASE "${CMAKE_SOURCE_DIR}/Player/resources"
+        FILES "${CMAKE_SOURCE_DIR}/Player/resources/DesktopSceneEngine.ico")
+    deploy_ffmpeg_dlls(DesktopSceneEngine_TrayRecoveryTest)
+    foreach(case death concurrent rejoin fencing relaunch shell shell-pending disconnect maximized-loss minimized-max-loss failed disconnect-death pending-death batch-death production-recovery gate-diagnostics prior-key-terminal prior-key-pending prior-key-fencing)
+        add_test(NAME DesktopSceneEngine_TrayRecovery_${case} COMMAND DesktopSceneEngine_TrayRecoveryTest ${case})
+        set_tests_properties(DesktopSceneEngine_TrayRecovery_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 65)
+    endforeach()
+endif()
+
+# Every existing MainWindow fixture builds the same local presentation implementation.
+get_property(session_fixture_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(session_fixture_target IN LISTS session_fixture_targets)
+    get_target_property(session_fixture_sources ${session_fixture_target} SOURCES)
+    list(FIND session_fixture_sources "${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp" session_main_source)
+    list(FIND session_fixture_sources "${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp" session_launcher_source)
+    list(FIND session_fixture_sources "${CMAKE_SOURCE_DIR}/Player/SessionPresentation.cpp" session_presentation_source)
+    if((NOT session_main_source EQUAL -1 OR NOT session_launcher_source EQUAL -1) AND session_presentation_source EQUAL -1)
+        target_sources(${session_fixture_target} PRIVATE ${CMAKE_SOURCE_DIR}/Player/SessionPresentation.cpp)
+    endif()
+    if(NOT session_launcher_source EQUAL -1)
+        target_sources(${session_fixture_target} PRIVATE ${CMAKE_SOURCE_DIR}/Player/DisplayPresentation.cpp)
+    endif()
+    if(NOT session_main_source EQUAL -1 OR NOT session_launcher_source EQUAL -1)
+        # S5 hidden ordinary-Close interactions reuse the existing activation helper.
+        # Compile that same helper in legacy local fixtures, not a test-only substitute.
+        foreach(session_activation_source InstanceActivation.cpp InstanceAdmission.cpp)
+            list(FIND session_fixture_sources "${CMAKE_SOURCE_DIR}/Player/${session_activation_source}" session_activation_index)
+            if(session_activation_index EQUAL -1)
+                target_sources(${session_fixture_target} PRIVATE "${CMAKE_SOURCE_DIR}/Player/${session_activation_source}")
+            endif()
+        endforeach()
+        target_link_libraries(${session_fixture_target} PRIVATE Qt6::Network advapi32 user32)
+    endif()
+endforeach()

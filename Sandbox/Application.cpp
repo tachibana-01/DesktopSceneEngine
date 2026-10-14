@@ -282,7 +282,7 @@ int Application::runLoop()
 {
     std::cout
         << "Controls: Space pause/resume, 1/NumPad1=1x, "
-        << "2/NumPad2=2x, 5/NumPad5=0.5x, N=next, "
+        << "2/NumPad2=2x, 5/NumPad5=0.5x, P=previous, N=next, "
         << "Up/Down=volume, M=mute, Esc=exit."
         << std::endl;
 
@@ -324,6 +324,10 @@ int Application::runLoop()
         if (engine_.consumeKeyPress('N'))
         {
             engine_.switchToNextScene();
+        }
+        if (engine_.consumeKeyPress('P'))
+        {
+            engine_.switchToPreviousScene();
         }
         if (engine_.consumeKeyPress(VK_UP))
         {

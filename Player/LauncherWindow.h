@@ -3,6 +3,7 @@
 #include <DesktopSceneEngine/Platform/Display.h>
 #include "ApplicationPreferences.h"
 #include "GlobalSettingsNotification.h"
+#include "SessionPresentation.h"
 
 #include <QMainWindow>
 
@@ -14,6 +15,7 @@ class QLabel;
 class QListWidget;
 class QPushButton;
 class QWidget;
+class QToolButton;
 
 class LauncherWindowTestAccess;
 
@@ -29,6 +31,7 @@ public:
 
     // Called only on accepted close, before role teardown. Bootstrap owns the resource it stops.
     void setAcceptedCloseCallback(std::function<void()> callback) { acceptedCloseCallback_ = std::move(callback); }
+    SessionPresentation& trayPresentation() { return trayPresentation_; }
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -61,6 +64,8 @@ private:
     QPushButton* identifyButton_ = nullptr;
     QPushButton* startSessionButton_ = nullptr;
     QPushButton* settingsButton_ = nullptr;
+    QToolButton* hideToTrayButton_ = nullptr;
+    SessionPresentation trayPresentation_{*this};
     ApplicationTranslationState& translationState_;
     ApplicationPreferencesStore& preferencesStore_;
     // Literal source text for the last action result; translated text is derived.

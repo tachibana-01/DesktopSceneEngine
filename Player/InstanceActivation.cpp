@@ -31,23 +31,29 @@ QByteArray activationRequestFrame(const InstanceSlot& slot)
     return frame;
 }
 
-void surfaceAdmittedRole(QWidget& role)
+void surfaceAdmittedRole(QWidget& role, ActivationRequest activation)
 {
+    const bool requestActivation = activation == ActivationRequest::Request;
+    const bool priorShowWithoutActivating = role.testAttribute(Qt::WA_ShowWithoutActivating);
+    if (!requestActivation) role.setAttribute(Qt::WA_ShowWithoutActivating);
+    if (!requestActivation && role.isMinimized()) role.hide();
     // Restore the existing state, not showNormal(): a minimized maximized role stays maximized.
     if (role.isMinimized()) role.setWindowState(role.windowState() & ~Qt::WindowMinimized);
     role.show();
+    role.setAttribute(Qt::WA_ShowWithoutActivating, priorShowWithoutActivating);
     QWidget* target = &role;
-    if (auto* modal = QApplication::activeModalWidget(); modal && (modal == &role || role.isAncestorOf(modal)))
+    if (auto* modal = QApplication::activeModalWidget(); modal
+        && (modal->windowModality() == Qt::ApplicationModal || modal == &role || role.isAncestorOf(modal)))
         target = modal;
     // Native QFileDialog has a hidden Qt modal wrapper, not the displayed dialog HWND.
     // Resolve the currently blocking owned popup transiently; never foreground that wrapper/parent.
     const bool hiddenModalWrapper = target->testAttribute(Qt::WA_DontShowOnScreen);
-    const auto roleHwnd = reinterpret_cast<HWND>(role.winId());
-    const auto nativeBase = reinterpret_cast<HWND>((hiddenModalWrapper ? &role : target)->winId());
+    QWidget* blockerOwner = hiddenModalWrapper && target->parentWidget() ? target->parentWidget()->window() : &role;
+    const auto nativeBase = reinterpret_cast<HWND>((hiddenModalWrapper ? blockerOwner : target)->winId());
     if (hiddenModalWrapper || !IsWindowEnabled(nativeBase))
     {
         // GetLastActivePopup must start at the unowned root, including nested owned dialogs.
-        const auto rootOwner = GetAncestor(roleHwnd, GA_ROOTOWNER);
+        const auto rootOwner = GetAncestor(nativeBase, GA_ROOTOWNER);
         const auto popup = GetLastActivePopup(rootOwner);
         DWORD popupProcess = 0;
         if (popup) GetWindowThreadProcessId(popup, &popupProcess);
@@ -55,12 +61,14 @@ void surfaceAdmittedRole(QWidget& role)
             && popupProcess == GetCurrentProcessId()
             && GetAncestor(popup, GA_ROOTOWNER) == rootOwner)
         {
-            if (!SetForegroundWindow(popup)) QApplication::alert(&role);
+            if (!requestActivation) SetWindowPos(popup, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (requestActivation && !SetForegroundWindow(popup)) QApplication::alert(&role);
         }
-        else QApplication::alert(&role);
+        else if (requestActivation) QApplication::alert(&role);
         return;
     }
     target->raise();
+    if (!requestActivation) return;
     target->activateWindow();
     if (!SetForegroundWindow(reinterpret_cast<HWND>(target->winId()))) QApplication::alert(target);
 }
@@ -86,12 +94,21 @@ bool InstanceActivationEndpoint::listen()
     return !closing_ && !activationRequestFrame(slot_).isEmpty() && server_.listen(slot_.endpointName());
 }
 
-void InstanceActivationEndpoint::bindReadyRole(QWidget& role)
+void InstanceActivationEndpoint::bindReadyRole(QWidget& role, std::function<void()> restorePresentation)
 {
     if (closing_) return;
     role_ = &role;
+    restorePresentation_ = std::move(restorePresentation);
     connect(&role, &QObject::destroyed, this, [this] { beginShutdown(); });
     // Complete requests accepted during a legitimate admission-to-ready startup gap.
+    for (auto* socket : findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
+        QMetaObject::invokeMethod(socket, "readyRead", Qt::QueuedConnection);
+}
+
+void InstanceActivationEndpoint::setReadyRoleProvider(std::function<QWidget*()> provider)
+{
+    if (closing_) return;
+    roleProvider_ = std::move(provider);
     for (auto* socket : findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly))
         QMetaObject::invokeMethod(socket, "readyRead", Qt::QueuedConnection);
 }
@@ -131,15 +148,20 @@ void InstanceActivationEndpoint::consume(QLocalSocket* socket, Request& request)
         socket->abort();
         return;
     }
-    if (request.bytes.size() != static_cast<qsizetype>(size) + 4 || !role_) return;
-    request.completed = true;
+    if (request.bytes.size() != static_cast<qsizetype>(size) + 4) return;
     if (request.bytes != activationRequestFrame(slot_))
     {
+        request.completed = true;
         socket->abort();
         return;
     }
-    surfaceAdmittedRole(*role_);
-    if (closing_ || !role_) { socket->abort(); return; }
+    QPointer<QWidget> role = roleProvider_ ? roleProvider_() : role_.data();
+    if (!role) return;
+    request.completed = true;
+    if (restorePresentation_) restorePresentation_();
+    if (closing_ || !role) { socket->abort(); return; }
+    surfaceAdmittedRole(*role);
+    if (closing_ || !role) { socket->abort(); return; }
     socket->write(ActivationAck);
     socket->disconnectFromServer();
 }
@@ -148,6 +170,8 @@ void InstanceActivationEndpoint::beginShutdown()
 {
     closing_ = true;
     role_.clear();
+    roleProvider_ = {};
+    restorePresentation_ = {};
     server_.close();
     for (auto* socket : findChildren<QLocalSocket*>(QString{}, Qt::FindDirectChildrenOnly)) socket->abort();
     // QObject destruction closes/deletes accepted sockets before the enclosing bootstrap releases the lease.

@@ -1,6 +1,7 @@
 #include "LauncherWindow.h"
 
 #include "DisplaySessionBootstrap.h"
+#include "DisplayPresentation.h"
 
 #include <QCoreApplication>
 #include <QCloseEvent>
@@ -16,6 +17,7 @@
 #include <QSignalBlocker>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <QToolButton>
 
 #include <cstddef>
 #include <optional>
@@ -27,35 +29,6 @@ namespace
 QString launcherText(const char* sourceText)
 {
     return QCoreApplication::translate("LauncherWindow", sourceText);
-}
-
-QString fromUtf8(const std::string& value)
-{
-    return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
-}
-
-QString displayLabel(const DesktopSceneEngine::Platform::DisplayDescriptor& display)
-{
-    QString name = fromUtf8(display.friendlyName).trimmed();
-    if (name.isEmpty())
-    {
-        name = launcherText("Display %1").arg(display.displayNumber);
-    }
-
-    QString label = launcherText("%1 — %2 × %3")
-        .arg(name)
-        .arg(display.pixelWidth)
-        .arg(display.pixelHeight);
-    if (display.primary)
-    {
-        label += launcherText(" — Primary");
-    }
-    if (!display.id.isPersistentOwnerCapable())
-    {
-        label += launcherText(" — Session unavailable");
-    }
-
-    return label;
 }
 
 QString enumerationFailureText(
@@ -91,7 +64,11 @@ namespace DesktopSceneEngine::Player
 void LauncherWindow::closeEvent(QCloseEvent* event)
 {
     QMainWindow::closeEvent(event);
-    if (event->isAccepted() && acceptedCloseCallback_) acceptedCloseCallback_();
+    if (event->isAccepted())
+    {
+        trayPresentation_.beginTeardown();
+        if (acceptedCloseCallback_) acceptedCloseCallback_();
+    }
 }
 
 LauncherWindow::LauncherWindow(ApplicationTranslationState& translationState,
@@ -102,6 +79,19 @@ LauncherWindow::LauncherWindow(ApplicationTranslationState& translationState,
 
     auto* centralWidget = new QWidget(this);
     auto* layout = new QVBoxLayout(centralWidget);
+    auto* presentationRow = new QHBoxLayout();
+    presentationRow->setContentsMargins(4, 2, 4, 2);
+    presentationRow->addStretch();
+    hideToTrayButton_ = new QToolButton(centralWidget);
+    hideToTrayButton_->setObjectName(QStringLiteral("launcherHideToTray"));
+    hideToTrayButton_->setText(QString::fromUtf8("⌄"));
+    hideToTrayButton_->setAutoRaise(true);
+    hideToTrayButton_->setMinimumSize(28, 24);
+    hideToTrayButton_->setToolTip(launcherText("Hide to System Tray"));
+    hideToTrayButton_->setAccessibleName(launcherText("Hide to System Tray"));
+    presentationRow->addWidget(hideToTrayButton_);
+    layout->addLayout(presentationRow);
+    trayPresentation_.bindButton(*hideToTrayButton_);
     instructionLabel_ = new QLabel(
         launcherText("Select a display to start an independent Display Session."),
         centralWidget
@@ -209,6 +199,8 @@ void LauncherWindow::retranslateUi()
     settingsButton_->setText(launcherText("Settings"));
     identifyButton_->setText(launcherText("Identify"));
     startSessionButton_->setText(launcherText("Start Session"));
+    hideToTrayButton_->setToolTip(launcherText("Hide to System Tray"));
+    hideToTrayButton_->setAccessibleName(launcherText("Hide to System Tray"));
     for (int row = 0; row < displayList_->count(); ++row)
         displayList_->item(row)->setText(displayLabel(displayEnumeration_.snapshot.displays[static_cast<std::size_t>(row)]));
     updateStatus();

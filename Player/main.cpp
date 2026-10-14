@@ -4,6 +4,7 @@
 #include "MainWindow.h"
 #include "InstanceAdmission.h"
 #include "InstanceActivation.h"
+#include "ApplicationCoordinator.h"
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -35,6 +36,9 @@ int main(int argc, char* argv[])
     {
         applicationArguments.removeFirst();
     }
+    const bool coordinatorBootstrap = applicationArguments == QStringList{
+        QString::fromLatin1(DesktopSceneEngine::Player::CoordinatorBootstrapArgument)};
+    if (coordinatorBootstrap) applicationArguments.clear();
     const DesktopSceneEngine::Player::ApplicationProcessMode processMode =
         DesktopSceneEngine::Player::parseApplicationProcessMode(applicationArguments);
 
@@ -76,6 +80,8 @@ int main(int argc, char* argv[])
     }
     if (outcome == DesktopSceneEngine::Player::InstanceAdmissionOutcome::Occupied)
     {
+        // An internal missing-coordinator attempt must never create/surface Launcher UI.
+        if (coordinatorBootstrap) return 0;
         const auto forwarded = DesktopSceneEngine::Player::forwardActivation(*slot);
         if (forwarded.outcome != DesktopSceneEngine::Player::ActivationForwardOutcome::Delivered)
         {
@@ -93,10 +99,20 @@ int main(int argc, char* argv[])
     }
     if (std::holds_alternative<DesktopSceneEngine::Player::LauncherProcessMode>(processMode))
     {
-        DesktopSceneEngine::Player::LauncherWindow launcherWindow{translationState, preferencesStore};
-        launcherWindow.setAcceptedCloseCallback([&activation] { activation.beginShutdown(); });
-        launcherWindow.show();
-        activation.bindReadyRole(launcherWindow);
+        application.setQuitOnLastWindowClosed(false);
+        DesktopSceneEngine::Player::ApplicationCoordinator coordinator{*slot, activation, coordinatorBootstrap};
+        coordinator.setLauncherFactory([&] {
+            auto* launcher = new DesktopSceneEngine::Player::LauncherWindow{translationState, preferencesStore};
+            launcher->setAcceptedCloseCallback([&coordinator, launcher] { coordinator.retireLauncher(*launcher); });
+            return launcher;
+        });
+        if (!coordinator.listen())
+        {
+            std::cerr << "[Coordinator] Join endpoint could not start." << std::endl;
+            activation.beginShutdown();
+            return 1;
+        }
+        if (!coordinatorBootstrap) coordinator.showLauncher();
         const int result = application.exec();
         activation.beginShutdown();
         return result;
@@ -109,7 +125,9 @@ int main(int argc, char* argv[])
         translationState,
         preferencesStore,
         preferences};
-    window.setAcceptedCloseCallback([&activation] { activation.beginShutdown(); });
+    // Hide must not end the process when its last primary window becomes invisible.
+    // Ordinary accepted Close remains the explicit Session process exit authority.
+    application.setQuitOnLastWindowClosed(false);
     window.show();
     if (!window.initializeEngine())
     {
@@ -117,7 +135,21 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    activation.bindReadyRole(window);
+    activation.bindReadyRole(window, [&window] { (void)window.trayPresentation().restore(); });
+    const auto launcherSlot = DesktopSceneEngine::Player::InstanceSlot::fromProcessMode(
+        DesktopSceneEngine::Player::LauncherProcessMode{}, *scope);
+    DesktopSceneEngine::Player::SessionCoordinatorJoin coordinatorJoin{*slot, *launcherSlot};
+    coordinatorJoin.enableControl(window.trayPresentation());
+    coordinatorJoin.enableDesktopDeployment([&window] { return window.desktopDeploymentProjection(); },
+        [&window](DesktopSceneEngine::Player::DesktopDeploymentIntent intent) { return window.requestDesktopDeployment(intent); });
+    window.setAcceptedCloseCallback([&] {
+        coordinatorJoin.beginRoleTeardown();
+        activation.beginShutdown();
+        QTimer::singleShot(0, &coordinatorJoin, [&] {
+            coordinatorJoin.drainAndStop([&] { application.quit(); });
+        }); // Ordinary teardown finishes before result drainage/explicit process exit, including hidden clean Close.
+    });
+    coordinatorJoin.start(window);
     const int result = application.exec();
     activation.beginShutdown();
     return result;

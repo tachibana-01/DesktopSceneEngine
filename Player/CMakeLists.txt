@@ -26,8 +26,16 @@ target_sources(
     InstanceAdmission.cpp
     InstanceActivation.h
     InstanceActivation.cpp
+    ApplicationCoordinator.h
+    ApplicationCoordinator.cpp
+    SessionPresentation.h
+    SessionPresentation.cpp
+    DesktopDeployment.h
+    RoleClose.h
     LauncherWindow.h
     LauncherWindow.cpp
+    DisplayPresentation.h
+    DisplayPresentation.cpp
     ProjectDocumentState.h
     EffectiveVolume.h
     DisplaySelectionState.h
