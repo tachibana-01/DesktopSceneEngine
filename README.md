@@ -15,6 +15,10 @@ compatibility or a completed long-term roadmap. The current source includes:
 - Display-owned Project JSON v3 persistence and a fixed logical Canvas aspect.
 - A Launcher and one admitted Player session per persistent display identity;
   repeated launches activate the existing role instead of creating a duplicate.
+- **System Tray V1**: a single system-tray entry, Launcher/Session Hide and Show,
+  per-session tray Deploy/Undeploy, Show All, and Close/Close All through the normal
+  close workflow. Tray control supports Explorer/shell restart and application
+  lifecycle recovery.
 - Preview-only startup and reversible **Deploy / Undeploy**, preserving the Project,
   Canvas and Engine playback session.
 - Shared graphics-device recovery, Explorer/shell-host invalidation handling and
@@ -50,7 +54,6 @@ Player/       Qt Widgets Launcher and fixed-display Player sessions
 Sandbox/      Developer runtime exerciser, not the normal Player entry point
 tests/        Automated tests, checked-in synthetic audio, optional native/soak tools
 docs/         Architecture, persistence specifications and historical planning
-notes/        Historical/design notes accepted for publication
 vcpkg.json    nlohmann-json and FFmpeg manifest dependencies
 CMakeLists.txt
 ```
