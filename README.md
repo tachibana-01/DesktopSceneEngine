@@ -171,8 +171,9 @@ preserve ownership boundaries, and provide focused regression evidence.
 
 ## Releases
 
-No prebuilt binary release is currently published.
-Future Windows packages will be distributed through GitHub Releases.
+A prebuilt Windows binary release is available for `v0.1.0`; it does not include
+System Tray V1. No qualified prebuilt Windows package is currently available for
+`v0.2.0`.
 
 ## License and dependencies
 
