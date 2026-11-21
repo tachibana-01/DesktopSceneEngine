@@ -58,7 +58,7 @@ The architecture separates these responsibilities into independent modules.
 
 # 4. Product Composition
 
-The project consists of two major products.
+The production application consists of the Engine and the Windows Player.
 
 ## Engine
 
@@ -72,23 +72,15 @@ It may be used independently as a library or SDK.
 
 ---
 
-## Editor
+## Windows Player
 
-The Editor is the graphical management application.
-
-It provides tools for:
-
-- Scene editing
-- Media management
-- Crop editing
-- Playlist management
-- Settings
-- Preview
-- Project management
-
-The Editor communicates with the Engine through public interfaces only.
-
-The Editor must not implement business logic already provided by the Engine.
+Launcher and its Coordinator start or open a Session for a display. A native
+Session application owns document and command handling. React and TypeScript
+present Launcher, the Session editor, and the background-music window through
+WebView2. Qt 6 provides application and platform services. The Engine serves
+native Preview and the Session's Deploy and Undeploy operations for the bound
+Windows desktop target. Generalized display mapping remains separate from this
+fixed-target deployment path.
 
 ---
 
@@ -197,7 +189,7 @@ Technical implementation belongs to the Infrastructure Layer.
 
 Operating-system interaction belongs to the Platform Layer.
 
-User interaction belongs to the Editor.
+User interaction belongs to the Player's Launcher and Session presentation surfaces.
 
 No responsibility shall be duplicated across modules.
 
@@ -215,11 +207,16 @@ Architectural changes shall be documented through Architecture Decision Records 
 
 ---
 
-# 9. Phase 83 Canvas / Media Presentation / Display Target Editor Foundation
+# 9. Phase 83 Canvas / Media Presentation / Display Target Editor Foundation (Historical)
 
-Phase 83 is complete. It implements the editor foundation for Canvas, per-Item Media
+This section records the completed Phase 83 baseline. Its Preview hierarchy,
+display policy and persistence scope describe that checkpoint. The current
+Windows Player and desktop deployment are described in §4.
+
+Phase 83 implemented the editor foundation for Canvas, per-Item Media
 Presentation, Windows Display Target selection, Identify, and the Player Preview
-CanvasFrame. It does not implement physical desktop output or JSON vNext.
+CanvasFrame. Physical desktop output and newer project formats were outside
+that checkpoint.
 
 ## Current Semantic Pipeline
 

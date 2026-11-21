@@ -1,22 +1,35 @@
 #include "ActivePlaybackProjection.h"
 #include "MainWindowTestDisplay.h"
 #include "WorkspaceModel.h"
+#include "../Core/AudioExecutionEngineFixture.h"
 
 #include <DesktopSceneEngine/Engine.h>
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 namespace
 {
 
 using DesktopSceneEngine::Engine;
+namespace Audio = DesktopSceneEngine::Audio;
+namespace Tests = DesktopSceneEngine::Tests;
+
+class ProjectionEngine : public Tests::AwaitAudioEngine
+{
+public:
+    bool switchToNextScene()
+    { return Tests::effect(*this, [&] { return Engine::switchToNextScene(); }); }
+};
 using DesktopSceneEngine::Player::ActivePlaybackProjection;
 using DesktopSceneEngine::Player::ItemId;
 using DesktopSceneEngine::Player::WorkspaceMediaType;
@@ -31,6 +44,42 @@ bool require(bool condition, const char* message)
 
     std::cerr << "Test failed: " << message << std::endl;
     return false;
+}
+
+std::optional<Audio::AudioEffectReceipt> bindAndObserveStart(ProjectionEngine& engine,
+    const DesktopSceneEngine::Domain::Project& project, const DesktopSceneEngine::Domain::EntityId& scene)
+{
+    if (!Tests::settle(engine)) return std::nullopt;
+    const auto token = engine.beginAudioEffect(Engine::AudioEffectScope::Structural);
+    if (!token) return std::nullopt;
+    const bool accepted = engine.Engine::bindProject(project, scene);
+    (void)engine.finishAudioEffect(*token, accepted);
+    if (!accepted) return std::nullopt;
+
+    const auto& control = DesktopSceneEngine::Core::AudioOutputRecoveryEngineTestAccess::control(engine);
+    const auto effect = std::find_if(control.effects.begin(), control.effects.end(),
+        [&](const auto& candidate) { return candidate.result.token == *token; });
+    if (effect == control.effects.end()) return std::nullopt;
+
+    // Observe the owner-issued Bind receipt before C consumes it. The normal
+    // follow-up can then install prepared audio without restarting the clock.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    do
+    {
+        for (const auto& ticket : effect->tickets)
+        {
+            const auto receipt = control.execution.receipt(ticket);
+            if (receipt && receipt->command == Audio::AudioCommandKind::ReplaceEmbedded
+                && receipt->replacement == Audio::AudioEmbeddedReplacement::Bind)
+            {
+                if (Tests::settle(engine) && engine.audioEffect(*token).phase == Engine::AudioEffectPhase::Applied)
+                    return receipt;
+                return std::nullopt;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    } while (std::chrono::steady_clock::now() < deadline);
+    return std::nullopt;
 }
 
 bool nearlyEqual(float left, float right, float tolerance = 0.02F)
@@ -126,7 +175,7 @@ bool verifyFinalStorageRebuild()
         return false;
     }
 
-    Engine engine{};
+    ProjectionEngine engine{};
     engine.initialize();
     if (!require(engine.bindProject(
             activeProjection->project,
@@ -349,7 +398,7 @@ bool verifyNonActivePlaylistAddLeavesPlaybackUntouched()
         return false;
     }
 
-    Engine engine{};
+    ProjectionEngine engine{};
     engine.initialize();
     if (!require(engine.bindProject(
             activeProjection->project,
@@ -477,7 +526,7 @@ bool verifyNonCurrentActivePlaylistDeleteRebuild()
         return false;
     }
 
-    Engine engine{};
+    ProjectionEngine engine{};
     engine.initialize();
     if (!require(engine.bindProject(
             activeProjection->project,
@@ -561,9 +610,10 @@ bool verifyNonCurrentActivePlaylistDeleteRebuild()
         || !require(engine.switchToNextScene()
                 && activeProjection->itemForSceneIndex(engine.activeSceneIndex()) == itemD,
             "Next after non-current deletion should use the rebuilt sequence")
-        || !require(
-            (engine.update(10.1F),
-                activeProjection->itemForSceneIndex(engine.activeSceneIndex()) == itemA),
+        || !require(Tests::waitUntil(engine, [&] {
+                engine.update();
+                return activeProjection->itemForSceneIndex(engine.activeSceneIndex()) == itemA;
+            }, std::chrono::seconds{12}),
             "Automatic transition after non-current deletion should use the rebuilt sequence"))
     {
         engine.shutdown();
@@ -630,7 +680,7 @@ bool verifyCurrentActivePlaylistDeleteStartsSuccessor()
         return false;
     }
 
-    Engine engine{};
+    ProjectionEngine engine{};
     engine.initialize();
     if (!require(engine.bindProject(
             activeProjection->project,
@@ -691,25 +741,41 @@ bool verifyCurrentActivePlaylistDeleteStartsSuccessor()
         return false;
     }
 
+    std::optional<Audio::AudioEffectReceipt> successorBind;
     {
         auto oldProjection = std::move(activeProjection);
         engine.detachProject();
         activeProjection = std::move(prepared->projection);
-        if (!require(engine.bindProject(
+        successorBind = bindAndObserveStart(engine,
                 activeProjection->project,
-                activeProjection->project.scenes[prepared->targetSceneIndex].id),
-                "The current-item successor projection should bind"))
+                activeProjection->project.scenes[prepared->targetSceneIndex].id);
+        if (!require(successorBind.has_value(), "The current-item successor should receive a real Bind receipt"))
         {
             engine.shutdown();
             return false;
         }
     }
 
+    const auto& start = successorBind->clock;
+    const auto current = DesktopSceneEngine::Core::AudioOutputRecoveryEngineTestAccess::control(engine).clock;
+    const auto ownerClock = Tests::audioState(engine).clock;
+    const bool startsAtZero = successorBind->result == Audio::AudioEffectResult::Applied
+        && start.valid() && start.position == 0.0 && start.rate == 1.5
+        && start.mode == Audio::AudioClockMode::Running;
+    const bool continues = current.valid() && current.binding == start.binding
+        && current.timingVersion >= start.timingVersion && current.time >= start.time
+        && std::fabs(current.position - Audio::resolveAudioClockPosition(start, current.time)) < 0.000001
+        && ownerClock.binding == current.binding && ownerClock.timingVersion == current.timingVersion
+        && ownerClock.time == current.time && ownerClock.position == current.position;
+    const float speed = engine.playbackSpeed();
+    const bool paused = engine.isPaused();
+    if (!startsAtZero || !continues || !nearlyEqual(speed, 1.5F) || paused)
+        std::cerr << "Successor bind: start=" << start.position << ", owner current anchor=" << ownerClock.position
+            << ", elapsed position=" << engine.playbackTime() << ", rate=" << speed << ", paused=" << paused << '\n';
+
     if (!require(activeProjection->itemForSceneIndex(engine.activeSceneIndex()) == itemD,
             "Deleting the current item must activate its logical successor")
-        || !require(nearlyEqual(engine.playbackTime(), 0.0F)
-                && nearlyEqual(engine.playbackSpeed(), 1.5F)
-                && !engine.isPaused(),
+        || !require(startsAtZero && continues && nearlyEqual(speed, 1.5F) && !paused,
             "The successor should start normally with its own configured rate")
         || !require(nearlyEqual(engine.volume(), oldVolume) && engine.isMuted() == oldMute,
             "Current-item deletion must preserve output volume and mute")
@@ -774,7 +840,7 @@ bool verifyNonActivePlaylistDeleteLeavesPlaybackUntouched()
         return false;
     }
 
-    Engine engine{};
+    ProjectionEngine engine{};
     engine.initialize();
     if (!require(engine.bindProject(
             activeProjection->project,
@@ -820,8 +886,15 @@ bool verifyNonActivePlaylistDeleteLeavesPlaybackUntouched()
 
 }
 
-int main()
+int main(int argc, char* argv[])
 {
+    if (argc == 2 && std::string_view{argv[1]} == "--fixture-independent")
+        return verifySuccessorIndexAfterCurrentItemRemoval() ? 0 : 1;
+    if (std::string_view{DESKTOP_SCENE_ENGINE_TEST_RESOURCES_DIR}.empty())
+    {
+        std::cerr << "External projection-rebuild media unavailable; use --fixture-independent for the public case.\n";
+        return 77;
+    }
     return verifyFinalStorageRebuild()
             && verifyNonActivePlaylistAddLeavesPlaybackUntouched()
             && verifySuccessorIndexAfterCurrentItemRemoval()

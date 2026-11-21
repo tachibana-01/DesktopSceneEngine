@@ -1,0 +1,14 @@
+@import './anchoredPopover.css';
+
+.playback-mode-trigger { display: grid; place-items: center; flex-shrink: 0; width: 30px; height: 30px; margin: 0; padding: 0; border: 0; border-radius: 2px; background: transparent; color: #8e9bad; }
+.playback-mode-trigger:hover { color: #c1cbd7; background: #252c35; }
+.playback-mode-trigger:focus-visible { outline: 1px solid #aab7c9; outline-offset: -1px; }
+.playback-mode-trigger:disabled { color: #4e5968; background: transparent; cursor: default; }
+.playback-mode-popover { position: fixed; z-index: 40; display: grid; grid-template-columns: 22px max-content 16px; column-gap: 10px; width: max-content; padding: 6px 10px; border: 0; border-radius: var(--dse-popover-radius); background: var(--dse-popover-surface); box-shadow: var(--dse-popover-shadow); transform: translateY(-100%); }
+.playback-mode-popover::after { content: ''; position: absolute; left: calc(var(--playback-mode-arrow-x, 50%) - 6px); bottom: -6px; width: 12px; height: 6px; background: inherit; border: 0; clip-path: polygon(0 0, 100% 0, 50% 100%); }
+.playback-mode-popover > button { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: center; min-height: 32px; padding: 0; border: 0; border-radius: 2px; background: transparent; color: #b8c4d4; font-size: 11px; text-align: left; white-space: nowrap; }
+.playback-mode-popover > button[aria-checked=true] { background: #2b3440; color: #d0d9e4; }
+.playback-mode-popover > button:hover { background: #343e4b; color: #e9edf3; }
+.playback-mode-popover > button:focus-visible { outline: 1px solid #8a99ae; outline-offset: -1px; }
+.playback-mode-check { display: block; width: 16px; text-align: center; color: #c5d0df; }
+.playback-mode-tooltip { position: fixed; z-index: 60; width: max-content; padding: 4px 7px; border-radius: 2px; background: var(--dse-popover-surface); color: #d0d9e4; font-size: 11px; line-height: 16px; pointer-events: none; transform: translate(-50%, -100%); }

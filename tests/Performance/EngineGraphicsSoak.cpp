@@ -33,7 +33,7 @@ class CanvasTargetFitTestAccess
 {
 public:
     static const GraphicsBackend& backend(const Engine& engine)
-    { return engine.renderer_->backend_; }
+    { return engine.renderer().backend_; }
 };
 }
 

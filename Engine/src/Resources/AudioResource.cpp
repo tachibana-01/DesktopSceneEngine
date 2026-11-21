@@ -30,6 +30,16 @@ namespace DesktopSceneEngine::Resources
 namespace
 {
 
+bool cancelled(const std::atomic_bool* cancellation) noexcept
+{
+    return cancellation && cancellation->load(std::memory_order_acquire);
+}
+
+int interruptAudio(void* opaque) noexcept
+{
+    return cancelled(static_cast<const std::atomic_bool*>(opaque)) ? 1 : 0;
+}
+
 struct FormatCloser
 {
     void operator()(AVFormatContext* context) const noexcept
@@ -181,6 +191,10 @@ bool appendFilteredFrame(
     const auto* samples = reinterpret_cast<const std::int16_t*>(frame.data[0]);
     try
     {
+        const auto required = output.size() + sampleCount;
+        if (required > output.capacity())
+            output.reserve((std::min)(MaximumPcmBytes / sizeof(std::int16_t),
+                (std::max)(required, output.capacity() * 2)));
         output.insert(output.end(), samples, samples + sampleCount);
     }
     catch (...)
@@ -194,9 +208,10 @@ bool appendFilteredFrame(
 bool buildTempoPcm(
     const std::vector<std::int16_t>& source,
     float tempo,
-    std::vector<std::int16_t>& output) noexcept
+    std::vector<std::int16_t>& output,
+    const std::atomic_bool* cancellation) noexcept
 {
-    if (!validTempo(tempo) || source.empty()
+    if (cancelled(cancellation) || !validTempo(tempo) || source.empty()
         || source.size() % OutputChannels != 0U)
     {
         return false;
@@ -264,6 +279,7 @@ bool buildTempoPcm(
 
     for (std::size_t frameOffset = 0; frameOffset < sourceFrames; )
     {
+        if (cancelled(cancellation)) return false;
         const std::size_t frames = (std::min)(
             FilterChunkFrames,
             sourceFrames - frameOffset);
@@ -296,6 +312,7 @@ bool buildTempoPcm(
         frameOffset += frames;
         while (true)
         {
+            if (cancelled(cancellation)) return false;
             const int result = av_buffersink_get_frame(
                 sinkContext,
                 filtered.get());
@@ -323,6 +340,7 @@ bool buildTempoPcm(
     }
     while (true)
     {
+        if (cancelled(cancellation)) return false;
         const int result = av_buffersink_get_frame(sinkContext, filtered.get());
         if (result == AVERROR_EOF)
         {
@@ -335,7 +353,7 @@ bool buildTempoPcm(
         av_frame_unref(filtered.get());
     }
 
-    return !output.empty();
+    return !cancelled(cancellation) && !output.empty();
 }
 
 }
@@ -356,6 +374,7 @@ struct AudioResource::Impl
     AVSampleFormat sourceSampleFormat = AV_SAMPLE_FMT_NONE;
     AudioOpenStatus status = AudioOpenStatus::NotOpened;
     float tempo = 1.0F;
+    const std::atomic_bool* cancellation = nullptr;
 };
 
 bool AudioResource::appendConvertedSamples(
@@ -364,6 +383,7 @@ bool AudioResource::appendConvertedSamples(
     int inputSamples
 ) noexcept
 {
+    if (cancelled(impl.cancellation)) return false;
     const int outputCapacity = swr_get_out_samples(
         impl.resampler.get(),
         inputSamples);
@@ -435,6 +455,10 @@ bool AudioResource::appendConvertedSamples(
 
     try
     {
+        const auto required = impl.pcm.size() + convertedSamples;
+        if (required > impl.pcm.capacity())
+            impl.pcm.reserve((std::min)(MaximumPcmBytes / sizeof(std::int16_t),
+                (std::max)(required, impl.pcm.capacity() * 2)));
         impl.pcm.insert(
             impl.pcm.end(),
             chunk.begin(),
@@ -455,6 +479,7 @@ bool AudioResource::flushResampler(Impl& impl) noexcept
          iteration < maximumFlushIterations;
          ++iteration)
     {
+        if (cancelled(impl.cancellation)) return false;
         const int pending = swr_get_out_samples(impl.resampler.get(), 0);
         if (pending < 0)
         {
@@ -487,6 +512,7 @@ bool AudioResource::receiveDecodedFrames(Impl& impl) noexcept
 {
     while (true)
     {
+        if (cancelled(impl.cancellation)) return false;
         const int result = avcodec_receive_frame(
             impl.codec.get(),
             impl.decodedFrame.get());
@@ -515,7 +541,7 @@ bool AudioResource::receiveDecodedFrames(Impl& impl) noexcept
 
 bool AudioResource::decodePcm(Impl& impl) noexcept
 {
-    while (av_read_frame(impl.format.get(), impl.packet.get()) >= 0)
+    while (!cancelled(impl.cancellation) && av_read_frame(impl.format.get(), impl.packet.get()) >= 0)
     {
         if (impl.packet->stream_index == impl.audioStreamIndex)
         {
@@ -530,7 +556,7 @@ bool AudioResource::decodePcm(Impl& impl) noexcept
         av_packet_unref(impl.packet.get());
     }
 
-    if (avcodec_send_packet(impl.codec.get(), nullptr) < 0
+    if (cancelled(impl.cancellation) || avcodec_send_packet(impl.codec.get(), nullptr) < 0
         || !receiveDecodedFrames(impl)
         || !flushResampler(impl))
     {
@@ -556,14 +582,14 @@ MediaType AudioResource::type() const noexcept
     return MediaType::Audio;
 }
 
-bool AudioResource::open(const std::filesystem::path& path) noexcept
+bool AudioResource::open(const std::filesystem::path& path, const std::atomic_bool* cancellation) noexcept
 {
     if (impl_ != nullptr)
     {
         impl_->status = AudioOpenStatus::DecodeFailure;
     }
 
-    if (path.empty())
+    if (path.empty() || cancelled(cancellation))
     {
         return false;
     }
@@ -579,6 +605,7 @@ bool AudioResource::open(const std::filesystem::path& path) noexcept
     }
 
     candidate->packet.reset(av_packet_alloc());
+    candidate->cancellation = cancellation;
     candidate->decodedFrame.reset(av_frame_alloc());
     if (!candidate->packet || !candidate->decodedFrame)
     {
@@ -588,14 +615,17 @@ bool AudioResource::open(const std::filesystem::path& path) noexcept
     const std::string utf8Path = pathAsUtf8(path);
     candidate->sourcePath = utf8Path;
 
-    AVFormatContext* rawFormat = nullptr;
+    AVFormatContext* rawFormat = avformat_alloc_context();
+    if (!rawFormat) return false;
+    rawFormat->interrupt_callback = {interruptAudio, const_cast<std::atomic_bool*>(cancellation)};
     if (avformat_open_input(&rawFormat, utf8Path.c_str(), nullptr, nullptr) < 0)
     {
+        avformat_close_input(&rawFormat);
         return false;
     }
     candidate->format.reset(rawFormat);
 
-    if (avformat_find_stream_info(candidate->format.get(), nullptr) < 0)
+    if (cancelled(cancellation) || avformat_find_stream_info(candidate->format.get(), nullptr) < 0)
     {
         return false;
     }
@@ -668,20 +698,22 @@ bool AudioResource::open(const std::filesystem::path& path) noexcept
     candidate->sourceChannels = candidate->codec->ch_layout.nb_channels;
     candidate->sourceSampleFormat = candidate->codec->sample_fmt;
 
-    if (!decodePcm(*candidate))
+    if (!decodePcm(*candidate) || cancelled(cancellation))
     {
         return false;
     }
 
+    try { candidate->tempoPcm = candidate->pcm; }
+    catch (...) { return false; }
+    if (cancelled(cancellation)) return false;
     impl_ = std::move(candidate);
     impl_->status = AudioOpenStatus::Ready;
-    impl_->tempoPcm = impl_->pcm;
     return true;
 }
 
-bool AudioResource::setTempo(float tempo) noexcept
+bool AudioResource::setTempo(float tempo, const std::atomic_bool* cancellation) noexcept
 {
-    if (!impl_ || impl_->status != AudioOpenStatus::Ready
+    if (cancelled(cancellation) || !impl_ || impl_->status != AudioOpenStatus::Ready
         || !validTempo(tempo))
     {
         return false;
@@ -689,13 +721,15 @@ bool AudioResource::setTempo(float tempo) noexcept
 
     if (std::fabs(tempo - 1.0F) < 0.0001F)
     {
-        impl_->tempoPcm = impl_->pcm;
+        try { impl_->tempoPcm = impl_->pcm; }
+        catch (...) { return false; }
+        if (cancelled(cancellation)) return false;
         impl_->tempo = 1.0F;
         return true;
     }
 
     std::vector<std::int16_t> candidate{};
-    if (!buildTempoPcm(impl_->pcm, tempo, candidate))
+    if (!buildTempoPcm(impl_->pcm, tempo, candidate, cancellation))
     {
         return false;
     }
@@ -703,6 +737,26 @@ bool AudioResource::setTempo(float tempo) noexcept
     impl_->tempoPcm = std::move(candidate);
     impl_->tempo = tempo;
     return true;
+}
+
+AudioPcmStorage AudioResource::releasePcm() noexcept
+{
+    if (!impl_) return {};
+    impl_->status = AudioOpenStatus::NotOpened;
+    return {std::move(impl_->pcm), std::move(impl_->tempoPcm), impl_->tempo};
+}
+
+bool AudioResource::prepareTempoPcm(const std::vector<std::int16_t>& original,
+    float tempo, std::vector<std::int16_t>& output, const std::atomic_bool* cancellation) noexcept
+{
+    if (cancelled(cancellation) || !validTempo(tempo) || original.empty() || &original == &output) return false;
+    if (std::fabs(tempo - 1.0F) < 0.0001F)
+    {
+        try { output = original; }
+        catch (...) { return false; }
+        return !cancelled(cancellation);
+    }
+    return buildTempoPcm(original, tempo, output, cancellation);
 }
 
 float AudioResource::tempo() const noexcept

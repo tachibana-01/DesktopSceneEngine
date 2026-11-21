@@ -266,9 +266,10 @@ Project owns:
 - History
 - Favorites
 
-The current Desktop Canvas and Display Target selection are Player workspace/session
-state while JSON v1.0 is frozen. They must not be described as persisted Domain
-Project fields.
+The frozen v1.0 Domain `Project` does not persist a Desktop Canvas or a Display
+Target. The current v2 `AuthoredProject` persists the Desktop Canvas aspect. The
+physical Display Target remains Session/platform state. See
+[Authored Project JSON v2](06_AUTHORED_PROJECT_JSON_V2.md).
 
 Scene owns:
 
@@ -392,10 +393,13 @@ The model is designed so that new entities can be introduced without modifying e
 
 ---
 
-# 11. Phase 83 Canvas and Display Target Contract
+# 11. Phase 83 Canvas and Display Target Contract (Historical)
 
 Phase 83 implements the editor foundation described here. It does not add JSON v1.0
 persistence, Canvas-to-Display Mapping, or physical desktop output.
+The following subsections describe that historical baseline. The current persistence
+and output paths are described in [Authored Project JSON v2](06_AUTHORED_PROJECT_JSON_V2.md)
+and [Architecture](01_ARCHITECTURE.md#4-product-composition).
 
 ## Semantic Pipeline
 

@@ -170,6 +170,21 @@ bool verifyLatestRequestReplacement()
             "The state must retain one bounded pending request and count superseded requests");
 }
 
+bool verifyCancelledRequestBeforeWorkerConsumes()
+{
+    using DesktopSceneEngine::Player::TimelinePreviewRequestState;
+    using DesktopSceneEngine::Player::WorkspaceMediaType;
+    TimelinePreviewRequestState state;
+    const auto source = makeSource(QStringLiteral("cancelled-before-consume.mp4"), WorkspaceMediaType::Video);
+    if (!require(state.submit(makeRequest(source, 1.0F, 1U, 1U)),
+            "An initial hover schedules one worker wakeup")) return false;
+    state.invalidatePending();
+    if (!require(!state.takeLatest().has_value(),
+            "The queued worker wakeup must observe that leave cancelled its pending request")) return false;
+    return require(state.submit(makeRequest(source, 2.0F, 1U, 2U)),
+        "Hover after a cancelled empty worker wakeup must schedule new work instead of remaining orphaned");
+}
+
 bool verifySourceSwitchReplacesOldPendingRequest()
 {
     using DesktopSceneEngine::Player::TimelinePreviewRequestState;
@@ -361,10 +376,12 @@ bool verifyResultInvalidation()
             "Leaving the timeline must reject a returning preview result");
 }
 
-bool verifyWorkerDecodeAndShutdown(const std::filesystem::path& videoPath)
+bool verifyWorkerDecodeAndShutdown(const std::filesystem::path& mediaPath,
+    DesktopSceneEngine::Player::WorkspaceMediaType mediaType)
 {
     using DesktopSceneEngine::Player::TimelinePreviewRequestState;
     using DesktopSceneEngine::Player::TimelinePreviewWorker;
+    using DesktopSceneEngine::Player::WorkspaceMediaType;
 
     TimelinePreviewRequestState state{};
     TemporaryDirectory cache{};
@@ -378,12 +395,14 @@ bool verifyWorkerDecodeAndShutdown(const std::filesystem::path& videoPath)
         worker,
         &TimelinePreviewWorker::previewReady,
         worker,
-        [&decoded, &timingOrdered](const DesktopSceneEngine::Player::TimelinePreviewResult& result)
+        [&decoded, &timingOrdered, mediaType](const DesktopSceneEngine::Player::TimelinePreviewResult& result)
         {
+            const bool hasExpectedFrame = !result.image.isNull()
+                && (mediaType == WorkspaceMediaType::Video
+                    || (result.image.size() == QSize{23, 17}
+                        && result.image.pixelColor(0, 0) == QColor{12, 79, 150}));
             decoded.store(
-                result.request.source.mediaType
-                    == DesktopSceneEngine::Player::WorkspaceMediaType::Video
-                    && !result.image.isNull(),
+                result.request.source.mediaType == mediaType && hasExpectedFrame,
                 std::memory_order_relaxed);
             auto timing = result.timing;
             timing.guiApplied = DesktopSceneEngine::Player::TimelinePreviewTiming::Clock::now();
@@ -395,10 +414,10 @@ bool verifyWorkerDecodeAndShutdown(const std::filesystem::path& videoPath)
     thread.start();
 
     const auto source = makeSource(
-        QString::fromStdWString(videoPath.native()),
-        DesktopSceneEngine::Player::WorkspaceMediaType::Video);
+        QString::fromStdWString(mediaPath.native()), mediaType);
     auto request = makeRequest(source, 0.0F, 1U, 1U);
-    request.representativeTimestampMilliseconds = 0;
+    if (mediaType == WorkspaceMediaType::Video)
+        request.representativeTimestampMilliseconds = 0;
     request.timing.hoverEvent = DesktopSceneEngine::Player::TimelinePreviewTiming::Clock::now();
     request.timing.requestSubmitted = DesktopSceneEngine::Player::TimelinePreviewTiming::Clock::now();
     const bool scheduled = state.submit(request);
@@ -418,14 +437,24 @@ bool verifyWorkerDecodeAndShutdown(const std::filesystem::path& videoPath)
     }
 
     return require(scheduled && decodeQueued,
-               "A worker-owned video request should be scheduled for decoding")
+               "A worker-owned media request should be scheduled for decoding")
         && require(stopQueued, "Worker shutdown should be queued to the worker thread")
         && require(decoded.load(std::memory_order_relaxed),
-            "The worker should decode its independently owned video source before shutdown")
+            "The worker should decode the expected frame from its independently owned media source")
         && require(timingOrdered.load(std::memory_order_relaxed),
             "A successful preview result must preserve T0 through T5 ordering")
         && require(finished && !thread.isRunning(),
             "Worker shutdown must finish the dedicated QThread without a deadlock");
+}
+
+bool verifyWorkerImageHover()
+{
+    const TemporaryDirectory media;
+    const auto path = media.path() / L"owned-image.png";
+    QImage image{23, 17, QImage::Format_RGB32};
+    image.fill(QColor{12, 79, 150});
+    return require(image.save(QString::fromStdWString(path.native())), "Write the owned image fixture")
+        && verifyWorkerDecodeAndShutdown(path, DesktopSceneEngine::Player::WorkspaceMediaType::Image);
 }
 
 bool verifyWorkerPreloadsWithoutHover(const std::filesystem::path& videoPath)
@@ -485,6 +514,14 @@ bool verifyWorkerPreloadsWithoutHover(const std::filesystem::path& videoPath)
     }
 
     const auto diagnostics = state.diagnostics();
+    if (!containsPersistentPng(cache.path()))
+    {
+        std::cerr << "Preload diagnostics: started=" << diagnostics.preloadsStarted
+            << " completed=" << diagnostics.preloadsCompleted << " skipped=" << diagnostics.preloadsSkipped
+            << " cancelled=" << diagnostics.preloadsCancelled << " cache=" << cache.path().string() << '\n';
+        for (const auto& entry : std::filesystem::recursive_directory_iterator{cache.path()})
+            std::cerr << "Preload cache entry: " << entry.path().filename().string() << '\n';
+    }
     return require(configured,
                "An active video target must queue proactive preload work")
         && require(containsPersistentPng(cache.path()) && diagnostics.preloadsStarted >= 1U
@@ -681,11 +718,35 @@ bool verifyWorkerSourceSwitch(
 
 }
 
+bool verifyRequestState()
+{
+    return verifyLatestRequestReplacement() && verifyCancelledRequestBeforeWorkerConsumes()
+        && verifySourceSwitchReplacesOldPendingRequest()
+        && verifyLeaveAndShutdownCancellation()
+        && verifyPreloadYieldsToForegroundHover()
+        && verifyQueuedSourceSwitchRejectsStalePreload()
+        && verifyResultInvalidation();
+}
+
 int main(int argc, char* argv[])
 {
+    using DesktopSceneEngine::Player::WorkspaceMediaType;
     QCoreApplication application(argc, argv);
+    if (application.arguments().contains(QStringLiteral("--cancel-before-consume")))
+        return verifyCancelledRequestBeforeWorkerConsumes() ? 0 : 1;
+    if (application.arguments().contains(QStringLiteral("--image-hover-only")))
+        return verifyWorkerImageHover() ? 0 : 1;
+    if (application.arguments().contains(QStringLiteral("--generated")))
+        return verifyRequestState() && verifyWorkerImageHover() ? 0 : 1;
+    if (QStringLiteral(DESKTOP_SCENE_ENGINE_TEST_RESOURCES_DIR).isEmpty())
+    {
+        std::cerr << "External timeline-worker media unavailable; use --generated for the public cases.\n";
+        return 77;
+    }
 
     const std::filesystem::path videoPath = findVideoFixture();
+    if (application.arguments().contains(QStringLiteral("--preload-only")))
+        return !videoPath.empty() && verifyWorkerPreloadsWithoutHover(videoPath) ? 0 : 1;
     const std::filesystem::path secondVideoPath = findSecondVideoFixture(videoPath);
     if (!require(!videoPath.empty(), "A video fixture must be available")
         || !require(!secondVideoPath.empty(), "A second video fixture must be available"))
@@ -693,12 +754,9 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    return verifyLatestRequestReplacement() && verifySourceSwitchReplacesOldPendingRequest()
-            && verifyLeaveAndShutdownCancellation()
-            && verifyPreloadYieldsToForegroundHover()
-            && verifyQueuedSourceSwitchRejectsStalePreload()
-            && verifyResultInvalidation()
-            && verifyWorkerDecodeAndShutdown(videoPath)
+    return verifyRequestState()
+            && verifyWorkerDecodeAndShutdown(videoPath, WorkspaceMediaType::Video)
+            && verifyWorkerImageHover()
             && verifyWorkerPreloadsWithoutHover(videoPath)
             && verifyWorkerCancelsObsoleteDecode(videoPath)
             && verifyWorkerSourceSwitch(videoPath, secondVideoPath)

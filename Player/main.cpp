@@ -1,20 +1,38 @@
 #include "ApplicationPreferences.h"
 #include "DisplaySessionBootstrap.h"
-#include "LauncherWindow.h"
-#include "MainWindow.h"
+#include "WebViewLauncherHost.h"
+#include "LauncherBootstrap.h"
+#include "LauncherIdentify.h"
+#include "LauncherLanguage.h"
 #include "InstanceAdmission.h"
 #include "InstanceActivation.h"
 #include "ApplicationCoordinator.h"
+#include "ModelCSessionWindow.h"
 
 #include <QApplication>
 #include <QCoreApplication>
 #include <QIcon>
-#include <QMessageBox>
 #include <QSettings>
 #include <QStringList>
 
 #include <variant>
 #include <iostream>
+
+namespace
+{
+int showStartupFailure(QApplication& application,
+    DesktopSceneEngine::Player::ProductWindowRole role, const QString& title, const QString& message)
+{
+    using namespace DesktopSceneEngine::Player;
+    ProductWindowHost failure{role};
+    failure.setWindowTitle(title);
+    failure.resize(720, 480);
+    failure.setProductPresentationStage(ProductPresentationStage::Failed, message);
+    QObject::connect(&application, &QApplication::lastWindowClosed, &failure, [&] { application.exit(1); });
+    failure.show();
+    return application.exec();
+}
+}
 
 int main(int argc, char* argv[])
 {
@@ -55,12 +73,9 @@ int main(int argc, char* argv[])
                 "ApplicationBootstrap",
                 "The application startup arguments are invalid."
             );
-        QMessageBox::critical(
-            nullptr,
+        return showStartupFailure(application, DesktopSceneEngine::Player::ProductWindowRole::Launcher,
             QCoreApplication::translate("ApplicationBootstrap", "Startup Error"),
-            message
-        );
-        return 1;
+            message);
     }
 
     const auto scope = DesktopSceneEngine::Player::currentInteractiveInstanceScope();
@@ -100,9 +115,33 @@ int main(int argc, char* argv[])
     if (std::holds_alternative<DesktopSceneEngine::Player::LauncherProcessMode>(processMode))
     {
         application.setQuitOnLastWindowClosed(false);
+        DesktopSceneEngine::Player::LauncherLanguage language{preferencesStore, translationState};
         DesktopSceneEngine::Player::ApplicationCoordinator coordinator{*slot, activation, coordinatorBootstrap};
+        language.setOnChanged([&coordinator](const DesktopSceneEngine::Player::LauncherLanguageProjection& projection) {
+            if (auto* host = dynamic_cast<DesktopSceneEngine::Player::WebViewLauncherHost*>(coordinator.launcherWindow()))
+                host->languageChanged(projection);
+        });
+        coordinator.setSessionProjectionChanged([&coordinator](const DesktopSceneEngine::Player::LauncherSessionsSnapshot& snapshot) {
+            if (auto* host = dynamic_cast<DesktopSceneEngine::Player::WebViewLauncherHost*>(coordinator.launcherWindow()))
+                host->sessionsChanged(snapshot);
+        });
         coordinator.setLauncherFactory([&] {
-            auto* launcher = new DesktopSceneEngine::Player::LauncherWindow{translationState, preferencesStore};
+            auto* launcher = new DesktopSceneEngine::Player::WebViewLauncherHost{[&] {
+                return DesktopSceneEngine::Player::launcherBootstrapSnapshot(
+                    coordinator.launcherSessionSnapshot(), DesktopSceneEngine::Platform::enumerateActiveDisplays(),
+                    language.reload());
+            }, [] {
+                return DesktopSceneEngine::Player::launcherDisplayCatalog(
+                    DesktopSceneEngine::Platform::enumerateActiveDisplays());
+            }, [](const DesktopSceneEngine::DisplayId& id) {
+                return DesktopSceneEngine::Player::identifyLauncherDisplay(id);
+            }, language};
+            qInfo("[ProductComposition] role=launcher shell=cp4");
+            launcher->setSessionCommands([&coordinator](const QUuid& epoch, const DesktopSceneEngine::DisplayId& id) {
+                return DesktopSceneEngine::Player::launcherCreateResult(coordinator.createSession(epoch, id));
+            }, [&coordinator](const QUuid& epoch, const QUuid& incarnation) {
+                return DesktopSceneEngine::Player::launcherOpenResult(coordinator.openSession(epoch, incarnation));
+            });
             launcher->setAcceptedCloseCallback([&coordinator, launcher] { coordinator.retireLauncher(*launcher); });
             return launcher;
         });
@@ -120,37 +159,66 @@ int main(int argc, char* argv[])
 
     const auto& displaySessionMode =
         std::get<DesktopSceneEngine::Player::DisplaySessionProcessMode>(processMode);
-    MainWindow window{
-        displaySessionMode.displayId,
-        translationState,
-        preferencesStore,
-        preferences};
-    // Hide must not end the process when its last primary window becomes invisible.
-    // Ordinary accepted Close remains the explicit Session process exit authority.
+    using namespace DesktopSceneEngine::Player;
     application.setQuitOnLastWindowClosed(false);
-    window.show();
-    if (!window.initializeEngine())
+    const auto launcherSlot = InstanceSlot::fromProcessMode(LauncherProcessMode{}, *scope);
+    SessionCoordinatorJoin join{*slot, *launcherSlot};
+    // The relay outlives all C work, including exceptional retirement. It
+    // stays on GUI and resolves weak adapter lifetimes only on that thread.
+    SessionGuiRelay relay;
+    SessionControlExecutor control;
+    try
     {
-        window.close();
-        return 1;
-    }
-
-    activation.bindReadyRole(window, [&window] { (void)window.trayPresentation().restore(); });
-    const auto launcherSlot = DesktopSceneEngine::Player::InstanceSlot::fromProcessMode(
-        DesktopSceneEngine::Player::LauncherProcessMode{}, *scope);
-    DesktopSceneEngine::Player::SessionCoordinatorJoin coordinatorJoin{*slot, *launcherSlot};
-    coordinatorJoin.enableControl(window.trayPresentation());
-    coordinatorJoin.enableDesktopDeployment([&window] { return window.desktopDeploymentProjection(); },
-        [&window](DesktopSceneEngine::Player::DesktopDeploymentIntent intent) { return window.requestDesktopDeployment(intent); });
-    window.setAcceptedCloseCallback([&] {
-        coordinatorJoin.beginRoleTeardown();
+        ModelCSessionWindow window{control, relay, displaySessionMode.displayId, translationState, join.incarnation()};
+        bool startupFailed = false;
+        join.enableControl(window.trayPresentation());
+        join.enableDesktopDeploymentAsync([&window] { return window.desktopDeploymentProjection(); },
+            [&window](auto intent, auto complete) { window.requestDesktopDeployment(intent, std::move(complete)); });
+        window.setAcceptedCloseCallback([&] {
+            join.beginRoleTeardown();
+            activation.beginShutdown();
+            QTimer::singleShot(0, &join, [&] { join.drainAndStop([&] { application.exit(startupFailed ? 1 : 0); }); });
+        });
+        control.start(displaySessionMode.displayId, preferences, [] {
+            return std::make_unique<QSettings>(QSettings::NativeFormat, QSettings::UserScope,
+                QStringLiteral("DesktopSceneEngine"), QStringLiteral("Player"));
+        }, [&, guard = QPointer<ModelCSessionWindow>{&window}](bool ready) {
+            (void)relay.post([&, guard, ready] {
+                if (!guard) return;
+                if (!ready)
+                {
+                    startupFailed = true;
+                    qCritical("[SessionControl] Failed to start autonomous Model C Session");
+                    guard->failControlStartup(QCoreApplication::translate(
+                        "ApplicationBootstrap", "The Session runtime could not start."));
+                    return;
+                }
+                qInfo("[ProductComposition] role=session shell=cp4 route=default");
+                qInfo("[SessionComposition] model-c-production control autonomous");
+                window.startPresentation();
+                if (window.productFrameFailed())
+                {
+                    startupFailed = true;
+                    return;
+                }
+                activation.bindReadyRole(window, [&window] { (void)window.trayPresentation().restore(); });
+                join.start(window);
+            });
+        }, window.platformFactory());
+        window.show();
+        const int result = application.exec();
+        window.releasePresentation();
+        control.stop();
         activation.beginShutdown();
-        QTimer::singleShot(0, &coordinatorJoin, [&] {
-            coordinatorJoin.drainAndStop([&] { application.quit(); });
-        }); // Ordinary teardown finishes before result drainage/explicit process exit, including hidden clean Close.
-    });
-    coordinatorJoin.start(window);
-    const int result = application.exec();
-    activation.beginShutdown();
-    return result;
+        return result;
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << "[SessionControl] Model C startup failed: " << error.what() << '\n';
+        const int result = showStartupFailure(application, ProductWindowRole::Session,
+            QStringLiteral("DesktopSceneEngine"),
+            QCoreApplication::translate("ApplicationBootstrap", "The production Session presentation could not start."));
+        activation.beginShutdown();
+        return result;
+    }
 }

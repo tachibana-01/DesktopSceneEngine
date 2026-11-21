@@ -1,0 +1,24 @@
+/* Permanent 5px splitter gaps mirror MainWindow's non-collapsible QSplitter.
+   The three original panels remain direct children and the future native surface
+   remains entirely inside Preview; handles occupy only the inter-panel gaps. */
+.session-workspace[data-layout-mode] {
+  position: relative;
+  grid-template-columns: var(--session-library-width, 230px) minmax(0, 1fr) var(--session-inspector-width, 300px);
+  column-gap: 5px;
+}
+.session-splitter { position: absolute; top: 0; bottom: 0; width: 5px; cursor: col-resize; touch-action: none; user-select: none; background: #171c23; }
+.session-splitter[data-layout-splitter="left"] { left: var(--session-library-width, 230px); }
+.session-splitter[data-layout-splitter="right"] { right: var(--session-inspector-width, 300px); }
+.session-splitter::after { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 1px; background: transparent; }
+.session-splitter:hover::after, .session-splitter:focus-visible::after { background: #66758a; }
+.session-splitter:focus-visible { outline: 1px solid #aab7c9; outline-offset: -1px; }
+.session-workspace[data-layout-dragging="left"] [data-layout-splitter="left"]::after,
+.session-workspace[data-layout-dragging="right"] [data-layout-splitter="right"]::after { background: #a6b3c5; }
+.session-workspace[data-layout-dragging="left"], .session-workspace[data-layout-dragging="right"] { cursor: col-resize; user-select: none; }
+@media (max-width: 1100px) {
+  .session-workspace[data-layout-mode] { grid-template-columns: minmax(0, 1fr) 264px; column-gap: 0; }
+  .session-splitter { display: none; }
+}
+@media (max-width: 760px) {
+  .session-workspace[data-layout-mode] { grid-template-columns: minmax(0, 1fr); }
+}

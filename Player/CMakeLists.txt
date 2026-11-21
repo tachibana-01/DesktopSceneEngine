@@ -1,116 +1,29 @@
 find_package(
-    Qt6
+    Qt6 6.9
     CONFIG
     REQUIRED
     COMPONENTS Widgets Network LinguistTools
 )
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/ProductPresentation.cmake")
 
-add_executable(
-    DesktopSceneEngine_QtPlayer
-    WIN32
-)
+add_executable(DesktopSceneEngine_QtPlayer WIN32 main.cpp)
+target_link_libraries(DesktopSceneEngine_QtPlayer PRIVATE DSE::ProductPresentation)
+target_compile_options(DesktopSceneEngine_QtPlayer PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus;/W4>)
 
-
-target_sources(
-    DesktopSceneEngine_QtPlayer
-    PRIVATE
-
-    MainWindow.h
-    MainWindow.cpp
-    ApplicationPreferences.h
-    ApplicationPreferences.cpp
-    DisplaySessionBootstrap.h
-    DisplaySessionBootstrap.cpp
-    InstanceAdmission.h
-    InstanceAdmission.cpp
-    InstanceActivation.h
-    InstanceActivation.cpp
-    ApplicationCoordinator.h
-    ApplicationCoordinator.cpp
-    SessionPresentation.h
-    SessionPresentation.cpp
-    DesktopDeployment.h
-    RoleClose.h
-    LauncherWindow.h
-    LauncherWindow.cpp
-    DisplayPresentation.h
-    DisplayPresentation.cpp
-    ProjectDocumentState.h
-    EffectiveVolume.h
-    DisplaySelectionState.h
-    DisplaySelectionState.cpp
-    ActivePlaybackProjection.h
-    ActivePlaybackProjection.cpp
-    PreviewViewportHost.h
-    PreviewViewportHost.cpp
-    TimelinePreviewProvider.h
-    TimelinePreviewProvider.cpp
-    TimelinePreviewWorker.h
-    TimelinePreviewWorker.cpp
-    TimelinePreviewPreloadPlanner.h
-    TimelinePreviewPreloadPlanner.cpp
-    TimelinePreviewPresentation.h
-    TimelinePreviewPresentation.cpp
-    TimelineHoverGeometry.h
-    TimelineRepresentativeTimestamp.h
-    TimelinePreviewSource.h
-    CanvasPresentationGeometry.h
-    CanvasChromeFrame.h
-    CanvasChromeFrame.cpp
-    BackgroundMusicControlAdapter.h
-    BackgroundMusicControlAdapter.cpp
-    BackgroundMusicWindow.h
-    BackgroundMusicWindow.cpp
-    WorkspaceModel.cpp
-    main.cpp
-)
-
-
-set_target_properties(
-    DesktopSceneEngine_QtPlayer
-    PROPERTIES
-
-    AUTOMOC ON
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_QtPlayer
-    PRIVATE
-
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/Engine/src
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_QtPlayer
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_QtPlayer
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_QtPlayer
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-    Qt6::Network
-    advapi32
-    user32
-)
+find_program(DSE_NPM_EXECUTABLE NAMES npm.cmd REQUIRED)
+set(DSE_PRODUCT_FRONTEND "${CMAKE_SOURCE_DIR}/DesktopSceneEngineIII/Frontend")
+add_custom_target(DesktopSceneEngine_ProductFrontend
+    COMMAND "${DSE_NPM_EXECUTABLE}" run build
+    COMMAND ${CMAKE_COMMAND}
+        "-DBINARY_ROOT=${CMAKE_BINARY_DIR}"
+        "-DPRODUCT_DIRECTORY=$<TARGET_FILE_DIR:DesktopSceneEngine_QtPlayer>"
+        "-DFRONTEND_DIST=${DSE_PRODUCT_FRONTEND}/dist"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/StageProductFrontend.cmake"
+    WORKING_DIRECTORY "${DSE_PRODUCT_FRONTEND}"
+    COMMENT "Build and stage the production WebView2 package"
+    VERBATIM)
+add_dependencies(DesktopSceneEngine_QtPlayer DesktopSceneEngine_ProductFrontend)
 
 
 set(

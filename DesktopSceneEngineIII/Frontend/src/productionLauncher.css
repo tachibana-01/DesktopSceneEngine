@@ -1,0 +1,57 @@
+/* Production reads native facts. No prototype command/caption surface is mounted. */
+.production-launcher-root { min-height: 100vh; }
+.production-launcher .launcher-main {
+  width: min(1040px, calc(100% - 2 * clamp(24px, 5.7vw, 64px)));
+  padding-block: clamp(16px, 3.8vh, 34px) clamp(14px, 3.5vh, 28px);
+}
+.production-launcher .display-deck {
+  margin-block: clamp(12px, 2.5vh, 26px) clamp(14px, 3.5vh, 32px);
+}
+.production-launcher .deck-viewport {
+  --production-deck-max-height: 176px;
+  height: calc(var(--slide-height) * 1.2 + 70px);
+}
+.production-launcher .display-details { padding-top: clamp(14px, 3.2vh, 24px); }
+.production-launcher .detail-metadata { flex-wrap: wrap; }
+.production-launcher .detail-bottom { margin-top: clamp(10px, 2vh, 18px); }
+.production-launcher .detail-bottom .editorial-action { margin-inline-start: auto; }
+.production-launcher .launcher-empty { min-height: clamp(188px, 44vh, 326px); }
+.production-launcher .launcher-operation { min-height: 0; margin-top: 12px; }
+.production-launcher .launcher-operation:empty { margin: 0; }
+.production-launcher .display-name { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .035em; }
+.production-launcher .is-portrait .display-name { display: block; max-width: 95px; }
+.production-launcher .display-identify { overflow: visible; cursor: pointer; }
+.production-launcher .display-identify[aria-disabled="true"] { cursor: default; color: var(--text-secondary); }
+.production-launcher .production-display-name-text { display: block; max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: inherit; }
+.production-launcher .is-portrait .production-display-name-text { max-width: 95px; font-size: inherit; }
+.production-launcher .detail-heading h2 { overflow-wrap: anywhere; }
+.production-launcher .production-language-warning { margin: 14px 0 0; color: #d6b590; font-size: 12px; line-height: 1.5; }
+.production-launcher .production-session-secondary { margin: 8px 0 0; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.production-launcher .display-status--closing,
+.production-launcher .display-status--disconnected { color: #d6b590; }
+.production-launcher .production-unresolved-sessions { margin-top: 24px; width: min(100%, 620px); }
+.production-launcher .production-unresolved-sessions h2 { margin: 0 0 10px; color: var(--text-secondary); font-size: 12px; font-weight: 500; }
+.production-launcher .production-session-record { padding: 12px 0; border-top: 1px solid var(--line); }
+.production-launcher .production-session-record-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.production-launcher .production-session-bound { min-width: 0; color: var(--text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.production-launcher .production-enumeration-status,
+.production-launcher .production-bootstrap-error p { margin: 0; max-width: 550px; color: var(--text-muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+@media (max-height: 680px) {
+  .production-launcher .deck-viewport {
+    --production-deck-max-height: 148px;
+    height: calc(var(--slide-height) * 1.2 + 66px);
+  }
+}
+@media (max-height: 600px) {
+  .production-launcher .launcher-main { padding-block: 14px 12px; }
+  .production-launcher .page-identity h1 { font-size: 23px; }
+  .production-launcher .page-identity p { margin-top: 5px; }
+  .production-launcher .display-deck { margin-block: 12px 14px; }
+  .production-launcher .deck-viewport {
+    --production-deck-max-height: 124px;
+    height: calc(var(--slide-height) * 1.2 + 56px);
+  }
+}
+@media (max-width: 460px) {
+  .production-launcher .title-bar { gap: 12px; }
+}

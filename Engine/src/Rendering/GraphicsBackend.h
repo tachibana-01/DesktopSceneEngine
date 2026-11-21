@@ -1,12 +1,14 @@
 #pragma once
 
 #include <DesktopSceneEngine/PresentationTarget.h>
+#include <DesktopSceneEngine/HostedCompositionContent.h>
 
 #include "RenderData.h"
 #include "WindowTarget.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 
 namespace DesktopSceneEngine::Rendering
@@ -32,13 +34,7 @@ enum class FramePreparationResult
     GraphicsUnavailable
 };
 
-enum class MediaUpdateResult
-{
-    Updated,
-    ResourceFailure,
-    DeviceLost,
-    GraphicsUnavailable
-};
+using MediaUpdateResult = PresentationUploadResult;
 
 enum class GraphicsOperationResult
 {
@@ -62,6 +58,18 @@ struct MediaView
     std::size_t rowStride = 0U;
     std::size_t byteSize = 0U;
 };
+
+[[nodiscard]] inline bool hasValidRgbaBuffer(
+    int width, int height, int channels, std::size_t rowStride, std::size_t byteSize) noexcept
+{
+    if (width <= 0 || height <= 0 || channels != 4) return false;
+    const auto w = static_cast<std::size_t>(width);
+    if (w > (std::numeric_limits<std::size_t>::max)() / 4U
+        || rowStride < w * 4U || rowStride > (std::numeric_limits<std::uint32_t>::max)())
+        return false;
+
+    return rowStride <= byteSize / static_cast<std::size_t>(height);
+}
 
 enum class PresentResultCategory
 {
@@ -202,6 +210,23 @@ public:
 
     [[nodiscard]] PresentationTargetId initialize(const WindowTarget& target);
 
+    [[nodiscard]] PresentationTargetId initialize(const HostedCompositionTarget& target);
+
+    [[nodiscard]] PresentationTargetId attachPresentationTarget(const HostedCompositionTarget& target);
+
+    [[nodiscard]] bool setHostedPresentationExtent(PresentationTargetId id,
+        PresentationExtent extent) noexcept;
+
+    [[nodiscard]] CompositionContentLease acquireHostedCompositionContent(
+        PresentationTargetId id) const noexcept;
+
+    void invalidateHostedCompositionContent() noexcept;
+
+    // Deterministic native fault paths only; never a product capability.
+    [[nodiscard]] bool requestHostedContentReplacementForTesting(PresentationTargetId id) noexcept;
+    [[nodiscard]] bool forceNextHostedResizeResultForTesting(PresentationTargetId id,
+        std::int32_t result) noexcept;
+
     [[nodiscard]] PresentationTargetId attachPresentationTarget(
         const WindowTarget& target);
 
@@ -215,8 +240,11 @@ public:
 
     [[nodiscard]] Detail::GenerationReplacementResult recoverGraphicsGeneration(
         const Detail::MediaView* media);
+    [[nodiscard]] std::uint64_t deviceGeneration() const noexcept;
 
-    void renderPrepared(const RenderData& data);
+    // An explicit target submits only that endpoint and returns true only
+    // for its S_OK Present. The ordinary all-target path returns false.
+    bool renderPrepared(const RenderData& data, PresentationTargetId onlyTarget = {});
 
     [[nodiscard]] Detail::MediaUpdateResult updateImage(
         const void* imageData,

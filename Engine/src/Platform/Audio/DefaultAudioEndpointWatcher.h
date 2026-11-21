@@ -27,6 +27,9 @@ public:
     [[nodiscard]] bool initialize() noexcept;
 
     void shutdown() noexcept;
+    // A shutdown barrier. Failed unregister/in-flight callback retains all
+    // callback state; caller remains Pending and retries, never timeout-frees.
+    [[nodiscard]] bool shutdownAndQuiesce() noexcept;
 
     [[nodiscard]] std::uint64_t generation() const noexcept;
 

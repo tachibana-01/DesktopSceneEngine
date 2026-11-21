@@ -1,0 +1,10 @@
+.production-session :is(button,input,select):disabled { cursor:default; }
+.production-session button:disabled { color:var(--text-muted); }
+/* The implicit auto grid column otherwise grows to the longest authored name. */
+.production-session .session-library { grid-template-columns:minmax(0,1fr); }
+.production-session :is(.media-panel,.playlist-panel) { min-width:0; }
+.production-session .entity-alias { min-width:0; flex:1 1 0; }
+.session-entry-shell { min-height:100svh; display:grid; grid-template-rows:auto 1fr; }
+.session-entry-status { display:grid; place-content:center; gap:14px; padding:32px; color:var(--text-primary); background:var(--background); }
+.session-entry-status h1 { font-size:18px; font-weight:500; }
+.session-entry-status p { max-width:640px; font-size:12px; color:var(--text-muted); }

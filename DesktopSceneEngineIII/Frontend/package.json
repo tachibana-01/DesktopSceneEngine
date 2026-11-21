@@ -1,0 +1,52 @@
+{
+  "name": "desktop-scene-engine-iii-environment",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": "24.16.0",
+    "npm": "11.13.0"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "build": "vite build",
+    "check:dom": "node scripts/check-dom.mjs",
+    "check:launcher": "node scripts/check-dom.mjs && node scripts/check-launcher-semantics.mjs",
+    "check:launcher-production": "node scripts/check-launcher-production.mjs",
+    "check:launcher-refresh": "node scripts/check-launcher-refresh.mjs",
+    "check:launcher-refresh-dom": "node scripts/check-launcher-refresh-dom.mjs",
+    "check:launcher-identify": "node scripts/check-launcher-identify.mjs",
+    "check:launcher-identify-dom": "node scripts/check-launcher-identify-dom.mjs",
+    "check:launcher-language": "node scripts/check-launcher-language.mjs",
+    "check:launcher-sessions": "node scripts/check-launcher-sessions.mjs",
+    "check:launcher-sessions-dom": "node scripts/check-launcher-sessions-dom.mjs",
+    "check:session": "node scripts/check-session.mjs && node scripts/check-session-semantics.mjs && node scripts/check-session-entities.mjs && node scripts/check-session-document.mjs",
+    "check:inspector": "node scripts/check-session-inspector-model.mjs && node scripts/check-session-inspector.mjs",
+    "check:playback": "node scripts/check-session-sequence.mjs && node scripts/check-session-playback-model.mjs && node scripts/check-session-playback.mjs",
+    "check:timeline": "node scripts/check-session-timeline-model.mjs && node scripts/check-session-timeline-hover.mjs && node scripts/check-session-timeline-driver.mjs && node scripts/check-session-timeline.mjs",
+    "check:presentation": "node scripts/check-session-preview-geometry.mjs && node scripts/check-session-display-model.mjs && node scripts/check-session-view-model.mjs && node scripts/check-session-presentation-model.mjs && node scripts/check-session-presentation.mjs",
+    "check:background-music": "node scripts/check-background-music.mjs",
+    "check:remaining": "node scripts/check-session-ordering.mjs && node scripts/check-session-layout-model.mjs && node scripts/check-session-language-model.mjs && node scripts/check-session-shortcuts.mjs && node scripts/check-session-hide-model.mjs && node scripts/check-session-feedback-model.mjs && node scripts/check-session-remaining.mjs",
+    "check:launcher-create-open": "node scripts/check-launcher-create-open.mjs",
+    "check:launcher-create-open-dom": "node scripts/check-launcher-create-open-dom.mjs",
+    "check:launcher-hardening": "node scripts/check-launcher-hardening.mjs",
+    "check:launcher-hardening-dom": "node scripts/check-launcher-hardening-dom.mjs",
+    "check:session-snapshot": "node scripts/check-session-readonly.mjs",
+    "check:session-shell-dom": "node scripts/check-session-readonly-dom.mjs",
+    "check:model-c": "node scripts/check-model-c-production.mjs && node scripts/check-session-native-preview.mjs && node scripts/check-session-preview-occlusion.mjs",
+    "check:model-c-dom": "node scripts/check-model-c-production-dom.mjs && node scripts/check-session-native-preview-dom.mjs"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.4"
+  }
+}

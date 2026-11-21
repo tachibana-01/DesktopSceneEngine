@@ -1,5 +1,6 @@
 #include "WorkspaceModel.h"
 #include "MainWindowTestDisplay.h"
+#include "ProjectDocumentState.h"
 
 #include <array>
 #include <iostream>
@@ -1881,10 +1882,114 @@ bool verifyAuthoredChangeNotification()
         "Clearing the callback must prevent calls through a stale owner");
 }
 
+template <typename Model>
+bool verifyAuthoredBackgroundMusicRead()
+{
+    Model model{DesktopSceneEngine::Player::TestSupport::mainWindowTestDisplayOwner()};
+    const auto playlist = model.selectedPlaylistId();
+    const auto item = model.addItem(playlist, WorkspaceMediaType::Image, QStringLiteral("C:/Media/still.png"));
+    const auto emptyItem = model.addItem(playlist, WorkspaceMediaType::Video, QStringLiteral("C:/Media/clip.mp4"));
+    const auto otherPlaylist = model.addPlaylist();
+    const auto foreignItem = model.addItem(otherPlaylist, WorkspaceMediaType::Image, QStringLiteral("C:/Media/other.png"));
+    const QString source = QString::fromUtf8("C:/音乐/共同音源.flac");
+    const auto first = model.addPlaylistMusicTrack(playlist, source, QString::fromUtf8("队列 A"));
+    const auto second = model.addPlaylistMusicTrack(playlist, source, QString::fromUtf8("队列 B 🎵"));
+    if (!require(item && emptyItem && foreignItem && first && second && *first != *second,
+            "Authored read setup uses real parent/child and duplicate-source TrackIds")) return false;
+    const auto localFirst = model.addItemMusicTrack(*item, source, QString::fromUtf8("局部 A"));
+    const auto localSecond = model.addItemMusicTrack(*item, source, QString::fromUtf8("局部 B"));
+    constexpr double playlistVolume = 0.713456789012;
+    constexpr double itemVolume = 0.268567890123;
+    constexpr double trackVolume = 0.312345678901;
+    if (!require(localFirst && localSecond && *localFirst != *localSecond
+            && model.setPlaylistMusicEnabled(playlist, false)
+            && model.setPlaylistMusicPlaybackMode(playlist, MusicPlaybackMode::Shuffle)
+            && model.setPlaylistMusicVolume(playlist, playlistVolume)
+            && model.setPlaylistMusicTrackVolume(playlist, *second, trackVolume)
+            && model.movePlaylistMusicTrack(playlist, *second, -1)
+            && model.setItemMusicPlaybackMode(*item, MusicPlaybackMode::CurrentSingleLoop)
+            && model.setItemMusicVolume(*item, itemVolume)
+            && model.setItemMusicTrackVolume(*item, *localSecond, trackVolume)
+            && model.moveItemMusicTrack(*item, *localSecond, -1),
+        "Real authored mutation APIs establish both exact ordered queues")) return false;
+    const std::uint64_t revision = model.authoredRevision();
+    DesktopSceneEngine::Player::ProjectDocumentState document;
+    document.markClean(revision);
+    std::size_t notifications = 0U;
+    model.setAuthoredChangedCallback([&] { ++notifications; });
+    const auto selectedPlaylist = model.selectedPlaylistId();
+    const auto selectedItem = model.selectedItemId();
+    const auto activePlaylist = model.activePlaylistId();
+    const auto activeItem = model.activeItemId();
+    const Model& reader = model;
+    if constexpr (requires { reader.authoredBackgroundMusic(playlist, item); })
+    {
+        auto projection = reader.authoredBackgroundMusic(playlist, item);
+        const auto globalOnly = reader.authoredBackgroundMusic(playlist);
+        const auto empty = reader.authoredBackgroundMusic(playlist, emptyItem);
+        if (!require(projection && projection->itemId && projection->itemMusic && globalOnly && empty
+                && !reader.authoredBackgroundMusic(DesktopSceneEngine::Player::PlaylistId{})
+                && !reader.authoredBackgroundMusic(playlist, foreignItem)
+                && !reader.authoredBackgroundMusic(playlist, DesktopSceneEngine::Player::ItemId{}),
+            "Captured authored read validates Playlist and exact Item parent, not editor selection")) return false;
+        const auto& value = *projection;
+        const auto& p = value.playlistMusic;
+        const auto& i = *value.itemMusic;
+        if (!require(value.playlistId.value() == canonicalIdText(playlist.value)
+                && value.itemId && value.itemId->value() == canonicalIdText(item->value)
+                && p.enabled == false && p.playbackMode == DesktopSceneEngine::Domain::MusicPlaybackMode::Shuffle
+                && p.volume == playlistVolume && p.tracks.size() == 2U
+                && p.tracks[0].id.value() == canonicalIdText(second->value)
+                && p.tracks[1].id.value() == canonicalIdText(first->value)
+                && p.tracks[0].id != p.tracks[1].id
+                && p.tracks[0].source == source.toUtf8().toStdString()
+                && p.tracks[0].source == p.tracks[1].source
+                && p.tracks[0].displayAlias == QString::fromUtf8("队列 B 🎵").toUtf8().toStdString()
+                && p.tracks[0].volume == trackVolume && p.tracks[1].volume == 1.0,
+            "Playlist authored projection preserves native IDs/order/alias/source/enabled/mode/exact gains")) return false;
+        if (!require(i.enabled && i.playbackMode == DesktopSceneEngine::Domain::MusicPlaybackMode::CurrentSingleLoop
+                && i.volume == itemVolume && i.tracks.size() == 2U
+                && i.tracks[0].id.value() == canonicalIdText(localSecond->value)
+                && i.tracks[1].id.value() == canonicalIdText(localFirst->value)
+                && i.tracks[0].source == source.toUtf8().toStdString()
+                && i.tracks[0].source == i.tracks[1].source
+                && i.tracks[0].displayAlias == QString::fromUtf8("局部 B").toUtf8().toStdString()
+                && i.tracks[0].volume == trackVolume && i.tracks[1].volume == 1.0
+                && !globalOnly->itemId && !globalOnly->itemMusic
+                && globalOnly->playlistMusic.volume == playlistVolume
+                && globalOnly->playlistMusic.tracks[0].id == p.tracks[0].id
+                && empty->itemId && empty->itemMusic && empty->itemMusic->tracks.empty()
+                && empty->itemMusic->enabled && empty->itemMusic->volume == 1.0,
+            "Item authored queue remains distinct; omitted Item is not an invented empty queue")) return false;
+        // A returned value is a projection, never a mutable alias to the owner.
+        projection->playlistMusic.tracks[0].volume = 0.0;
+        projection->playlistMusic.tracks[0].displayAlias = "local copy only";
+        projection->itemMusic->tracks.clear();
+        const auto again = reader.authoredBackgroundMusic(playlist, item);
+        if (!require(again && again->playlistMusic.tracks[0].volume == trackVolume
+                && again->playlistMusic.tracks[0].displayAlias == QString::fromUtf8("队列 B 🎵").toUtf8().toStdString()
+                && again->itemMusic->tracks.size() == 2U,
+            "Editing detached projection cannot mutate canonical authored owner")) return false;
+        if (!require(model.authoredRevision() == revision && notifications == 0U
+                && !document.isDirty(model.authoredRevision())
+                && model.selectedPlaylistId() == selectedPlaylist && model.selectedItemId() == selectedItem
+                && model.activePlaylistId() == activePlaylist && model.activeItemId() == activeItem,
+            "Repeated reads neither dirty/notify/synchronize nor change selected/active identity")) return false;
+        std::cout << "PASS C1 authored BGM read: exact separate queues, parent IDs, readonly revision/callback/dirty\n";
+        return true;
+    }
+    else
+    {
+        return require(false,
+            "RED: real Workspace queues exist, but native authored BGM read projection is unavailable");
+    }
 }
 
-int main()
+}
+
+int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string{argv[1]} == "--bgm-read-only") return verifyAuthoredBackgroundMusicRead<WorkspaceModel>() ? 0 : 1;
     return verifyCanonicalAuthoredProjectOwnership()
             && verifyPlaylistBehavior()
             && verifyVisualPlaybackSequenceConfiguration()
@@ -1898,6 +2003,7 @@ int main()
             && verifyEmptyReset()
             && verifyAuthoredRevisionSemantics()
             && verifyAuthoredChangeNotification()
+            && verifyAuthoredBackgroundMusicRead<WorkspaceModel>()
         ? 0
         : 1;
 }

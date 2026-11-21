@@ -1,0 +1,43 @@
+.preview-context.preview-context-e { display: block; height: auto; flex-shrink: 0; padding: 14px 24px 12px; }
+.preview-facts-row { display: flex; align-items: center; gap: 14px; min-height: 18px; }
+.preview-facts-row h1 { margin: 0; color: #7e8a9b; font-size: 8px; letter-spacing: .13em; }
+.preview-canvas-fact { color: #647183; font-size: 8px; letter-spacing: .08em; white-space: nowrap; }
+.preview-canvas-fact strong { font-weight: 400; color: #a4afbf; margin-left: 6px; letter-spacing: 0; }
+.preview-presentation-state { margin-left: auto; color: #8795a8; font-size: 7px; letter-spacing: .08em; white-space: nowrap; }
+.preview-display-row { display: flex; align-items: center; gap: 12px; margin-top: 8px; min-width: 0; }
+.bound-display { flex: 1; min-width: 0; color: #9aa7b9; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bound-display:focus { outline: 1px solid #59677b; outline-offset: 3px; }
+.preview-actions { display: flex; flex-shrink: 0; gap: 4px; }
+.preview-actions button { min-height: 28px; padding: 0 7px; border: 1px solid transparent; border-radius: 2px; color: #a2adbd; background: transparent; font-size: 9px; }
+.preview-actions button:hover:enabled { border-color: #34404f; color: #d0d7e2; }
+.preview-actions .deployment-action { border-color: #343e4b; }
+.preview-actions button:disabled { color: #4f5b6c; cursor: default; }
+.preview-stage.preview-stage-e { --preview-stage-side-padding:24px; --preview-stage-bottom-padding:12px; --preview-caption-height:28px; --preview-caption-gap:4px; --preview-identify-height:14px; min-height: 0; min-width: 0; padding: 0 var(--preview-stage-side-padding) var(--preview-stage-bottom-padding); display: flex; flex-direction: column; container-type: normal; }
+.preview-viewport { position: relative; flex: 1; min-height: 0; min-width: 0; width: 100%; background: #11161d; align-self: center; }
+.preview-canvas.preview-chrome-frame { position: absolute; background: transparent; }
+.preview-chrome-frame[hidden] { display: none; }
+/* The existing constant gutter is transparent, never a neutral Canvas frame.
+   Only this outside outline is painted; its inner edge is the canonical HWND
+   rectangle. No DOM z-index is needed over native/media pixels. */
+.preview-chrome-frame::after {
+  content: none; position: absolute; pointer-events: none;
+  left: var(--canvas-left); top: var(--canvas-top);
+  width: var(--canvas-width); height: var(--canvas-height);
+  outline: 2px solid #d27368; outline-offset: 0;
+}
+.preview-phase-e[data-highlight=true] .preview-chrome-frame::after { content: ''; }
+.preview-placeholder.preview-native-surface { position: absolute; display: block; aspect-ratio: auto; border: 0; border-radius: 0; background: #12151a; }
+.preview-stage-e .preview-caption { flex-shrink: 0; min-height: var(--preview-caption-height); margin-top: var(--preview-caption-gap); }
+.preview-identify-result { min-height: var(--preview-identify-height); flex-shrink: 0; color: #758297; font-size: 8px; }
+.preview-view-options { margin-top: 12px; padding-top: 12px; border-top: 1px solid #2c3440; font-size: 10px; color: #a4afc0; }
+.preview-view-options label { display: inline-flex; align-items: center; gap: 7px; }
+.preview-view-options input { margin: 0; accent-color: #aab7c9; width: 12px; height: 12px; }
+.preview-view-options fieldset { border: 0; padding: 0; margin: 12px 0 0; display: flex; flex-wrap: wrap; gap: 16px; }
+.preview-view-options legend { padding: 0; margin-bottom: 9px; color: #8a98ab; }
+.preview-view-options legend span { margin-left: 10px; font-size: 7px; letter-spacing: .09em; color: #5f6c80; }
+.preview-view-feedback { height: 44px; overflow: auto; margin-top: 8px; }
+.preview-view-feedback > div { display: flex; align-items: start; gap: 10px; color: #c0aaa3; font-size: 9px; line-height: 14px; }
+.preview-view-feedback strong { font-weight: 500; }
+.preview-view-feedback button { border: 0; color: #b5c0d0; background: transparent; font: inherit; padding: 0; }
+@media (max-width:760px) { .preview-context.preview-context-e { padding: 12px 18px 10px; } .preview-stage.preview-stage-e { --preview-stage-side-padding:18px; --preview-stage-bottom-padding:10px; } }
+@media (max-width:520px) { .preview-display-row { flex-wrap: wrap; gap: 6px; } .bound-display { flex-basis: 100%; } .preview-actions { margin-left: auto; } .preview-facts-row { gap: 10px; } .preview-context.preview-context-e { padding-left: 16px; padding-right: 16px; } }

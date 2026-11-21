@@ -3,9 +3,6 @@
 
 #include <QApplication>
 #include <QEvent>
-#include <QFontDatabase>
-#include <QRawFont>
-#include <QToolButton>
 #include <QWindow>
 #include <windows.h>
 #include <iostream>
@@ -17,33 +14,30 @@ SessionPresentation::SessionPresentation(QWidget& window) : window_(&window)
     window.installEventFilter(this);
 }
 
-void SessionPresentation::bindButton(QToolButton& button)
+void SessionPresentation::bindRecovery(std::function<bool()> qualified, std::function<void()> requestHide)
 {
-    // Keep the client action's chevron independent of the localized text font.
-    // These are existing Windows fonts, not shipped assets or native caption UI.
-    auto glyphFont = button.font();
-    glyphFont.setPixelSize(18); // Legible Unicode fallback if neither icon font exists.
-    button.setFont(glyphFont);
-    const auto families = QFontDatabase::families();
-    for (const auto* family : {"Segoe Fluent Icons", "Segoe MDL2 Assets"})
+    if (!requestHide)
     {
-        if (!families.contains(QString::fromLatin1(family))) continue;
-        QFont iconFont(QString::fromLatin1(family));
-        iconFont.setPixelSize(16);
-        if (!QRawFont::fromFont(iconFont).supportsCharacter(0xE70D)) continue;
-        button.setText(QString(QChar(0xE70D))); // Windows ChevronDown; accessible name stays semantic.
-        button.setFont(iconFont);
-        break;
+        bindPermitRecovery(std::move(qualified), {});
+        return;
     }
-    button_ = &button;
-    connect(&button, &QToolButton::clicked, this, [this] { requestHide(); });
-    refreshEligibility();
+    bindPermitRecovery(std::move(qualified), [request = std::move(requestHide)](HideValidity stillAllowed) {
+        if (!stillAllowed || stillAllowed()) request();
+    });
 }
 
-void SessionPresentation::bindRecovery(std::function<bool()> qualified, std::function<void()> requestHide)
+void SessionPresentation::bindPermitRecovery(std::function<bool()> qualified,
+    std::function<void(HideValidity)> requestHide)
 {
     qualified_ = std::move(qualified);
     requestHide_ = std::move(requestHide);
+    refreshEligibility();
+}
+
+void SessionPresentation::bindEligibilityChanged(std::function<void(bool)> callback)
+{
+    eligibilityChanged_ = std::move(callback);
+    lastEligibility_.reset();
     refreshEligibility();
 }
 
@@ -54,7 +48,7 @@ bool SessionPresentation::eligible() const
 
 bool SessionPresentation::modalBlocked() const
 {
-    // Application-modal BGM dialogs need not descend from MainWindow.
+    // Application-modal BGM dialogs may have a different top-level owner.
     if (const auto* modal = QApplication::activeModalWidget(); modal
         && (modal->windowModality() == Qt::ApplicationModal || modal == window_
             || (window_ && window_->isAncestorOf(modal)))) return true;
@@ -97,9 +91,15 @@ RoleCloseResult SessionPresentation::requestClose(const RoleCloseKey& key)
     closeOperation_ = RoleCloseOperation{key, RoleCloseResult::Pending};
     refreshEligibility();
     if (closeReport_) closeReport_(); // Pending before entering a nested document/dialog event loop.
-    window_->close(); // Sole semantic path: actual QWidget close -> existing role closeEvent.
-    closeOperation_->result = ending_ ? RoleCloseResult::CloseAccepted : RoleCloseResult::CloseAborted;
-    if (!ending_ && closeWasHidden_)
+    window_->close(); // May leave the same native close operation Pending.
+    return closeOperation_->result;
+}
+
+void SessionPresentation::completeClose(bool accepted)
+{
+    if (!closeOperation_ || terminalCloseResult(closeOperation_->result)) return;
+    closeOperation_->result = accepted ? RoleCloseResult::CloseAccepted : RoleCloseResult::CloseAborted;
+    if (!accepted && closeWasHidden_)
     {
         if (!closeRecoveryLost_ && qualified_ && qualified_() && !modalBlocked())
         {
@@ -110,7 +110,6 @@ RoleCloseResult SessionPresentation::requestClose(const RoleCloseKey& key)
     }
     refreshEligibility();
     if (closeReport_) closeReport_(); // Accepted only AFTER the existing ordinary teardown returned.
-    return closeOperation_->result;
 }
 
 void SessionPresentation::surfaceCloseInteraction()
@@ -128,17 +127,23 @@ void SessionPresentation::refreshEligibility()
     // Loss of the recovery path is different from a temporary modal Hide blocker.
     // A hidden primary must fail visible immediately on known qualification loss.
     if (hidden_ && !ending_ && (!qualified_ || !qualified_())) (void)restore();
-    if (button_) button_->setEnabled(eligible());
+    if (const auto changed = eligibilityChanged_; changed)
+    {
+        const auto available = eligible();
+        if (lastEligibility_ == available) return;
+        lastEligibility_ = available;
+        changed(available);
+    }
 }
 
-void SessionPresentation::requestHide()
+void SessionPresentation::requestHide(HideValidity stillAllowed)
 {
-    if (eligible() && requestHide_) requestHide_();
+    if (eligible() && requestHide_) requestHide_(std::move(stillAllowed));
 }
 
 bool SessionPresentation::applyHidePermit()
 {
-    if (!eligible()) return false; // Fresh local qualification/modal check, not cached button state.
+    if (!eligible()) return false; // Recheck current local qualification and modality.
     if (hidden_) return true;
     restoreState_ = window_->windowState() & ~Qt::WindowMinimized & ~Qt::WindowActive;
     restoreGeometry_ = window_->isMaximized() ? window_->normalGeometry() : window_->geometry();
@@ -205,7 +210,7 @@ void SessionPresentation::beginTeardown()
     ++showGeneration_;
     qualified_ = {};
     requestHide_ = {};
-    if (button_) button_->setEnabled(false);
+    eligibilityChanged_ = {};
 }
 
 bool SessionPresentation::eventFilter(QObject* watched, QEvent* event)

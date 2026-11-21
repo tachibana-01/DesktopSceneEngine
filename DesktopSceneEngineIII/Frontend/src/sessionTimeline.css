@@ -1,0 +1,29 @@
+.session-timeline { min-width: 0; background: #15191f; border-top: 1px solid #272e38; }
+.timeline-line { height: 34px; display: flex; align-items: center; padding: 0 26px; gap: 14px; }
+.preview-workspace .timeline-line { padding-inline: clamp(10px, 3%, 26px); }
+.timeline-control { height: 28px; position: relative; flex: 1; min-width: 0; touch-action: none; outline: none; }
+.timeline-control, .timeline-groove, .timeline-progress, .timeline-thumb { cursor: default; }
+.timeline-control:focus-visible { outline: 1px solid #909eaf; outline-offset: -1px; }
+.timeline-groove { position: absolute; left: 0; right: 0; top: 13px; height: 2px; background: #394554; }
+.timeline-progress { display: block; height: 2px; background: #8897ac; }
+.timeline-thumb { position: absolute; top: -4px; width: 5px; height: 10px; transform: translateX(-50%); background: #b3becd; }
+.timeline-control[aria-disabled=true] { opacity: .25; }
+.timeline-control[aria-disabled=true] .timeline-thumb { display: none; }
+.timeline-time { flex: 0 0 auto; min-width: 0; text-align: right; font-size: 10px; color: #8290a4; white-space: nowrap; }
+.timeline-time > span { color: #4b5767; }
+.timeline-time.is-preview { color: #d2dae5; }
+/* DOM-only mock overlay. A future overlap with native Preview HWND requires a
+   Host/Native-capable popup strategy; this z-index is not an HWND airspace fix. */
+.timeline-hover-overlay { position: fixed; inset: 0; z-index: 20; pointer-events: none; }
+.timeline-hover-overlay[data-placement-ready=false] { visibility: hidden; }
+.timeline-hover-popup { position: absolute; padding: 7px; border: 1px solid #36404d; border-radius: 3px; background: #171c23; box-shadow: 0 3px 10px #0004; pointer-events: none; }
+.timeline-thumbnail { width: var(--thumbnail-width); height: var(--thumbnail-height); margin: 0 auto; display: grid; place-items: center; background: #0b0f14; overflow: hidden; }
+.timeline-thumbnail > span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: #8a97a8; }
+.timeline-thumbnail svg { width: 100%; height: 100%; }
+.timeline-thumbnail text { font-family: monospace; font-size: 9px; fill: #c1c9d4; }
+.timeline-hover-time { height: 24px; display: grid; place-items: center; font-size: 10px; color: #c8d1de; }
+.timeline-sr { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.timeline-dev-lab { margin-top: 16px; border-top: 1px solid #303946; padding-top: 12px; }
+.timeline-dev-lab summary { color: #9caabd; font-size: 11px; cursor: pointer; }
+.timeline-dev-lab .playback-dev-facts { margin-top: 10px; }
+@media (max-width:760px) { .timeline-line { padding: 0 16px; } }

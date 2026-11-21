@@ -1,0 +1,5 @@
+/.deps/
+/build/
+/Frontend/node_modules/
+/Frontend/dist/
+/Prototype/evidence/

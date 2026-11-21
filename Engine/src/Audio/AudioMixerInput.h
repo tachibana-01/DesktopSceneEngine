@@ -9,8 +9,10 @@ namespace DesktopSceneEngine::Audio
 enum class AudioMixerInputReadStatus
 {
     Data,
+    TemporaryEmpty,
     EndOfStream,
-    Failure
+    Failure,
+    Retired
 };
 
 struct AudioMixerInputReadResult

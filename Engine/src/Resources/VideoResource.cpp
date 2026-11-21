@@ -11,11 +11,11 @@ extern "C"
 
 #include <cmath>
 #include <array>
-#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <string>
@@ -80,7 +80,8 @@ using ScalePtr = std::unique_ptr<SwsContext, ScaleCloser>;
 constexpr std::size_t DiagnosticGuardSize = 64U * 1024U;
 constexpr unsigned char DiagnosticGuardValue = 0xA5U;
 constexpr unsigned char DiagnosticPaddingValue = 0xCCU;
-constexpr std::size_t DiagnosticPaddingLimit = 4096U;
+constexpr std::size_t DestinationAlignment = 64U;
+constexpr std::size_t WritableDiagnosticPaddingSize = 0U;
 
 std::atomic_uint64_t nextResourceGeneration{0U};
 
@@ -109,36 +110,6 @@ std::uint64_t diagnosticValue(const std::atomic_uint64_t& counter) noexcept
 std::uint64_t incrementDiagnosticValue(std::atomic_uint64_t& counter) noexcept
 {
     return counter.fetch_add(1U, std::memory_order_relaxed) + 1U;
-}
-
-std::size_t readDiagnosticSize(
-    const char* name,
-    std::size_t defaultValue,
-    std::size_t maximum) noexcept
-{
-    const char* value = std::getenv(name);
-    if (value == nullptr || *value == '\0')
-    {
-        return defaultValue;
-    }
-
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end == value || *end != '\0' || parsed > maximum)
-    {
-        return defaultValue;
-    }
-
-    return static_cast<std::size_t>(parsed);
-}
-
-std::size_t readDiagnosticAlignment() noexcept
-{
-    const std::size_t value = readDiagnosticSize(
-        "DSE_VIDEO_ALIGNMENT",
-        64U,
-        64U);
-    return value == 16U || value == 32U || value == 64U ? value : 1U;
 }
 
 struct RegionInspection
@@ -327,16 +298,12 @@ struct VideoResource::Impl
         : resourceGeneration(nextResourceGeneration.fetch_add(
               1U,
               std::memory_order_relaxed) + 1U),
-          writablePaddingSize(readDiagnosticSize(
-              "DSE_VIDEO_PADDING_BYTES",
-              0U,
-              DiagnosticPaddingLimit)),
-          destinationAlignment(readDiagnosticAlignment()),
           packet(av_packet_alloc()),
           decodedFrame(av_frame_alloc())
     {
     }
 
+    VideoFrameDecodeOptions activeDecodeOptions{};
     FormatPtr format{};
     CodecPtr codec{};
     PacketPtr packet{};
@@ -347,11 +314,9 @@ struct VideoResource::Impl
     std::uint64_t resourceGeneration = 0;
     std::uint64_t bufferGeneration = 0;
     std::size_t logicalPixelSize = 0;
-    std::size_t writablePaddingSize = 0;
     std::size_t allocatedDiagnosticSize = 0;
     std::size_t backingStorageSize = 0;
     std::size_t guardSize = DiagnosticGuardSize;
-    std::size_t destinationAlignment = 1;
     int videoStreamIndex = -1;
     AVRational timeBase{0, 1};
     int width = 0;
@@ -375,7 +340,6 @@ struct VideoResource::Impl
     std::size_t lastDestinationRowStride = 0;
     int lastScaledRows = 0;
     VideoDecodeDiagnostics decodeDiagnostics{};
-    VideoFrameDecodeOptions activeDecodeOptions{};
     std::atomic_uint64_t cancellationCheckCount{0U};
     bool cancellationObserved = false;
     bool sequentialStateValid = false;
@@ -383,6 +347,8 @@ struct VideoResource::Impl
     bool decoderDrainSent = false;
     bool packetPending = false;
     bool eofReached = false;
+    bool decoderEofReached = false;
+    bool lastRequestReachedEndOfStream = false;
     bool hasReturnedFrame = false;
     bool forceSeekOnNextRequest = false;
     double lastDecodedTimestampSeconds = -1.0;
@@ -412,12 +378,12 @@ bool VideoResource::verifyBufferGuard(const char* phase) const noexcept
         return true;
     }
 
-    const std::size_t paddingAndGuard = impl_->writablePaddingSize
+    const std::size_t paddingAndGuard = WritableDiagnosticPaddingSize
         + impl_->guardSize;
     const bool sizeValid = impl_->logicalPixelSize <= impl_->backingStorageSize
         && paddingAndGuard <= impl_->backingStorageSize - impl_->logicalPixelSize
         && impl_->allocatedDiagnosticSize == impl_->logicalPixelSize
-            + impl_->writablePaddingSize
+            + WritableDiagnosticPaddingSize
         && impl_->pixels.size() >= impl_->backingStorageSize
         && impl_->pixels.data() != nullptr;
     if (!sizeValid)
@@ -430,7 +396,7 @@ bool VideoResource::verifyBufferGuard(const char* phase) const noexcept
             static_cast<unsigned long long>(impl_->bufferGeneration),
             impl_->sourcePath.c_str(),
             impl_->logicalPixelSize,
-            impl_->writablePaddingSize,
+            WritableDiagnosticPaddingSize,
             impl_->guardSize,
             impl_->backingStorageSize,
             impl_->pixels.size(),
@@ -442,10 +408,10 @@ bool VideoResource::verifyBufferGuard(const char* phase) const noexcept
     const unsigned char* const paddingBegin =
         impl_->pixels.data() + impl_->logicalPixelSize;
     const unsigned char* const guardBegin =
-        paddingBegin + impl_->writablePaddingSize;
+        paddingBegin + WritableDiagnosticPaddingSize;
     const RegionInspection padding = inspectRegion(
         paddingBegin,
-        impl_->writablePaddingSize,
+        WritableDiagnosticPaddingSize,
         DiagnosticPaddingValue);
     const RegionInspection guard = inspectRegion(
         guardBegin,
@@ -474,7 +440,7 @@ bool VideoResource::verifyBufferGuard(const char* phase) const noexcept
         static_cast<unsigned long long>(
             diagnosticValue(globalDiagnostics.scaleCalls)),
         impl_->logicalPixelSize,
-        impl_->writablePaddingSize,
+        WritableDiagnosticPaddingSize,
         impl_->guardSize,
         impl_->backingStorageSize,
         static_cast<const void*>(impl_->pixels.data()),
@@ -504,7 +470,7 @@ bool VideoResource::verifyBufferGuard(const char* phase) const noexcept
         std::fprintf(
             stderr,
             "[VideoResource] tail-write escaped padding: maximum-bytes-beyond-logical=%zu\n",
-            impl_->writablePaddingSize + guard.last + 1U);
+            WritableDiagnosticPaddingSize + guard.last + 1U);
     }
     else if (!padding.intact && guard.intact)
     {
@@ -533,6 +499,16 @@ bool VideoResource::nextFrame(float time) noexcept
 
 bool VideoResource::open(const std::filesystem::path& path) noexcept
 {
+    return open(path, nullptr);
+}
+
+bool VideoResource::open(const std::filesystem::path& path,
+    const std::atomic_bool* cancellationRequested) noexcept
+{
+    if (impl_)
+    {
+        impl_->lastRequestReachedEndOfStream = false;
+    }
     if (!impl_ || path.empty())
     {
         return false;
@@ -553,14 +529,26 @@ bool VideoResource::open(const std::filesystem::path& path) noexcept
         return false;
     }
 
-    const std::u8string utf8Path = path.u8string();
-    const std::string ffmpegPath{
-        reinterpret_cast<const char*>(utf8Path.data()),
-        utf8Path.size()
-    };
-    candidate->sourcePath = ffmpegPath;
+    try
+    {
+        const auto utf8Path = path.u8string();
+        candidate->sourcePath.assign(reinterpret_cast<const char*>(utf8Path.data()), utf8Path.size());
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+    const auto& ffmpegPath = candidate->sourcePath;
 
-    AVFormatContext* rawFormat = nullptr;
+    AVFormatContext* rawFormat = avformat_alloc_context();
+    if (!rawFormat) return false;
+    candidate->activeDecodeOptions.cancellationRequested = cancellationRequested;
+    rawFormat->interrupt_callback.callback = [](void* opaque) -> int {
+        const auto* context = static_cast<const Impl*>(opaque);
+        const auto* cancellation = context->activeDecodeOptions.cancellationRequested;
+        return cancellation && cancellation->load(std::memory_order_acquire) ? 1 : 0;
+    };
+    rawFormat->interrupt_callback.opaque = candidate.get();
     if (avformat_open_input(&rawFormat, ffmpegPath.c_str(), nullptr, nullptr) < 0)
     {
         return false;
@@ -571,6 +559,7 @@ bool VideoResource::open(const std::filesystem::path& path) noexcept
     {
         return false;
     }
+    candidate->activeDecodeOptions = {};
 
     const AVCodec* decoder = nullptr;
     candidate->videoStreamIndex = av_find_best_stream(
@@ -654,6 +643,7 @@ bool VideoResource::frameAt(float time) noexcept
     if (impl_ != nullptr)
     {
         ++impl_->decodeDiagnostics.frameAtCalls;
+        impl_->lastRequestReachedEndOfStream = false;
     }
 
     if (shouldLog(frameAtCall))
@@ -700,6 +690,7 @@ bool VideoResource::frameAt(float time) noexcept
             impl_->inputEof = false;
             impl_->decoderDrainSent = false;
             impl_->eofReached = false;
+            impl_->decoderEofReached = false;
             impl_->hasReturnedFrame = false;
             impl_->forceSeekOnNextRequest = true;
             frame_ = DecodedFrame{};
@@ -759,6 +750,7 @@ bool VideoResource::frameAt(float time) noexcept
             - static_cast<double>(impl_->lastRequestedTime))
             <= TimestampEpsilon)
     {
+        impl_->lastRequestReachedEndOfStream = impl_->decoderEofReached;
         return false;
     }
 
@@ -803,19 +795,23 @@ bool VideoResource::frameAt(float time) noexcept
 
     if (impl_->eofReached && !requiresSeek)
     {
+        impl_->lastRequestReachedEndOfStream = impl_->decoderEofReached;
         return false;
     }
 
+    impl_->decoderEofReached = false;
     if (requiresSeek)
     {
         impl_->lastSeekTimestamp = targetTimestamp;
         (void)incrementDiagnosticValue(globalDiagnostics.seekCalls);
         ++impl_->decodeDiagnostics.seekCalls;
-        if (av_seek_frame(
+        const auto seekResult = av_seek_frame(
                 impl_->format.get(),
                 impl_->videoStreamIndex,
                 targetTimestamp,
-            AVSEEK_FLAG_BACKWARD) < 0)
+                AVSEEK_FLAG_BACKWARD);
+        if (cancellationRequested()) return false;
+        if (seekResult < 0)
         {
             impl_->lastRequestedTime = time;
             impl_->sequentialStateValid = false;
@@ -934,7 +930,7 @@ bool VideoResource::frameAt(float time) noexcept
             AV_PIX_FMT_RGBA,
             impl_->width,
             impl_->height,
-            static_cast<int>(impl_->destinationAlignment));
+            static_cast<int>(DestinationAlignment));
         if (requiredSize <= 0)
         {
             return false;
@@ -943,8 +939,8 @@ bool VideoResource::frameAt(float time) noexcept
         const std::size_t logicalPixelSize =
             static_cast<std::size_t>(requiredSize);
         if (logicalPixelSize > (std::numeric_limits<std::size_t>::max)()
-                - impl_->writablePaddingSize
-            || logicalPixelSize + impl_->writablePaddingSize
+                - WritableDiagnosticPaddingSize
+            || logicalPixelSize + WritableDiagnosticPaddingSize
                 > (std::numeric_limits<std::size_t>::max)()
                     - impl_->guardSize)
         {
@@ -952,7 +948,7 @@ bool VideoResource::frameAt(float time) noexcept
         }
 
         const std::size_t allocatedDiagnosticSize =
-            logicalPixelSize + impl_->writablePaddingSize;
+            logicalPixelSize + WritableDiagnosticPaddingSize;
         const std::size_t backingStorageSize =
             allocatedDiagnosticSize + impl_->guardSize;
         const unsigned char* oldData = impl_->pixels.data();
@@ -1000,7 +996,7 @@ bool VideoResource::frameAt(float time) noexcept
                 AV_PIX_FMT_RGBA,
                 impl_->width,
                 impl_->height,
-                static_cast<int>(impl_->destinationAlignment)) < 0)
+                static_cast<int>(DestinationAlignment)) < 0)
         {
             return false;
         }
@@ -1061,12 +1057,12 @@ bool VideoResource::frameAt(float time) noexcept
             static_cast<const void*>(impl_->pixels.data()
                 + impl_->allocatedDiagnosticSize),
             impl_->logicalPixelSize,
-            impl_->writablePaddingSize,
+            WritableDiagnosticPaddingSize,
             impl_->backingStorageSize,
             rowStride,
             impl_->width,
             impl_->height,
-            impl_->destinationAlignment,
+            DestinationAlignment,
             impl_->lastDecodedWidth,
             impl_->lastDecodedHeight,
             static_cast<int>(impl_->lastDecodedFormat),
@@ -1275,6 +1271,8 @@ bool VideoResource::frameAt(float time) noexcept
         {
             impl_->lastRequestedTime = time;
             impl_->eofReached = true;
+            impl_->decoderEofReached = impl_->inputEof && impl_->decoderDrainSent;
+            impl_->lastRequestReachedEndOfStream = impl_->decoderEofReached;
             impl_->sequentialStateValid = false;
             return false;
         }
@@ -1326,6 +1324,7 @@ bool VideoResource::frameAt(float time) noexcept
         const int readResult = av_read_frame(
             impl_->format.get(),
             impl_->packet.get());
+        if (cancellationRequested()) return false;
         if (readResult == AVERROR_EOF)
         {
             impl_->inputEof = true;
@@ -1376,6 +1375,11 @@ VideoFrameDecodeStatus VideoResource::frameAt(
 const DecodedFrame& VideoResource::currentFrame() const noexcept
 {
     return frame_;
+}
+
+bool VideoResource::lastFrameAtReachedEndOfStream() const noexcept
+{
+    return impl_ && impl_->lastRequestReachedEndOfStream;
 }
 
 VideoDecodeDiagnostics VideoResource::diagnostics() const noexcept

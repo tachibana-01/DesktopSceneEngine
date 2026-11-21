@@ -22,14 +22,8 @@ set(
 # ==============================
 
 option(
-    BUILD_EDITOR
-    "Build Qt Editor"
-    OFF
-)
-
-option(
     BUILD_PLAYER
-    "Build the Qt6 Widgets Player"
+    "Build the Windows DesktopSceneEngine Player"
     OFF
 )
 
@@ -230,13 +224,6 @@ add_subdirectory(Sandbox)
 if(BUILD_PLAYER)
 
     add_subdirectory(Player)
-
-endif()
-
-
-if(BUILD_EDITOR)
-
-    add_subdirectory(Editor)
 
 endif()
 

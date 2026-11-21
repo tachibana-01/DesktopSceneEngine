@@ -30,10 +30,15 @@ target_sources(
 
     src/DisplayIdentity.cpp
     src/Audio/AudioMixer.cpp
+    src/Audio/AudioExecution.cpp
+    src/Audio/AudioExecutionClock.cpp
+    src/Audio/AudioPcmPipe.cpp
+    src/Audio/AudioSourcePreparation.cpp
     src/Audio/AudioSampleConversion.cpp
     src/Audio/EmbeddedAudioMixerInput.cpp
     src/Audio/MixedOutputBridge.cpp
     src/Core/Engine.cpp
+    src/Core/EngineAudioControl.cpp
     src/Music/BackgroundMusicExecutor.cpp
     src/Music/BackgroundMusicOrchestrator.cpp
     src/Music/BackgroundMusicRuntime.cpp
@@ -51,6 +56,7 @@ target_sources(
     src/Platform/Windows/WindowsDisplayIdentifier.cpp
     src/Platform/Windows/WindowsDisplayEnumerator.cpp
     src/Resources/AudioResource.cpp
+    src/Resources/DetachedMediaProducer.cpp
     src/Resources/ImageResource.cpp
     src/Resources/PreviewVideoDecoder.cpp
     src/Resources/RepresentativeFrameCache.cpp
@@ -60,7 +66,9 @@ target_sources(
     src/Resources/RepresentativeFrameStore.cpp
     src/Resources/SequentialAudioSource.cpp
     src/Resources/VideoResource.cpp
+    src/Rendering/EnginePresentation.cpp
     src/Rendering/GraphicsBackend.cpp
+    src/Rendering/HostedCompositionContent.cpp
     src/Rendering/Renderer.cpp
     src/Runtime/Playback/PlaybackRuntime.cpp
     src/Runtime/Scene/SceneRuntime.cpp
@@ -134,6 +142,7 @@ if(WIN32)
         comctl32
         windowscodecs
         ole32
+        avrt
         uuid
     )
 

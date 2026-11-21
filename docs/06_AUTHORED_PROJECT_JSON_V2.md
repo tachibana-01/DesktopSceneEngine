@@ -4,10 +4,10 @@
 
 Authored Project JSON v2 is the portable persistence representation of
 `Domain::AuthoredProject`. It preserves authored configuration and stable authored
-identity. The serializer in this phase accepts and produces version `2.0` only.
+identity. The v2 object serializer accepts and produces version `2.0` only.
 
-Legacy Project JSON `1.0` remains a separate historical input format. Its migration
-is handled by a later importer phase and is not part of the v2 object serializer.
+Legacy Project JSON `1.0` is a separate input format. [Project file loading](08_PROJECT_FILE_IO.md)
+dispatches it to the [legacy importer](07_LEGACY_V1_IMPORT.md).
 
 ## Root
 

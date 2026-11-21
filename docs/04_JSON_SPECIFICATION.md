@@ -10,9 +10,9 @@ Last Updated: 2026-07-23
 
 # 1. Purpose
 
-This document defines the JSON serialization specification used throughout Desktop Scene Engine.
-
-The purpose of this specification is to ensure that all JSON files within the project follow a unified format, naming convention, compatibility strategy, and serialization behavior.
+This document defines the frozen legacy v1.0 project JSON format. Current authored
+projects use [JSON v2](06_AUTHORED_PROJECT_JSON_V2.md). See also
+[Legacy v1 Import](07_LEGACY_V1_IMPORT.md) and [Project File I/O](08_PROJECT_FILE_IO.md).
 
 This document defines **how data is represented**, not **what the data means**.
 

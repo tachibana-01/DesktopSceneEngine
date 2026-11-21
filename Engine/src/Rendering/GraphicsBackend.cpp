@@ -1,5 +1,6 @@
 #include "GraphicsBackend.h"
 #include "PresentationViewport.h"
+#include "HostedCompositionContent.h"
 
 #include "../Platform/Windows/NativeWindowClientSize.h"
 
@@ -32,6 +33,7 @@ using Microsoft::WRL::ComPtr;
 using DesktopSceneEngine::Rendering::Detail::PresentationTargetState;
 using DesktopSceneEngine::Rendering::Detail::CompositionFailurePoint;
 using DesktopSceneEngine::Rendering::Detail::GraphicsOperationResult;
+using DesktopSceneEngine::Rendering::Detail::hasValidRgbaBuffer;
 using DesktopSceneEngine::PresentationTransport;
 using DesktopSceneEngine::CanvasOutsideMode;
 
@@ -93,13 +95,54 @@ struct CompositionSwapChainResources
     CompositionTreeState treeState = CompositionTreeState::Unwired;
 };
 
+struct HostedCompositionResources
+{
+    std::shared_ptr<DesktopSceneEngine::Rendering::Detail::HostedTargetState> state;
+};
+
 struct TargetDescriptor
 {
     DesktopSceneEngine::PresentationTargetId id{};
     void* nativeHandle = nullptr;
     PresentationTransport transport = PresentationTransport::HwndSwapChain;
     int bottomInsetPixels = 0;
+    DesktopSceneEngine::PresentationExtent allocationExtent{};
+    std::shared_ptr<DesktopSceneEngine::Rendering::Detail::HostedTargetState> hosted;
 };
+
+bool validExtent(DesktopSceneEngine::PresentationExtent extent) noexcept
+{
+    return extent.width >= 0 && extent.height >= 0
+        && extent.width <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
+        && extent.height <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+}
+
+bool validWindowTarget(const DesktopSceneEngine::Rendering::WindowTarget& target) noexcept
+{
+    if (target.transport == PresentationTransport::HostedCompositionContent)
+        return !target.handle && target.bottomInsetPixels == 0 && validExtent(target.allocationExtent);
+    return (target.transport == PresentationTransport::HwndSwapChain
+            || target.transport == PresentationTransport::DirectCompositionSwapChain)
+        && target.handle
+        && DesktopSceneEngine::Platform::Windows::queryNativeWindowClientSize(target.handle).has_value();
+}
+
+std::optional<DesktopSceneEngine::Platform::Windows::NativeClientSize>
+targetExtent(const TargetDescriptor& descriptor) noexcept
+{
+    if (descriptor.hosted)
+        return descriptor.hosted->lifetime->active
+            ? std::optional{DesktopSceneEngine::Platform::Windows::NativeClientSize{
+                descriptor.allocationExtent.width, descriptor.allocationExtent.height}}
+            : std::nullopt;
+    return DesktopSceneEngine::Platform::Windows::queryNativeWindowClientSize(descriptor.nativeHandle);
+}
+
+bool endpointAlive(const TargetDescriptor& descriptor) noexcept
+{
+    return descriptor.hosted ? descriptor.hosted->lifetime->active
+        : IsWindow(reinterpret_cast<HWND>(descriptor.nativeHandle)) != FALSE;
+}
 
 bool hasOtherLogicalCompositionTarget(
     const std::vector<TargetDescriptor>& descriptors,
@@ -118,7 +161,7 @@ struct TargetRealization
     DesktopSceneEngine::PresentationTargetId id{};
     ComPtr<IDXGISwapChain> swapChain{};
     ComPtr<ID3D11RenderTargetView> renderTargetView{};
-    std::variant<HwndSwapChainResources, CompositionSwapChainResources> transport{};
+    std::variant<HwndSwapChainResources, CompositionSwapChainResources, HostedCompositionResources> transport{};
     int observedClientWidth = 0;
     int observedClientHeight = 0;
     int realizedClientWidth = 0;
@@ -143,7 +186,55 @@ struct TargetRealization
     // One authorization on an already-published logical slot, not on its
     // current swap chain or render-target view.
     bool pendingTargetLocalRecovery = false;
+    bool replaceHostedContentForTesting = false;
+    std::optional<HRESULT> hostedResizeResultForTesting;
 };
+
+// Revoke only the publication whose buffers are about to mutate. An older,
+// distinct swapchain can remain a valid retained presentation during replacement.
+void invalidateHostedBuffers(TargetRealization& target) noexcept
+{
+    const auto* hosted = std::get_if<HostedCompositionResources>(&target.transport);
+    if (!hosted || !hosted->state->published) return;
+    auto& publication = *hosted->state->published;
+    if (publication.content.Get() == target.swapChain.Get())
+    {
+        publication.eligible = false;
+        publication.current = false;
+    }
+}
+
+void publishHostedContent(const DeviceResources& resources, TargetRealization& target)
+{
+    const auto* hosted = std::get_if<HostedCompositionResources>(&target.transport);
+    if (!hosted || !hosted->state->lifetime->active) return;
+    auto& state = *hosted->state;
+    const auto& previous = state.published;
+    const bool sameIdentity = previous && previous->content.Get() == target.swapChain.Get()
+        && previous->deviceGeneration == resources.generation;
+    if (sameIdentity && previous->eligible
+        && previous->extent.width == target.realizedClientWidth
+        && previous->extent.height == target.realizedClientHeight) return;
+    if (!sameIdentity && !state.nextContentGeneration) return;
+    try
+    {
+        auto next = std::make_shared<DesktopSceneEngine::CompositionContentLease::State>();
+        next->content = target.swapChain;
+        next->extent = {target.realizedClientWidth, target.realizedClientHeight};
+        next->targetId = target.id;
+        next->deviceGeneration = resources.generation;
+        next->contentGeneration = sameIdentity ? previous->contentGeneration : state.nextContentGeneration;
+        next->lifetime = state.lifetime;
+        if (!sameIdentity) ++state.nextContentGeneration; // zero permanently exhausts the identity space
+        if (previous) previous->current = false;
+        state.lifetime->deviceGeneration = resources.generation;
+        state.published = std::move(next);
+    }
+    catch (const std::bad_alloc&)
+    {
+        // No unready resource or fabricated metadata is published on allocation failure.
+    }
+}
 
 static_assert(std::is_nothrow_move_constructible_v<TargetDescriptor>);
 static_assert(std::is_nothrow_move_assignable_v<TargetDescriptor>);
@@ -161,7 +252,7 @@ bool isTargetEffectivelyReady(
     const DeviceResources& resources, const TargetRealization& target) noexcept
 {
     return target.state == PresentationTargetState::Ready
-        && (std::holds_alternative<HwndSwapChainResources>(target.transport)
+        && (!std::holds_alternative<CompositionSwapChainResources>(target.transport)
             || resources.compositionTrustState == CompositionTrustState::Trusted);
 }
 
@@ -190,12 +281,6 @@ void enterCompositionContainment(DeviceResources& resources) noexcept
         }
     }
     return false;
-}
-
-bool validTransport(PresentationTransport transport) noexcept
-{
-    return transport == PresentationTransport::HwndSwapChain
-        || transport == PresentationTransport::DirectCompositionSwapChain;
 }
 
 template<class Operation>
@@ -241,6 +326,12 @@ HRESULT releasePresentationDrawableResources(DeviceResources& resources,
 {
     HRESULT requiredTransactionResult = S_OK;
     target.state = PresentationTargetState::Failed; // Exclude before disconnect.
+    if (auto* hosted = std::get_if<HostedCompositionResources>(&target.transport))
+    {
+        if (hosted->state->lifetime->deviceGeneration == resources.generation)
+            hosted->state->lifetime->deviceGeneration = 0;
+        if (hosted->state->published) hosted->state->published->current = false;
+    }
     if (resources.context)
         resources.context->OMSetRenderTargets(0, nullptr, nullptr);
     if (auto* composition = std::get_if<CompositionSwapChainResources>(&target.transport))
@@ -482,35 +573,6 @@ void setViewport(
     viewport.MinDepth = 0.0F;
     viewport.MaxDepth = 1.0F;
     deviceResources.context->RSSetViewports(1, &viewport);
-}
-
-bool hasValidRgbaBuffer(
-    int width,
-    int height,
-    int channels,
-    std::size_t rowStride,
-    std::size_t byteSize)
-{
-    if (width <= 0 || height <= 0 || channels != 4)
-    {
-        return false;
-    }
-
-    const std::size_t minimumRowStride =
-        static_cast<std::size_t>(width) * 4U;
-    if (rowStride < minimumRowStride
-        || rowStride > (std::numeric_limits<UINT>::max)())
-    {
-        return false;
-    }
-
-    const std::size_t rowCount = static_cast<std::size_t>(height);
-    if (rowStride > (std::numeric_limits<std::size_t>::max)() / rowCount)
-    {
-        return false;
-    }
-
-    return byteSize >= rowStride * rowCount;
 }
 
 DesktopSceneEngine::Rendering::Detail::MediaUpdateResult createMediaRealization(
@@ -979,6 +1041,20 @@ HRESULT createSwapChainResources(DeviceResources& resources,
 {
     if (std::holds_alternative<HwndSwapChainResources>(target.transport))
         return createHwndSwapChainResources(resources, descriptor, target, clientSize);
+    if (std::holds_alternative<HostedCompositionResources>(target.transport))
+    {
+        ComPtr<IDXGIFactory2> factory;
+        HRESULT result = resources.factory.As(&factory);
+        if (SUCCEEDED(result))
+            result = prepareCompositionSwapChainResources(resources, factory.Get(), target, clientSize);
+        if (SUCCEEDED(result))
+        {
+            ++target.generation;
+            target.state = hasDrawableViewport(descriptor, target)
+                ? PresentationTargetState::Ready : PresentationTargetState::Suspended;
+        }
+        return result;
+    }
     const HRESULT creationResult =
         createCompositionSwapChainResources(resources, descriptor, target, clientSize);
     if (SUCCEEDED(creationResult))
@@ -1015,9 +1091,9 @@ bool createPresentationTargetResources(
     target.id = descriptor.id;
     if (descriptor.transport == PresentationTransport::DirectCompositionSwapChain)
         target.transport.emplace<CompositionSwapChainResources>();
-    const auto clientSize =
-        DesktopSceneEngine::Platform::Windows::queryNativeWindowClientSize(
-            descriptor.nativeHandle);
+    else if (descriptor.hosted)
+        target.transport.emplace<HostedCompositionResources>(descriptor.hosted);
+    const auto clientSize = targetExtent(descriptor);
     if (!clientSize.has_value())
     {
         if (failureResult)
@@ -1122,9 +1198,7 @@ bool reconcilePresentationTarget(
     const bool wasUsable = target.state == PresentationTargetState::Ready
         || target.state == PresentationTargetState::Occluded
         || target.state == PresentationTargetState::Suspended;
-    const auto clientSize =
-        DesktopSceneEngine::Platform::Windows::queryNativeWindowClientSize(
-            descriptor.nativeHandle);
+    const auto clientSize = targetExtent(descriptor);
     if (!clientSize.has_value())
     {
         target.pendingTargetLocalRecovery = false; // Endpoint owner must resolve invalid HWND.
@@ -1157,6 +1231,7 @@ bool reconcilePresentationTarget(
 
     if (!hasDrawableNativeSize)
     {
+        invalidateHostedBuffers(target);
         target.state = PresentationTargetState::Suspended;
         return false;
     }
@@ -1185,11 +1260,22 @@ bool reconcilePresentationTarget(
         }
         if (category == GraphicsOperationResult::ResourceFailure
             && !authorizedAttempt && wasUsable
-            && IsWindow(reinterpret_cast<HWND>(descriptor.nativeHandle))
-            && (descriptor.transport == PresentationTransport::HwndSwapChain
+            && endpointAlive(descriptor)
+            && (descriptor.transport != PresentationTransport::DirectCompositionSwapChain
                 || deviceResources.compositionTrustState == CompositionTrustState::Trusted))
             target.pendingTargetLocalRecovery = true;
     };
+
+    if (std::exchange(target.replaceHostedContentForTesting, false))
+    {
+        // The published strong reference retains the old resource until a
+        // fresh swapchain has actually rendered and presented successfully.
+        const auto& state = std::get<HostedCompositionResources>(target.transport).state;
+        if (state->published) state->published->current = false;
+        deviceResources.context->OMSetRenderTargets(0, nullptr, nullptr);
+        target.renderTargetView.Reset();
+        target.swapChain.Reset();
+    }
 
     if (!target.swapChain)
     {
@@ -1235,9 +1321,11 @@ bool reconcilePresentationTarget(
     }
 
     const bool authorizedAttempt = std::exchange(target.pendingTargetLocalRecovery, false);
+    invalidateHostedBuffers(target);
     deviceResources.context->OMSetRenderTargets(0, nullptr, nullptr);
     target.renderTargetView.Reset();
-    const HRESULT resizeResult = target.swapChain->ResizeBuffers(
+    const auto forcedResize = std::exchange(target.hostedResizeResultForTesting, std::nullopt);
+    const HRESULT resizeResult = forcedResize ? *forcedResize : target.swapChain->ResizeBuffers(
             0,
             static_cast<UINT>(clientSize->width),
             static_cast<UINT>(clientSize->height),
@@ -1950,6 +2038,62 @@ std::uint64_t GraphicsBackend::successfulPresentationResizeCountForTesting()
         ->successfulResizeCountForTesting;
 }
 
+PresentationTargetId GraphicsBackend::initialize(const HostedCompositionTarget& target)
+{
+    return initialize(WindowTarget{nullptr, 0, PresentationTransport::HostedCompositionContent, target.extent});
+}
+
+PresentationTargetId GraphicsBackend::attachPresentationTarget(const HostedCompositionTarget& target)
+{
+    return attachPresentationTarget(WindowTarget{nullptr, 0, PresentationTransport::HostedCompositionContent, target.extent});
+}
+
+bool GraphicsBackend::setHostedPresentationExtent(PresentationTargetId id, PresentationExtent extent) noexcept
+{
+    auto* descriptor = impl_ && impl_->initialized ? impl_->findDescriptor(id) : nullptr;
+    if (!descriptor || !descriptor->hosted || !descriptor->hosted->lifetime->active || !validExtent(extent))
+        return false;
+    descriptor->allocationExtent = extent;
+    return true;
+}
+
+CompositionContentLease GraphicsBackend::acquireHostedCompositionContent(PresentationTargetId id) const noexcept
+{
+    const auto* descriptor = impl_ && impl_->initialized ? impl_->findDescriptor(id) : nullptr;
+    if (!descriptor || !descriptor->hosted) return {};
+    CompositionContentLease lease{descriptor->hosted->published};
+    return lease.isCurrent() ? std::move(lease) : CompositionContentLease{};
+}
+
+void GraphicsBackend::invalidateHostedCompositionContent() noexcept
+{
+    if (!impl_) return;
+    for (auto& descriptor : impl_->targetDescriptors)
+        if (descriptor.hosted)
+        {
+            descriptor.hosted->lifetime->active = false;
+            if (descriptor.hosted->published) descriptor.hosted->published->current = false;
+        }
+}
+
+bool GraphicsBackend::requestHostedContentReplacementForTesting(PresentationTargetId id) noexcept
+{
+    auto* target = impl_ && impl_->initialized ? impl_->findRealization(id) : nullptr;
+    if (!target || !std::holds_alternative<HostedCompositionResources>(target->transport)) return false;
+    target->replaceHostedContentForTesting = true;
+    target->pendingTargetLocalRecovery = true;
+    return true;
+}
+
+bool GraphicsBackend::forceNextHostedResizeResultForTesting(PresentationTargetId id, std::int32_t result) noexcept
+{
+    auto* target = impl_ && impl_->initialized ? impl_->findRealization(id) : nullptr;
+    if (!target || !std::holds_alternative<HostedCompositionResources>(target->transport)
+        || SUCCEEDED(static_cast<HRESULT>(result))) return false;
+    target->hostedResizeResultForTesting = static_cast<HRESULT>(result);
+    return true;
+}
+
 PresentationTargetId GraphicsBackend::initialize(const WindowTarget& target)
 {
     if (!impl_)
@@ -1963,9 +2107,7 @@ PresentationTargetId GraphicsBackend::initialize(const WindowTarget& target)
     }
 
     auto generation = std::make_unique<GraphicsGeneration>();
-    if (!validTransport(target.transport) || target.handle == nullptr
-        || !Platform::Windows::queryNativeWindowClientSize(target.handle).has_value()
-        || !createDeviceResources(generation->deviceResources))
+    if (!validWindowTarget(target) || !createDeviceResources(generation->deviceResources))
     {
         shutdown();
         return {};
@@ -1987,13 +2129,12 @@ PresentationTargetId GraphicsBackend::attachPresentationTarget(
     const WindowTarget& target)
 {
     if (!impl_ || !impl_->initialized
-        || target.handle == nullptr || impl_->targetIdExhausted)
+        || impl_->targetIdExhausted)
     {
         return {};
     }
 
-    if (!validTransport(target.transport)
-        || !Platform::Windows::queryNativeWindowClientSize(target.handle).has_value())
+    if (!validWindowTarget(target))
         return {};
 
     if (target.transport == PresentationTransport::DirectCompositionSwapChain
@@ -2007,7 +2148,8 @@ PresentationTargetId GraphicsBackend::attachPresentationTarget(
             impl_->targetDescriptors.end(),
             [&target](const TargetDescriptor& existing)
             {
-                return existing.nativeHandle == target.handle;
+                return target.transport != PresentationTransport::HostedCompositionContent
+                    && !existing.hosted && existing.nativeHandle == target.handle;
             }))
     {
         return {};
@@ -2033,8 +2175,13 @@ PresentationTargetId GraphicsBackend::attachPresentationTarget(
     }
 
     const PresentationTargetId id{impl_->nextPresentationTargetId};
-    const TargetDescriptor descriptor{id, target.handle, target.transport,
-        (std::max)(target.bottomInsetPixels, 0)};
+    TargetDescriptor descriptor{id, target.handle, target.transport,
+        (std::max)(target.bottomInsetPixels, 0), target.allocationExtent};
+    if (target.transport == PresentationTransport::HostedCompositionContent)
+    {
+        try { descriptor.hosted = std::make_shared<DesktopSceneEngine::Rendering::Detail::HostedTargetState>(); }
+        catch (const std::bad_alloc&) { return {}; }
+    }
     TargetRealization candidate{};
     bool realized = false;
     bool generationLost = false;
@@ -2125,6 +2272,8 @@ bool GraphicsBackend::detachPresentationTarget(PresentationTargetId id) noexcept
         [id](const TargetDescriptor& descriptor) { return descriptor.id == id; });
     if (found == impl_->targetDescriptors.end())
         return false;
+
+    if (found->hosted) found->hosted->lifetime->active = false;
 
     const bool wasCompositionTarget =
         found->transport == PresentationTransport::DirectCompositionSwapChain;
@@ -2343,9 +2492,7 @@ Detail::GenerationReplacementResult GraphicsBackend::recoverGraphicsGeneration(
             int observedClientHeight = realization.observedClientHeight;
             if (forcedResult)
             {
-                const auto clientSize =
-                    Platform::Windows::queryNativeWindowClientSize(
-                        descriptor.nativeHandle);
+                const auto clientSize = targetExtent(descriptor);
                 if (clientSize.has_value())
                 {
                     observedClientWidth = clientSize->width;
@@ -2368,13 +2515,14 @@ Detail::GenerationReplacementResult GraphicsBackend::recoverGraphicsGeneration(
             realization.id = descriptor.id;
             if (descriptor.transport == PresentationTransport::DirectCompositionSwapChain)
                 realization.transport.emplace<CompositionSwapChainResources>();
+            else if (descriptor.hosted)
+                realization.transport.emplace<HostedCompositionResources>(descriptor.hosted);
             if (candidateLost)
             {
                 impl_->discardGeneration(std::move(candidate), false);
                 return GenerationReplacementResult::GenerationUnavailable;
             }
-            const bool endpointValid =
-                IsWindow(reinterpret_cast<HWND>(descriptor.nativeHandle)) != FALSE;
+            const bool endpointValid = endpointAlive(descriptor);
             const bool zeroNativeSize = endpointValid
                 && (observedClientWidth == 0 || observedClientHeight == 0);
             realization.state = zeroNativeSize
@@ -2382,7 +2530,7 @@ Detail::GenerationReplacementResult GraphicsBackend::recoverGraphicsGeneration(
             if (endpointValid && !zeroNativeSize
                 && (!forcedResult
                     || *forcedResult == Detail::GraphicsOperationResult::ResourceFailure)
-                && (descriptor.transport == PresentationTransport::HwndSwapChain
+                && (descriptor.transport != PresentationTransport::DirectCompositionSwapChain
                     || candidate->deviceResources.compositionTrustState
                         == CompositionTrustState::Trusted))
                 realization.pendingTargetLocalRecovery = true;
@@ -2409,6 +2557,12 @@ Detail::GenerationReplacementResult GraphicsBackend::recoverGraphicsGeneration(
 
     impl_->currentGeneration = std::move(candidate);
     return GenerationReplacementResult::GenerationAvailable;
+}
+
+std::uint64_t GraphicsBackend::deviceGeneration() const noexcept
+{
+    return impl_ && impl_->currentGeneration
+        ? impl_->currentGeneration->deviceResources.generation : 0;
 }
 
 Detail::MediaUpdateResult GraphicsBackend::updateImage(
@@ -2542,16 +2696,16 @@ void GraphicsBackend::clearImage() noexcept
     media.channels = 0;
 }
 
-void GraphicsBackend::renderPrepared(const RenderData& data)
+bool GraphicsBackend::renderPrepared(const RenderData& data, PresentationTargetId onlyTarget)
 {
     if (!impl_ || !impl_->initialized || !impl_->currentGeneration)
-        return;
+        return false;
 
     auto& generation = *impl_->currentGeneration;
     if (isDeviceLost(generation.deviceResources))
     {
         impl_->transitionToPendingRecovery();
-        return;
+        return false;
     }
     bool generationLost = false;
     const bool canDrawImage = updatePresentationConstants(
@@ -2575,13 +2729,13 @@ void GraphicsBackend::renderPrepared(const RenderData& data)
             if ((mode != CanvasOutsideMode::Opaque && mode != CanvasOutsideMode::Transparent)
                 || (mode == CanvasOutsideMode::Transparent
                     && descriptor.transport != PresentationTransport::DirectCompositionSwapChain))
-                return;
+                return false;
             transparentOutside = mode == CanvasOutsideMode::Transparent;
         }
         if (generationLost
             || !bindPresentationTarget(generation.deviceResources, descriptor, target))
         {
-            return;
+            return false;
         }
 
         constexpr float transparentClearColor[4] = {0.0F, 0.0F, 0.0F, 0.0F};
@@ -2617,6 +2771,8 @@ void GraphicsBackend::renderPrepared(const RenderData& data)
             target.state,
             category,
             target.renderTargetView && hasDrawableViewport(descriptor, target));
+        if (category == Detail::PresentResultCategory::Presented)
+            publishHostedContent(generation.deviceResources, target);
         switch (category)
         {
         case Detail::PresentResultCategory::Presented:
@@ -2625,10 +2781,11 @@ void GraphicsBackend::renderPrepared(const RenderData& data)
         case Detail::PresentResultCategory::Occluded:
             break;
         case Detail::PresentResultCategory::TargetFailed:
+            invalidateHostedBuffers(target);
             generation.deviceResources.context->OMSetRenderTargets(
                 0, nullptr, nullptr);
             target.renderTargetView.Reset();
-            if (IsWindow(reinterpret_cast<HWND>(descriptor.nativeHandle))
+            if (endpointAlive(descriptor)
                 && !isDeviceLost(generation.deviceResources))
                 target.pendingTargetLocalRecovery = true;
             std::fprintf(
@@ -2641,9 +2798,23 @@ void GraphicsBackend::renderPrepared(const RenderData& data)
             generationLost = true;
             break;
         }
+        return category == Detail::PresentResultCategory::Presented && presentationResult.result == S_OK;
     };
 
     const PresentationTargetId pacingTargetId = impl_->usablePacingTargetId();
+    if (onlyTarget.isValid())
+    {
+        const auto* descriptor = impl_->findDescriptor(onlyTarget);
+        auto* target = impl_->findRealization(onlyTarget);
+        if (!descriptor || !target || !isTargetEffectivelyReady(generation.deviceResources, *target))
+            return false;
+        const bool pacing = onlyTarget == pacingTargetId;
+        const bool presented = submitTarget(
+            *descriptor, *target, pacing ? 1U : 0U, pacing ? 0U : DXGI_PRESENT_DO_NOT_WAIT);
+        if (generationLost) impl_->transitionToPendingRecovery();
+        return presented;
+    }
+
     for (std::size_t index = 0; index < generation.targets.size(); ++index)
     {
         auto& target = generation.targets[index];
@@ -2655,7 +2826,7 @@ void GraphicsBackend::renderPrepared(const RenderData& data)
             if (generationLost)
             {
                 impl_->transitionToPendingRecovery();
-                return;
+                return false;
             }
         }
     }
@@ -2670,6 +2841,7 @@ void GraphicsBackend::renderPrepared(const RenderData& data)
     }
     if (generationLost)
         impl_->transitionToPendingRecovery();
+    return false;
 }
 
 void GraphicsBackend::shutdown() noexcept
@@ -2680,6 +2852,7 @@ void GraphicsBackend::shutdown() noexcept
     }
 
     impl_->initialized = false;
+    invalidateHostedCompositionContent();
     const bool generationLost = impl_->currentGeneration
         && isDeviceLost(impl_->currentGeneration->deviceResources);
     impl_->retireGeneration(!generationLost);

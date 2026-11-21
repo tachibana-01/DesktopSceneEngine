@@ -16,6 +16,8 @@ enum class AudioBlockStartMode
     ConfigurePaused
 };
 
+enum class CheckedMuteStatus { Applied, Unavailable, DeviceFailure, ContractFailure };
+
 class AudioOutput final : public DesktopSceneEngine::Audio::AudioBlockSink
 {
 public:
@@ -29,6 +31,14 @@ public:
     AudioOutput& operator=(AudioOutput&&) = delete;
 
     [[nodiscard]] bool initialize() noexcept;
+    // Dedicated A owner only. Event readiness is independent of GUI messages.
+    [[nodiscard]] bool initializeEventDriven() noexcept;
+    [[nodiscard]] void* readinessHandle() const noexcept;
+    [[nodiscard]] std::size_t bufferFrameCount() const noexcept;
+    // Zero means the endpoint did not report a usable period.
+    [[nodiscard]] std::size_t devicePeriodFrames() const noexcept;
+    [[nodiscard]] bool isInitialized() const noexcept;
+    [[nodiscard]] CheckedMuteStatus setMutedChecked(bool muted) noexcept;
 
     [[nodiscard]] DesktopSceneEngine::Audio::AudioBlockStatus beginBlockMode(
         AudioBlockStartMode startMode
@@ -81,6 +91,10 @@ public:
 
     DesktopSceneEngine::Audio::AudioBlockStatus resume() noexcept;
     void stop() noexcept;
+    // Unlike the legacy void wrapper, reports whether BOTH native Stop and
+    // Reset succeeded. Failed reset leaves stream/borrow facts intact until
+    // the owner explicitly closes the untrusted client.
+    [[nodiscard]] DesktopSceneEngine::Audio::AudioBlockStatus stopAndResetChecked() noexcept;
     void shutdown() noexcept;
 
     void setVolume(float volume) noexcept;
@@ -123,6 +137,9 @@ private:
     ) noexcept;
 
     std::unique_ptr<Impl> impl_{};
+    [[nodiscard]] bool initializeInternal(bool eventDriven) noexcept;
+    [[nodiscard]] DesktopSceneEngine::Audio::AudioBlockStatus stopAfterDeviceFailure() noexcept;
+    void clearSubmissionState() noexcept;
 };
 
 }

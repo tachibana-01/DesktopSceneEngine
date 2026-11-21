@@ -1,0 +1,20 @@
+/* Model C exposes a viewing region above the Session matte and Host clip.
+   Desired React fit never cuts a second, exact aperture around retained media. */
+html[data-session-composition="model-c-production"],
+html[data-session-composition="model-c-production"] :is(body,#root,.production-session,.preview-workspace,.preview-viewport) {
+  background: transparent;
+}
+html[data-session-composition="model-c-production"] .production-session :is(.title-bar,.preview-context,.preview-caption,.preview-identify-result) {
+  background: var(--background);
+}
+html[data-session-composition="model-c-production"] .preview-stage.preview-stage-e {
+  padding: 0;
+  border: solid var(--background);
+  border-width: 0 var(--preview-stage-side-padding) var(--preview-stage-bottom-padding);
+  background: linear-gradient(var(--background),var(--background)) bottom / 100% calc(var(--preview-caption-height) + var(--preview-caption-gap) + var(--preview-identify-height)) no-repeat;
+}
+/* Only current native lifecycle truth clears the ordinary surface backing.
+   Pending or rejected desired requests never mask a valid retained clip. */
+html[data-session-composition="model-c-production"] .preview-placeholder.preview-native-surface[data-native-preview-state="visible"][data-model-c-lifecycle-valid="true"] {
+  background: transparent;
+}

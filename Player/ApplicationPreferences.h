@@ -6,6 +6,7 @@
 #include <QTranslator>
 #include <QSettings>
 
+#include <memory>
 #include <optional>
 
 class QSettings;
@@ -56,9 +57,22 @@ private:
 class ApplicationPreferencesStore final
 {
 public:
+    struct Location
+    {
+        QSettings::Format format;
+        QSettings::Scope scope;
+        QString fileName;
+        QString organization;
+        QString application;
+        bool fallbacksEnabled;
+        bool atomicSyncRequired;
+
+        [[nodiscard]] std::unique_ptr<QSettings> open() const;
+    };
 
     explicit ApplicationPreferencesStore(QSettings& settings) noexcept;
 
+    [[nodiscard]] Location location() const;
     [[nodiscard]] ApplicationPreferences load() const;
 
     QSettings::Status saveLanguage(UiLanguage language) const;

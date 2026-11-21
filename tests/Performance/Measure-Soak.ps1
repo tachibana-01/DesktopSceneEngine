@@ -9,7 +9,7 @@ Default is characterization, NOT authorization to run a canonical baseline.
 param(
     [string]$Repository = (Join-Path $PSScriptRoot '../..'),
     [string]$BuildDirectory = 'build',
-    [string]$Media = 'TestResources/Images/d51e6c28d76e72fc409a72159f582ada61a2add0.jpg',
+    [string]$Media,
     [ValidateRange(60, 86400)][double]$WarmupSeconds = 60,
     [ValidateRange(60, 86400)][double]$WarmupTimeoutSeconds = 180,
     [ValidateRange(1, 86400)][double]$MeasureSeconds = 120,
@@ -119,6 +119,9 @@ function Test-MeasurementSelectors {
 }
 if ($SelfTest) { Test-MeasurementSelectors; return }
 
+if ([string]::IsNullOrWhiteSpace($Media)) {
+    throw 'Canonical media fixture unavailable. Supply the owned canonical JPEG with -Media; see tests/README.md.'
+}
 $frozenHash = '928AC1EA4B3F8329160AFB9AA0BE1F916C01A4A4CC3A6D6A03670AC3837DBD3A'
 $repositoryPath = (Resolve-Path -LiteralPath $Repository).Path
 function Resolve-UnderRepository([string]$Path) {

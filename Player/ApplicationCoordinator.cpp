@@ -1,6 +1,6 @@
 #include "ApplicationCoordinator.h"
 #include "SessionPresentation.h"
-#include "LauncherWindow.h"
+#include "LauncherRolePresentation.h"
 #include "DisplayPresentation.h"
 
 #include <QApplication>
@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <utility>
 
 namespace DesktopSceneEngine::Player
 {
@@ -137,6 +138,47 @@ bool activationOwnedBy(const InstanceSlot& slot, DWORD pid)
     CloseHandle(pipe);
     return same;
 }
+
+std::wstring quoteWindowsArgument(const QString& argument)
+{
+    // CommandLineToArgvW/CRT quoting: backslashes are doubled only before a
+    // quote or the closing delimiter. Always quoting also preserves empty args.
+    std::wstring result(1, L'"');
+    std::size_t slashes = 0;
+    for (const auto character : argument.toStdWString())
+    {
+        if (character == L'\\') { ++slashes; continue; }
+        if (character == L'"') result.append(slashes * 2 + 1, L'\\');
+        else result.append(slashes, L'\\');
+        slashes = 0;
+        result += character;
+    }
+    result.append(slashes * 2, L'\\');
+    result += L'"';
+    return result;
+}
+
+void* launchObservedSessionProcess(const DisplaySessionLaunchRequest& request)
+{
+    if (request.program.isEmpty() || request.program.contains(QChar::Null)) return nullptr;
+    auto command = quoteWindowsArgument(request.program);
+    for (const auto& argument : request.arguments)
+    {
+        if (argument.contains(QChar::Null)) return nullptr;
+        command += L' ';
+        command += quoteWindowsArgument(argument);
+    }
+    if (command.size() >= 32767) return nullptr;
+    const auto program = request.program.toStdWString();
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, FALSE,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &startup, &process)) return nullptr;
+    CloseHandle(process.hThread);
+    // Merely an observation. No job ownership, destructor kill, or supervision.
+    return process.hProcess;
+}
 }
 
 QString coordinatorEndpointName(const InstanceSlot& launcherSlot)
@@ -189,10 +231,19 @@ struct ApplicationCoordinator::SessionRecord
     QPointer<QTimer> closeDeadline;
 };
 
+struct ApplicationCoordinator::CreateRecord
+{
+    LauncherCreateOperation operation;
+    ProcessHandle process;
+    std::unique_ptr<QWinEventNotifier> death;
+    std::unique_ptr<QTimer> observation;
+};
+
 ApplicationCoordinator::ApplicationCoordinator(const InstanceSlot& launcherSlot,
     InstanceActivationEndpoint& activation, bool bootstrap, std::function<void()> drained)
     : launcherSlot_(launcherSlot), activation_(activation), drained_(std::move(drained))
 {
+    launchSessionProcess_ = launchObservedSessionProcess;
     server_.setSocketOptions(QLocalServer::UserAccessOption);
     server_.setMaxPendingConnections(MaximumActivationClients);
     server_.setListenBacklogSize(MaximumActivationClients);
@@ -203,7 +254,7 @@ ApplicationCoordinator::ApplicationCoordinator(const InstanceSlot& launcherSlot,
     if (bootstrap) bootstrapDeadline_.start(ActivationDeadlineMs);
     drain_.setSingleShot(true);
     connect(&drain_, &QTimer::timeout, this, [this] {
-        if (launcher_ || !sessions_.empty() || bootstrapDeadline_.isActive()) return;
+        if (launcher_ || !sessions_.empty() || hasPendingCreate() || bootstrapDeadline_.isActive()) return;
         closing_ = true;
         server_.close();
         activation_.beginShutdown();
@@ -240,7 +291,8 @@ ApplicationCoordinator::ApplicationCoordinator(const InstanceSlot& launcherSlot,
 ApplicationCoordinator::~ApplicationCoordinator()
 {
     closing_ = true;
-    if (auto* launcher = dynamic_cast<LauncherWindow*>(launcher_.get())) launcher->trayPresentation().beginTeardown();
+    sessionProjectionChanged_ = {};
+    if (auto* launcher = dynamic_cast<LauncherRolePresentation*>(launcher_.get())) launcher->trayPresentation().beginTeardown();
     showAllDeadline_.stop(); trayClickGuard_.stop();
     trayHealth_.stop();
     tray_.hide();
@@ -259,6 +311,235 @@ bool ApplicationCoordinator::listen()
 void ApplicationCoordinator::setLauncherFactory(std::function<QWidget*()> factory)
 {
     launcherFactory_ = std::move(factory);
+}
+
+std::vector<LauncherRegisteredSession> ApplicationCoordinator::verifiedRegisteredSessions() const
+{
+    std::vector<LauncherRegisteredSession> result;
+    for (const auto& record : sessions_)
+    {
+        // Only a signalled pinned process lifetime proves death. WAIT_FAILED
+        // must not make a registered incarnation disappear from the projection.
+        if (WaitForSingleObject(record->process.value, 0) == WAIT_OBJECT_0) continue;
+        const auto id = DisplayId::parseCanonicalRepresentation(record->identity.toStdString());
+        // Preserve an impossible identity as invalid input to the strict shared
+        // serializer, which surfaces projection failure rather than dropping it.
+        result.push_back({id.value_or(DisplayId{}), record->incarnation,
+            record->control && record->control->state() == QLocalSocket::ConnectedState,
+            record->closeOperation});
+    }
+    return result;
+}
+
+LauncherSessionsSnapshot ApplicationCoordinator::launcherSessionSnapshot()
+{
+    refreshSessionProjection();
+    return {epoch_, sessionProjectionRevision_, sessionProjection_, createProjection_};
+}
+
+bool ApplicationCoordinator::hasPendingCreate() const
+{
+    return std::any_of(createOperations_.begin(), createOperations_.end(), [](const auto& record) {
+        return record->operation.state == LauncherCreateState::Pending;
+    });
+}
+
+std::vector<LauncherCreateOperation> ApplicationCoordinator::createOperationProjection() const
+{
+    std::vector<LauncherCreateOperation> operations;
+    operations.reserve(createOperations_.size());
+    for (const auto& record : createOperations_) operations.push_back(record->operation);
+    return operations;
+}
+
+void ApplicationCoordinator::finishCreateOperation(CreateRecord& record, LauncherCreateState state,
+    std::optional<QUuid> incarnation)
+{
+    if (record.operation.state != LauncherCreateState::Pending) return;
+    record.operation.state = state;
+    record.operation.incarnation = incarnation;
+    if (record.observation) record.observation->stop();
+    if (record.death) record.death->setEnabled(false);
+    if (record.process.value) { CloseHandle(record.process.value); record.process.value = nullptr; }
+    // Objects remain disabled until receipt eviction, so no sender is deleted
+    // inside a notifier/timer callback. Draining is reconsidered off that stack.
+    QMetaObject::invokeMethod(this, [this] { scheduleDrain(); }, Qt::QueuedConnection);
+}
+
+void ApplicationCoordinator::reconcileCreateOperations(const std::vector<LauncherRegisteredSession>& registered)
+{
+    for (const auto& record : createOperations_)
+    {
+        if (record->operation.state != LauncherCreateState::Pending) continue;
+        const auto session = std::find_if(registered.begin(), registered.end(), [&](const auto& row) {
+            return row.boundDisplayId == record->operation.displayId;
+        });
+        if (session != registered.end())
+        {
+            // Display-scoped correlation: the actual authenticated admission
+            // winner may be external. Never claim that our child won admission.
+            finishCreateOperation(*record, LauncherCreateState::Registered, session->incarnation);
+            continue;
+        }
+        const auto observed = record->process.value ? WaitForSingleObject(record->process.value, 0) : WAIT_FAILED;
+        if (observed == WAIT_OBJECT_0)
+            finishCreateOperation(*record, LauncherCreateState::ExitedBeforeRegistration);
+        else if (observed != WAIT_TIMEOUT)
+            finishCreateOperation(*record, LauncherCreateState::Uncertain);
+    }
+}
+
+LauncherCreateResult ApplicationCoordinator::createSession(const QUuid& coordinatorEpoch, const DisplayId& displayId)
+{
+    const auto result = [&](LauncherCreateStatus status, std::optional<QUuid> operation = std::nullopt,
+                            std::optional<QUuid> incarnation = std::nullopt) {
+        return LauncherCreateResult{epoch_, displayId, status, operation, incarnation};
+    };
+    if (coordinatorEpoch.isNull() || coordinatorEpoch != epoch_) return result(LauncherCreateStatus::StaleCoordinator);
+    if (closing_ || !server_.isListening()) return result(LauncherCreateStatus::Unavailable);
+    const auto canonical = displayId.canonicalRepresentation();
+    if (!canonical || !displayId.isPersistentOwnerCapable()
+        || DisplayId::parseCanonicalRepresentation(*canonical) != displayId)
+        return result(LauncherCreateStatus::NotOwnerCapable);
+
+    refreshSessionProjection();
+    const auto registered = std::find_if(sessionProjection_.begin(), sessionProjection_.end(), [&](const auto& row) {
+        return row.boundDisplayId == displayId;
+    });
+    if (registered != sessionProjection_.end())
+        return result(LauncherCreateStatus::AlreadyRegistered, std::nullopt, registered->incarnation);
+    for (const auto& record : createOperations_)
+        if (record->operation.displayId == displayId && record->operation.state == LauncherCreateState::Pending)
+            return result(LauncherCreateStatus::AlreadyPending, record->operation.operationId);
+
+    // Registry absence is not admission freedom. Re-resolve the exact current
+    // target, then let the unchanged child mutex/ACTIVATE path decide occupancy.
+    const auto enumeration = enumerateDisplays_();
+    if (enumeration.status != Platform::DisplayEnumerationStatus::Success)
+        return result(LauncherCreateStatus::CatalogUnavailable);
+    const auto resolved = enumeration.snapshot.resolve(displayId);
+    if (!resolved) return result(LauncherCreateStatus::Unresolved);
+    if (!resolved->id.isPersistentOwnerCapable()) return result(LauncherCreateStatus::NotOwnerCapable);
+
+    // Keep at most one latest receipt per Display and at most 64 overall.
+    // Capacity eviction only removes terminal receipts, never pending work.
+    std::erase_if(createOperations_, [&](const auto& record) { return record->operation.displayId == displayId; });
+    if (createOperations_.size() >= MaximumCoordinatorSessions)
+    {
+        const auto terminal = std::find_if(createOperations_.begin(), createOperations_.end(), [](const auto& record) {
+            return record->operation.state != LauncherCreateState::Pending;
+        });
+        if (terminal == createOperations_.end()) return result(LauncherCreateStatus::CapacityExceeded);
+        createOperations_.erase(terminal);
+    }
+    auto record = std::make_unique<CreateRecord>();
+    record->operation = {displayId, QUuid::createUuid(), LauncherCreateState::Pending, std::nullopt};
+    const auto operationId = record->operation.operationId;
+    const auto request = makeDisplaySessionLaunchRequest(QCoreApplication::applicationFilePath(), displayId);
+    if (request && launchSessionProcess_) record->process.value = launchSessionProcess_(*request);
+    if (!record->process.value)
+    {
+        record->operation.state = LauncherCreateState::LaunchFailed;
+        createOperations_.push_back(std::move(record));
+        refreshSessionProjection();
+        scheduleDrain();
+        return result(LauncherCreateStatus::LaunchFailed, operationId);
+    }
+    record->death = std::make_unique<QWinEventNotifier>(record->process.value);
+    auto* notifier = record->death.get();
+    connect(notifier, &QWinEventNotifier::activated, this, [this, operationId, notifier] {
+        notifier->setEnabled(false);
+        QMetaObject::invokeMethod(this, [this, operationId] {
+            // A queued observation of an old receipt cannot finish a later
+            // operation for the same Display after receipt eviction/retry.
+            const auto current = std::find_if(createOperations_.begin(), createOperations_.end(), [&](const auto& row) {
+                return row->operation.operationId == operationId && row->operation.state == LauncherCreateState::Pending;
+            });
+            if (current == createOperations_.end()) return;
+            refreshSessionProjection();
+            scheduleDrain();
+        }, Qt::QueuedConnection);
+    });
+    record->observation = std::make_unique<QTimer>();
+    record->observation->setSingleShot(true);
+    record->observation->setObjectName(QStringLiteral("createObservationDeadline"));
+    connect(record->observation.get(), &QTimer::timeout, this, [this, operationId] {
+        refreshSessionProjection(); // Prefer an already verified Join/death.
+        const auto current = std::find_if(createOperations_.begin(), createOperations_.end(), [&](const auto& row) {
+            return row->operation.operationId == operationId && row->operation.state == LauncherCreateState::Pending;
+        });
+        if (current == createOperations_.end()) return;
+        // A bound on our observation, not startup readiness, admission, failure,
+        // or process death. The independently owned process remains untouched.
+        finishCreateOperation(**current, LauncherCreateState::Uncertain);
+        refreshSessionProjection();
+        scheduleDrain();
+    });
+    record->observation->start(createObservationMs_);
+    createOperations_.push_back(std::move(record));
+    drain_.stop();
+    refreshSessionProjection();
+    return result(LauncherCreateStatus::Accepted, operationId);
+}
+
+LauncherOpenResult ApplicationCoordinator::openSession(const QUuid& coordinatorEpoch, const QUuid& incarnation)
+{
+    const auto result = [&](LauncherOpenStatus status) { return LauncherOpenResult{epoch_, incarnation, status}; };
+    if (coordinatorEpoch.isNull() || coordinatorEpoch != epoch_) return result(LauncherOpenStatus::StaleCoordinator);
+    if (closing_ || !server_.isListening()) return result(LauncherOpenStatus::Unavailable);
+    const auto found = std::find_if(sessions_.begin(), sessions_.end(), [&](const auto& row) { return row->incarnation == incarnation; });
+    if (incarnation.isNull() || found == sessions_.end()) return result(LauncherOpenStatus::RoleGone);
+    const auto& record = **found;
+    const auto alive = WaitForSingleObject(record.process.value, 0);
+    if (alive == WAIT_OBJECT_0) return result(LauncherOpenStatus::RoleGone);
+    if (alive != WAIT_TIMEOUT) return result(LauncherOpenStatus::ApiFailure);
+    if (record.closeOperation && (record.closeOperation->result == RoleCloseResult::Received
+        || record.closeOperation->result == RoleCloseResult::Pending
+        || record.closeOperation->result == RoleCloseResult::CloseAccepted)) return result(LauncherOpenStatus::Closing);
+    if (!record.control || record.control->state() != QLocalSocket::ConnectedState)
+        return result(LauncherOpenStatus::ControlUnavailable);
+    if (!recoveryAvailable(record)) return result(LauncherOpenStatus::Unavailable);
+    // One call to the established route; this reports dispatch, not completion
+    // or a foreground guarantee. Stale identity never routes to a replacement.
+    return result(dispatchSessionShow(incarnation, ActivationRequest::Request)
+        ? LauncherOpenStatus::ActivationRequested : LauncherOpenStatus::ApiFailure);
+}
+
+void ApplicationCoordinator::setSessionProjectionChanged(
+    std::function<void(const LauncherSessionsSnapshot&)> callback)
+{
+    sessionProjectionChanged_ = std::move(callback);
+    publishedSessionRevision_.reset();
+    refreshSessionProjection();
+}
+
+void ApplicationCoordinator::refreshSessionProjection()
+{
+    if (closing_) return;
+    auto current = verifiedRegisteredSessions();
+    reconcileCreateOperations(current);
+    auto operations = createOperationProjection();
+    if (current != sessionProjection_ || operations != createProjection_)
+    {
+        sessionProjection_ = std::move(current);
+        createProjection_ = std::move(operations);
+        ++sessionProjectionRevision_;
+    }
+    if (!sessionProjectionChanged_ || sessionProjectionQueued_
+        || publishedSessionRevision_ == sessionProjectionRevision_) return;
+    sessionProjectionQueued_ = true;
+    // Mutations converge through updateTray, but delivery leaves the mutation
+    // stack. Repeated tray/renewal observations with equal facts emit nothing.
+    QMetaObject::invokeMethod(this, [this] {
+        if (closing_ || !sessionProjectionChanged_) { sessionProjectionQueued_ = false; return; }
+        refreshSessionProjection(); // Fresh complete facts, coalescing intervening changes.
+        const LauncherSessionsSnapshot snapshot{epoch_, sessionProjectionRevision_, sessionProjection_, createProjection_};
+        sessionProjectionQueued_ = false;
+        if (publishedSessionRevision_ == snapshot.revision) return;
+        publishedSessionRevision_ = snapshot.revision;
+        const auto changed = sessionProjectionChanged_;
+        changed(snapshot);
+    }, Qt::QueuedConnection);
 }
 
 void ApplicationCoordinator::updateActivationProvider()
@@ -322,14 +603,14 @@ QWidget* ApplicationCoordinator::showLauncher()
             drain_.stop();
             launcher_->show();
             updateTray();
-            if (auto* launcher = dynamic_cast<LauncherWindow*>(launcher_.get()))
+            if (auto* launcher = dynamic_cast<LauncherRolePresentation*>(launcher_.get()))
             {
                 const auto incarnation = launcherIncarnation_;
                 launcher->trayPresentation().bindRecovery([this, incarnation] {
                     return incarnation == launcherIncarnation_ && launcherRecoveryAvailable();
                 }, [this, incarnation] {
                     if (incarnation == launcherIncarnation_ && launcherRecoveryAvailable())
-                        if (auto* current = dynamic_cast<LauncherWindow*>(launcher_.get())) (void)current->trayPresentation().applyHidePermit();
+                        if (auto* current = dynamic_cast<LauncherRolePresentation*>(launcher_.get())) (void)current->trayPresentation().applyHidePermit();
                 });
                 launcher->trayPresentation().bindCloseReport([this, incarnation, launcher] {
                     if (incarnation == launcherIncarnation_ && launcherClose_)
@@ -342,7 +623,7 @@ QWidget* ApplicationCoordinator::showLauncher()
             }
         }
     }
-    if (auto* launcher = dynamic_cast<LauncherWindow*>(launcher_.get())) (void)launcher->trayPresentation().restore();
+    if (auto* launcher = dynamic_cast<LauncherRolePresentation*>(launcher_.get())) (void)launcher->trayPresentation().restore();
     return launcher_.get();
 }
 
@@ -366,7 +647,7 @@ void ApplicationCoordinator::retireLauncher(QWidget& window)
 void ApplicationCoordinator::scheduleDrain()
 {
     updateTray();
-    if (!closing_ && !launcher_ && sessions_.empty() && !bootstrapDeadline_.isActive() && !drain_.isActive())
+    if (!closing_ && !launcher_ && sessions_.empty() && !hasPendingCreate() && !bootstrapDeadline_.isActive() && !drain_.isActive())
         drain_.start(100); // Short bounded event/result drainage, not persistent zero-role idle.
 }
 
@@ -481,10 +762,11 @@ bool ApplicationCoordinator::recoveryAvailable(const SessionRecord& record) cons
 
 void ApplicationCoordinator::updateTray()
 {
+    refreshSessionProjection();
     const bool live = !closing_ && (launcher_ || !sessions_.empty());
     if (live && !tray_.icon().isNull() && QSystemTrayIcon::isSystemTrayAvailable()) tray_.show();
     else tray_.hide();
-    if (auto* launcher = dynamic_cast<LauncherWindow*>(launcher_.get())) launcher->trayPresentation().refreshEligibility();
+    if (auto* launcher = dynamic_cast<LauncherRolePresentation*>(launcher_.get())) launcher->trayPresentation().refreshEligibility();
     refreshRoleMenu();
     queueCloseAllProgress();
 }
@@ -553,7 +835,7 @@ bool ApplicationCoordinator::dispatchRoleClose(const QUuid& incarnation)
     if (closing_) return false;
     if (launcher_ && incarnation == launcherIncarnation_)
     {
-        auto* launcher = dynamic_cast<LauncherWindow*>(launcher_.get());
+        auto* launcher = dynamic_cast<LauncherRolePresentation*>(launcher_.get());
         if (!launcher || launcherClosing_ || (launcherClose_ && (!terminalCloseResult(launcherClose_->result)
             || launcherClose_->result == RoleCloseResult::CloseAccepted))) return false;
         const RoleCloseKey key{epoch_, ++launcherCloseSequence_};
@@ -596,6 +878,7 @@ void ApplicationCoordinator::reconcileRoleClose(const QUuid& incarnation, std::o
                 || record->closeOperation->result == RoleCloseResult::RoleGone)) return;
             record->closeOperation = RoleCloseOperation{*key, RoleCloseResult::Uncertain};
             record->closeSequence = (std::max)(record->closeSequence, key->request);
+            refreshSessionProjection();
         }
         if (!record->closeOperation || !record->control || record->control->state() != QLocalSocket::ConnectedState) return;
         record->closeQueryOutstanding = true;
@@ -696,7 +979,7 @@ void ApplicationCoordinator::refreshRoleMenu()
         bool closeAvailable = false;
         bool available = role.launcher ? launcherRecoveryAvailable() : false;
         if (role.launcher)
-            if (auto* launcher = dynamic_cast<LauncherWindow*>(launcher_.get()))
+            if (auto* launcher = dynamic_cast<LauncherRolePresentation*>(launcher_.get()))
                 closeAvailable = available && launcher->trayPresentation().canClose();
         if (!role.launcher)
             for (const auto& record : sessions_) if (record->incarnation == role.incarnation)
@@ -815,7 +1098,7 @@ void ApplicationCoordinator::showRole(const QUuid& incarnation, ActivationReques
     if (closing_) return;
     if (launcher_ && !launcherClosing_ && incarnation == launcherIncarnation_)
     {
-        if (auto* launcher = dynamic_cast<LauncherWindow*>(launcher_.get()))
+        if (auto* launcher = dynamic_cast<LauncherRolePresentation*>(launcher_.get()))
             if (!launcher->trayPresentation().restore()) return;
         surfaceAdmittedRole(*launcher_, activation);
         std::cout << "[Tray] Launcher Show activation=" << (activation == ActivationRequest::Request ? "request" : "none")
@@ -1072,7 +1355,8 @@ void SessionCoordinatorJoin::enableControl(SessionPresentation& presentation)
     if (started_) return;
     presentation_ = &presentation;
     socket_.setReadBufferSize(MaximumVisibilityBufferedBytes + 1);
-    presentation.bindRecovery([this] { return qualified(); }, [this] { requestHidePermit(); });
+    presentation.bindPermitRecovery([this] { return qualified(); },
+        [this](SessionPresentation::HideValidity stillAllowed) { requestHidePermit(std::move(stillAllowed)); });
     presentation.bindCloseReport([this] {
         publishCloseCapability(); publishDesktopDeployment();
         if (presentation_ && presentation_->closeOperation()
@@ -1086,12 +1370,22 @@ void SessionCoordinatorJoin::enableControl(SessionPresentation& presentation)
     });
 }
 
-void SessionCoordinatorJoin::enableDesktopDeployment(std::function<DesktopDeploymentProjection()> projection,
-    std::function<DesktopDeploymentResult(DesktopDeploymentIntent)> execute)
+void SessionCoordinatorJoin::enableDesktopDeploymentAsync(std::function<DesktopDeploymentProjection()> projection,
+    std::function<void(DesktopDeploymentIntent, DesktopDeploymentCompletion)> execute)
 {
     if (started_) return;
     deploymentProjection_ = std::move(projection);
     deploymentExecute_ = std::move(execute);
+}
+
+void SessionCoordinatorJoin::completeDesktopDeployment(const QUuid& epoch, quint64 request, DesktopDeploymentResult result)
+{
+    if (epoch != coordinatorEpoch_ || request != lastDeploymentRequest_
+        || socket_.state() != QLocalSocket::ConnectedState) return;
+    publishDesktopDeployment();
+    std::cout << "[Tray] Deployment result=" << static_cast<int>(result) << " request=" << request << std::endl;
+    (void)writeVisibility(socket_, visibilityFrame(VisibilityMessage::DeploymentResult, epoch, incarnation_, request,
+        static_cast<quint8>(result)));
 }
 
 void SessionCoordinatorJoin::publishDesktopDeployment()
@@ -1118,6 +1412,7 @@ void SessionCoordinatorJoin::beginRoleTeardown()
 {
     roleEnding_ = true;
     recoveryQualified_ = false;
+    hideStillAllowed_ = {};
     retry_.stop(); deadline_.stop(); renewal_.stop(); expiry_.stop();
     // Keep only result/query drainage alive until the ordinary closeEvent has finished Engine/BGM teardown.
 }
@@ -1146,6 +1441,7 @@ void SessionCoordinatorJoin::stop()
     finished_ = true;
     retry_.stop(); deadline_.stop(); renewal_.stop(); expiry_.stop();
     recoveryQualified_ = false;
+    hideStillAllowed_ = {};
     if (presentation_) { presentation_->bindCloseReport({}); presentation_->bindRecovery({}, {}); }
     socket_.abort();
 }
@@ -1161,7 +1457,7 @@ bool SessionCoordinatorJoin::qualified() const
 void SessionCoordinatorJoin::revokeQualification()
 {
     recoveryQualified_ = false;
-    renewal_.stop(); expiry_.stop(); hideRequest_ = 0;
+    renewal_.stop(); expiry_.stop(); hideRequest_ = 0; hideStillAllowed_ = {};
     if (presentation_) presentation_->refreshEligibility();
 }
 
@@ -1200,12 +1496,13 @@ void SessionCoordinatorJoin::renewQualification()
     if (presentation_) presentation_->refreshEligibility();
 }
 
-void SessionCoordinatorJoin::requestHidePermit()
+void SessionCoordinatorJoin::requestHidePermit(std::function<bool()> stillAllowed)
 {
-    if (!qualified() || hideRequest_) return;
+    if (!qualified() || hideRequest_ || (stillAllowed && !stillAllowed())) return;
     hideRequest_ = ++sequence_;
     hideSentAt_ = requestClock_.elapsed();
     hideShowGeneration_ = presentation_->showGeneration();
+    hideStillAllowed_ = std::move(stillAllowed);
     (void)writeVisibility(socket_, visibilityFrame(VisibilityMessage::HidePermit, coordinatorEpoch_, incarnation_, hideRequest_, true));
 }
 
@@ -1248,8 +1545,10 @@ void SessionCoordinatorJoin::consumeControl()
         else if (kind == VisibilityMessage::Permit && request && request == hideRequest_)
         {
             hideRequest_ = 0;
+            const auto stillAllowed = std::exchange(hideStillAllowed_, {});
             if (frame.back() && requestClock_.elapsed() - hideSentAt_ < SessionQualificationLifetimeMs
-                && qualified() && presentation_ && hideShowGeneration_ == presentation_->showGeneration())
+                && qualified() && presentation_ && hideShowGeneration_ == presentation_->showGeneration()
+                && (!stillAllowed || stillAllowed()))
                 (void)presentation_->applyHidePermit();
         }
         else if (kind == VisibilityMessage::Show && request && request > lastShowRequest_)
@@ -1288,14 +1587,23 @@ void SessionCoordinatorJoin::consumeControl()
         {
             lastDeploymentRequest_ = request;
             if (!writeVisibility(socket_, visibilityFrame(VisibilityMessage::DeploymentReceived, epoch, incarnation_, request, 1))) return;
-            const auto result = !roleEnding_ && presentation_ && !presentation_->closePending()
-                && !presentation_->ending() && deploymentExecute_ ? deploymentExecute_(kind == VisibilityMessage::Deploy
-                ? DesktopDeploymentIntent::Deploy : DesktopDeploymentIntent::Undeploy) : DesktopDeploymentResult::Rejected;
-            publishDesktopDeployment();
-            std::cout << "[Tray] Deployment result=" << static_cast<int>(result) << " request=" << request << std::endl;
-            if (epoch != coordinatorEpoch_ || socket_.state() != QLocalSocket::ConnectedState) return;
-            if (!writeVisibility(socket_, visibilityFrame(VisibilityMessage::DeploymentResult, epoch, incarnation_, request,
-                static_cast<quint8>(result)))) return;
+            if (roleEnding_ || !presentation_ || presentation_->closePending() || presentation_->ending() || !deploymentExecute_)
+                completeDesktopDeployment(epoch, request, DesktopDeploymentResult::Rejected);
+            else
+            {
+                const auto execute = deploymentExecute_;
+                const auto settled = std::make_shared<bool>(false);
+                const auto complete = [owner = QPointer<SessionCoordinatorJoin>{this}, epoch, request, settled](
+                    DesktopDeploymentResult outcome) {
+                    if (owner && !std::exchange(*settled, true)) owner->completeDesktopDeployment(epoch, request, outcome);
+                };
+                try
+                {
+                    execute(kind == VisibilityMessage::Deploy ? DesktopDeploymentIntent::Deploy
+                        : DesktopDeploymentIntent::Undeploy, complete);
+                }
+                catch (...) { complete(DesktopDeploymentResult::Failure); }
+            }
         }
         else { socket_.abort(); return; }
         if (presentation_ && socket_.state() == QLocalSocket::ConnectedState)

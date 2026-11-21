@@ -66,6 +66,14 @@ bool waitUntil(const std::function<bool()>& predicate, int timeout = 10000)
     return false;
 }
 
+bool primaryRoleCaption(const wchar_t* caption)
+{
+    // A WebView host also creates a hidden Qt helper whose default caption is
+    // DesktopSceneEngine_QtPlayer. Count actual Launcher/Session roles, including
+    // deliberately hidden roles; visibility is not a role/lifetime predicate.
+    return QString::fromWCharArray(caption).startsWith(QStringLiteral("DesktopSceneEngine — "));
+}
+
 int windowsForPid(DWORD pid)
 {
     struct Query { DWORD pid; int count = 0; } query{pid};
@@ -75,7 +83,7 @@ int windowsForPid(DWORD pid)
         GetWindowThreadProcessId(hwnd, &pid);
         wchar_t caption[256]{};
         GetWindowTextW(hwnd, caption, 256);
-        if (pid == q.pid && wcsstr(caption, L"DesktopSceneEngine") && GetWindow(hwnd, GW_OWNER) == nullptr)
+        if (pid == q.pid && primaryRoleCaption(caption) && GetWindow(hwnd, GW_OWNER) == nullptr)
             ++q.count;
         return TRUE;
     }, reinterpret_cast<LPARAM>(&query));
@@ -93,7 +101,7 @@ HWND primaryWindowForPid(DWORD pid)
         GetWindowThreadProcessId(hwnd, &pid);
         wchar_t caption[256]{};
         GetWindowTextW(hwnd, caption, 256);
-        if (pid == q.pid && wcsstr(caption, L"DesktopSceneEngine") && GetWindow(hwnd, GW_OWNER) == nullptr)
+        if (pid == q.pid && primaryRoleCaption(caption) && GetWindow(hwnd, GW_OWNER) == nullptr)
             q.window = hwnd;
         return TRUE;
     }, reinterpret_cast<LPARAM>(&query));
@@ -233,23 +241,49 @@ bool invokeSessionHide(HWND hwnd)
 {
     using Microsoft::WRL::ComPtr;
     ComPtr<IUIAutomation> automation;
-    ComPtr<IUIAutomationElement> root, button;
-    ComPtr<IUIAutomationCondition> english, chinese, either;
-    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation)))
-        || FAILED(automation->ElementFromHandle(hwnd, &root))) return false;
+    ComPtr<IUIAutomationCondition> english, chinese, either, buttonType, hideButton;
+    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation))))
+        return false;
     auto nameCondition = [&](const wchar_t* name, IUIAutomationCondition** result) {
         VARIANT value; VariantInit(&value); value.vt = VT_BSTR; value.bstrVal = SysAllocString(name);
         const auto hr = automation->CreatePropertyCondition(UIA_NamePropertyId, value, result);
         VariantClear(&value); return SUCCEEDED(hr);
     };
-    if (!nameCondition(L"Hide to System Tray", &english) || !nameCondition(L"隐藏到系统托盘", &chinese)
+    VARIANT controlType;
+    VariantInit(&controlType);
+    controlType.vt = VT_I4;
+    controlType.lVal = UIA_ButtonControlTypeId;
+    if (!nameCondition(L"Hide to tray", &english) || !nameCondition(L"隐藏到系统托盘", &chinese)
         || FAILED(automation->CreateOrCondition(english.Get(), chinese.Get(), &either))
-        || FAILED(root->FindFirst(TreeScope_Subtree, either.Get(), &button)) || !button) return false;
-    BOOL enabled = FALSE;
-    if (FAILED(button->get_CurrentIsEnabled(&enabled)) || !enabled) return false;
-    ComPtr<IUIAutomationInvokePattern> invoke;
-    return SUCCEEDED(button->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke)))
-        && SUCCEEDED(invoke->Invoke());
+        || FAILED(automation->CreatePropertyCondition(UIA_ControlTypePropertyId, controlType, &buttonType))
+        || FAILED(automation->CreateAndCondition(either.Get(), buttonType.Get(), &hideButton))) return false;
+
+    // The composition WebView exposes its own provider from the input HWND.
+    // The native top-level's UIA subtree need not include that document.
+    struct Query
+    {
+        IUIAutomation* automation;
+        IUIAutomationCondition* hideButton;
+        bool invoked = false;
+        bool invoke(HWND window) const
+        {
+            ComPtr<IUIAutomationElement> root, button;
+            if (FAILED(automation->ElementFromHandle(window, &root)) || !root
+                || FAILED(root->FindFirst(TreeScope_Subtree, hideButton, &button)) || !button) return false;
+            BOOL enabled = FALSE;
+            if (FAILED(button->get_CurrentIsEnabled(&enabled)) || !enabled) return false;
+            ComPtr<IUIAutomationInvokePattern> action;
+            return SUCCEEDED(button->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&action)))
+                && SUCCEEDED(action->Invoke());
+        }
+    } query{automation.Get(), hideButton.Get()};
+    if (query.invoke(hwnd)) return true;
+    EnumChildWindows(hwnd, [](HWND child, LPARAM value) -> BOOL {
+        auto& query = *reinterpret_cast<Query*>(value);
+        query.invoked = IsWindowVisible(child) && query.invoke(child);
+        return !query.invoked;
+    }, reinterpret_cast<LPARAM>(&query));
+    return query.invoked;
 }
 
 bool hiddenCloseExit()
@@ -262,7 +296,8 @@ bool hiddenCloseExit()
     if (!waitUntil([&] { session->read(); return session->engines() == 1 && primaryWindow(*session)
         && session->output.contains("Coordinator Session joined. PID=" + QByteArray::number(coordinator->pid)); })) return false;
     const auto hwnd = primaryWindow(*session);
-    if (!waitUntil([&] { return invokeSessionHide(hwnd); }) || !waitUntil([&] { return !IsWindowVisible(hwnd); })) return false;
+    if (!waitUntil([&] { return invokeSessionHide(hwnd); })
+        || !waitUntil([&] { return IsWindow(hwnd) && !IsWindowVisible(hwnd) && !IsIconic(hwnd); })) return false;
     if (!closeLauncherUi(*coordinator) || !coordinator->running() || !session->running()) return false;
     if (!PostMessageW(hwnd, WM_CLOSE, 0, 0)) return false; // Real production ordinary Close; tray semantic path is proved separately by real framed peers.
     bool unexpectedlyVisible = false;
@@ -290,22 +325,45 @@ bool sessionVisibility()
     if (!waitUntil([&] { session->read(); return session->engines() == 1 && primaryWindow(*session)
         && session->output.contains("Coordinator Session joined. PID=" + QByteArray::number(coordinator->pid)); })) return false;
     const auto hwnd = primaryWindow(*session);
+    const auto extendedStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    WINDOWPLACEMENT normal{sizeof(WINDOWPLACEMENT)};
+    if (!GetWindowPlacement(hwnd, &normal)) return false;
     const HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, session->pid);
     if (!process) return false;
     struct ProcessLifetime { HANDLE value; ~ProcessLifetime() { CloseHandle(value); } } native{process};
     if (!waitUntil([&] { return invokeSessionHide(hwnd); })
-        || !waitUntil([&] { return !IsWindowVisible(hwnd); })
-        || !IsWindow(hwnd) || WaitForSingleObject(process, 0) != WAIT_TIMEOUT || session->engines() != 1) return false;
+        || !waitUntil([&] { return IsWindow(hwnd) && !IsWindowVisible(hwnd) && !IsIconic(hwnd); })
+        || GetWindowLongPtrW(hwnd, GWL_EXSTYLE) != extendedStyle
+        || WaitForSingleObject(process, 0) != WAIT_TIMEOUT || session->engines() != 1) return false;
     auto duplicate = launch(args);
     if (!duplicate->process.waitForFinished(10000) || duplicate->process.exitCode() != 0
         || !waitUntil([&] { return IsWindowVisible(hwnd); }) || primaryWindow(*session) != hwnd || session->engines() != 1) return false;
-    if (!waitUntil([&] { return invokeSessionHide(hwnd); }) || !waitUntil([&] { return !IsWindowVisible(hwnd); })) return false;
+    WINDOWPLACEMENT restored{sizeof(WINDOWPLACEMENT)};
+    if (!GetWindowPlacement(hwnd, &restored) || restored.showCmd != normal.showCmd
+        || !EqualRect(&normal.rcNormalPosition, &restored.rcNormalPosition)
+        || GetWindowLongPtrW(hwnd, GWL_EXSTYLE) != extendedStyle) return false;
+
+    if (!PostMessageW(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0)
+        || !waitUntil([&] { return IsZoomed(hwnd); })) return false;
+    if (!waitUntil([&] { return invokeSessionHide(hwnd); })
+        || !waitUntil([&] { return IsWindow(hwnd) && !IsWindowVisible(hwnd) && !IsIconic(hwnd); })) return false;
+    auto duplicateMaximized = launch(args);
+    if (!duplicateMaximized->process.waitForFinished(10000) || duplicateMaximized->process.exitCode() != 0
+        || !waitUntil([&] { return IsWindowVisible(hwnd) && IsZoomed(hwnd); })
+        || primaryWindow(*session) != hwnd || session->engines() != 1) return false;
+    if (!PostMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
+        || !waitUntil([&] { return !IsZoomed(hwnd); })) return false;
+    if (!GetWindowPlacement(hwnd, &restored) || restored.showCmd != normal.showCmd
+        || !EqualRect(&normal.rcNormalPosition, &restored.rcNormalPosition)) return false;
+
+    if (!waitUntil([&] { return invokeSessionHide(hwnd); })
+        || !waitUntil([&] { return IsWindow(hwnd) && !IsWindowVisible(hwnd) && !IsIconic(hwnd); })) return false;
     // Fault only this test-owned coordinator. S2 must reveal, not supervise/rejoin it.
     coordinator->process.kill(); coordinator->process.waitForFinished(5000);
     if (!waitUntil([&] { return IsWindowVisible(hwnd); }, 5000) || WaitForSingleObject(process, 0) != WAIT_TIMEOUT
         || primaryWindow(*session) != hwnd || session->engines() != 1) return false;
     const bool closed = session->closeNormally();
-    std::cout << "S2 production UIA Hide -> same HWND/one Engine -> duplicate ACTIVATE -> Hide -> coordinator death fail visible -> ordinary Close=" << closed << std::endl;
+    std::cout << "S2 production UIA Hide -> same HWND/one Engine -> restored normal and maximized placement -> coordinator loss fails visible -> ordinary Close=" << closed << std::endl;
     return closed;
 }
 
@@ -586,6 +644,10 @@ int main(int argc, char** argv)
     const auto name = app.arguments().value(1);
     try
     {
+        if (primaryRoleCaption(L"DesktopSceneEngine_QtPlayer")
+            || !primaryRoleCaption(L"DesktopSceneEngine — Launcher")
+            || !primaryRoleCaption(L"DesktopSceneEngine — Untitled"))
+            throw std::runtime_error("Primary role classification must exclude WebView helpers and retain real roles");
         requireNoExistingPlayer();
         bool ok = false;
         if (name == "launcher") ok = contenders(false, 2, true);

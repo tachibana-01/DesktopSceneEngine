@@ -176,9 +176,8 @@ The Engine has no graphical user interface.
 
 ## Editor
 
-The graphical application used to edit Projects.
-
-The Editor communicates with the Engine through public interfaces.
+The Project-editing surface of a Player Session. The Session application owns
+Project commands and communicates with the Engine through public interfaces.
 
 ---
 
@@ -281,9 +280,9 @@ Domain Scene; it does not create a competing persistent Crop or Layout model.
 
 The logical composition/output space into which Media Presentation is rendered.
 
-In current V1, Desktop Canvas is transient Player workspace/session state while JSON
-v1.0 remains frozen. A resolved Display Target may synchronize its aspect, but the
-two concepts remain separate.
+In the historical v1 foundation, Desktop Canvas was transient workspace state.
+The current v2 Authored Project persists its aspect. The physical Display Target
+remains a separate Session/platform fact.
 
 Desktop Canvas is not a Preview Viewport, a RenderWidget size, a physical Display,
 or a media's intrinsic dimensions.
@@ -326,8 +325,8 @@ Display Target is not inferred from Player-window location, first enumeration or
 or a Qt screen index. An unavailable target remains unresolved rather than silently
 binding to another display.
 
-Current selection synchronizes Canvas aspect when resolved, but does not perform
-physical display output or Canvas-to-Display Mapping.
+The Launcher selects the Display Target for a Session. The Session's explicit
+Deploy action starts desktop output on that bound target.
 
 ---
 
@@ -353,11 +352,9 @@ It never exposes native handles, Qt objects, or graphics objects to upper layers
 
 ## Canvas-to-Display Mapping
 
-The future transformation of the complete Desktop Canvas into a selected Display
-Target.
-
-Canvas-to-Display Mapping is separate from Media Presentation. Fill, Fit, Stretch,
-and Exact are deferred physical-output policies, not current Preview modes.
+The transformation of the complete Desktop Canvas into a selected Display Target,
+separate from per-Item Media Presentation. The current Session can deploy to its
+bound target. Generalized Fill, Fit, Stretch, and Exact policies remain deferred.
 
 ---
 

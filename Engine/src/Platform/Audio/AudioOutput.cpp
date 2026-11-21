@@ -65,10 +65,12 @@ struct AudioOutput::Impl
     Microsoft::WRL::ComPtr<IAudioRenderClient> renderClient{};
     Microsoft::WRL::ComPtr<IAudioStreamVolume> streamVolume{};
     UINT32 bufferFrameCount = 0;
+    std::size_t periodFrames = 0U;
     bool comInitialized = false;
     bool initialized = false;
     bool started = false;
     bool paused = false;
+    HANDLE readinessEvent = nullptr;
     OutputMode mode = OutputMode::Idle;
     const std::uint8_t* pcm = nullptr;
     std::size_t totalFrames = 0;
@@ -98,6 +100,16 @@ AudioOutput::~AudioOutput()
 }
 
 bool AudioOutput::initialize() noexcept
+{
+    return initializeInternal(false);
+}
+
+bool AudioOutput::initializeEventDriven() noexcept
+{
+    return initializeInternal(true);
+}
+
+bool AudioOutput::initializeInternal(bool eventDriven) noexcept
 {
     if (impl_ == nullptr)
     {
@@ -149,8 +161,9 @@ bool AudioOutput::initialize() noexcept
         format.nChannels * format.wBitsPerSample / 8U);
     format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
 
-    constexpr DWORD streamFlags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    const DWORD streamFlags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+        | (eventDriven ? AUDCLNT_STREAMFLAGS_EVENTCALLBACK : 0U);
     if (FAILED(impl_->client->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             streamFlags,
@@ -167,6 +180,20 @@ bool AudioOutput::initialize() noexcept
         return false;
     }
 
+    if (eventDriven)
+    {
+        impl_->readinessEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (impl_->readinessEvent == nullptr
+            || FAILED(impl_->client->SetEventHandle(impl_->readinessEvent)))
+        {
+            shutdown();
+            return false;
+        }
+    }
+    REFERENCE_TIME period = 0;
+    if (SUCCEEDED(impl_->client->GetDevicePeriod(&period, nullptr)) && period > 0)
+        impl_->periodFrames = static_cast<std::size_t>((period * 48'000LL + 9'999'999LL) / 10'000'000LL);
+
     // IAudioStreamVolume is available for ordinary shared-mode render
     // clients. Keep audio usable if a backend does not expose the optional
     // volume service; the requested volume remains stored for later use.
@@ -178,7 +205,66 @@ bool AudioOutput::initialize() noexcept
     setVolume(impl_->volume);
     return true;
 #else
+    static_cast<void>(eventDriven);
     return false;
+#endif
+}
+
+void* AudioOutput::readinessHandle() const noexcept
+{
+#if defined(_WIN32)
+    return impl_ ? impl_->readinessEvent : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+std::size_t AudioOutput::bufferFrameCount() const noexcept
+{
+#if defined(_WIN32)
+    return impl_ ? impl_->bufferFrameCount : 0U;
+#else
+    return 0U;
+#endif
+}
+
+std::size_t AudioOutput::devicePeriodFrames() const noexcept
+{
+#if defined(_WIN32)
+    return impl_ ? impl_->periodFrames : 0U;
+#else
+    return 0U;
+#endif
+}
+
+bool AudioOutput::isInitialized() const noexcept
+{
+    return impl_ && impl_->initialized;
+}
+
+CheckedMuteStatus AudioOutput::setMutedChecked(bool muted) noexcept
+{
+#if defined(_WIN32)
+    if (!impl_ || !impl_->initialized || !impl_->streamVolume)
+        return CheckedMuteStatus::Unavailable;
+    UINT32 channels = 0U;
+    const HRESULT countResult = impl_->streamVolume->GetChannelCount(&channels);
+    if (FAILED(countResult)) return CheckedMuteStatus::DeviceFailure;
+    // This stream is always canonical stereo. Do not allocate on A to cope
+    // with an unexpected device contract.
+    if (channels != 2U) return CheckedMuteStatus::ContractFailure;
+    const float level = muted ? 0.0F : 1.0F;
+    const float levels[2] = {level, level};
+    const HRESULT result = impl_->streamVolume->SetAllVolumes(2U, levels);
+    if (FAILED(result))
+        return result == AUDCLNT_E_DEVICE_INVALIDATED || result == AUDCLNT_E_SERVICE_NOT_RUNNING
+            ? CheckedMuteStatus::DeviceFailure : CheckedMuteStatus::ContractFailure;
+    impl_->muted = muted;
+    impl_->volume = level;
+    return CheckedMuteStatus::Applied;
+#else
+    static_cast<void>(muted);
+    return CheckedMuteStatus::Unavailable;
 #endif
 }
 
@@ -214,8 +300,7 @@ AudioBlockStatus AudioOutput::beginBlockMode(
 
     if (FAILED(impl_->client->Start()))
     {
-        stop();
-        return AudioBlockStatus::DeviceFailure;
+        return stopAfterDeviceFailure();
     }
 
     impl_->started = true;
@@ -260,8 +345,7 @@ AudioBlockAvailability AudioOutput::writableFrames() noexcept
     if (FAILED(impl_->client->GetCurrentPadding(&padding))
         || padding > impl_->bufferFrameCount)
     {
-        stop();
-        return {0U, AudioBlockStatus::DeviceFailure};
+        return {0U, stopAfterDeviceFailure()};
     }
 
     return {
@@ -329,8 +413,7 @@ AudioBlockStatus AudioOutput::writeFrames(
     if (FAILED(impl_->client->GetCurrentPadding(&padding))
         || padding > impl_->bufferFrameCount)
     {
-        stop();
-        return AudioBlockStatus::DeviceFailure;
+        return stopAfterDeviceFailure();
     }
 
     const std::size_t availableFrames = static_cast<std::size_t>(
@@ -346,8 +429,7 @@ AudioBlockStatus AudioOutput::writeFrames(
             &destination))
         || destination == nullptr)
     {
-        stop();
-        return AudioBlockStatus::DeviceFailure;
+        return stopAfterDeviceFailure();
     }
 
     std::memcpy(
@@ -358,8 +440,7 @@ AudioBlockStatus AudioOutput::writeFrames(
             static_cast<UINT32>(requestedFrames),
             0)))
     {
-        stop();
-        return AudioBlockStatus::DeviceFailure;
+        return stopAfterDeviceFailure();
     }
 
     if (padding == 0U && impl_->submittedFrameCount > 0U)
@@ -479,6 +560,8 @@ bool AudioOutput::submitAtFrameInternal(
     }
 
     stop();
+    if (!impl_->initialized || impl_->client == nullptr || impl_->renderClient == nullptr)
+        return false;
     impl_->mode = OutputMode::LegacyBorrowed;
     const std::size_t sourceFrameCount = byteSize / frameBytes;
     const std::size_t startByte = startFrame * frameBytes;
@@ -634,8 +717,7 @@ AudioBlockStatus AudioOutput::pause() noexcept
 
     if (FAILED(impl_->client->Stop()))
     {
-        stop();
-        return AudioBlockStatus::DeviceFailure;
+        return stopAfterDeviceFailure();
     }
 
     impl_->paused = true;
@@ -676,8 +758,7 @@ AudioBlockStatus AudioOutput::resume() noexcept
 
     if (FAILED(impl_->client->Start()))
     {
-        stop();
-        return AudioBlockStatus::DeviceFailure;
+        return stopAfterDeviceFailure();
     }
 
     impl_->started = true;
@@ -695,18 +776,48 @@ AudioBlockStatus AudioOutput::resume() noexcept
 
 void AudioOutput::stop() noexcept
 {
+    // Retain the legacy signature while refusing to leave a possibly running
+    // client behind when its caller cannot inspect a failed reset.
+    if (stopAndResetChecked() != AudioBlockStatus::Success) shutdown();
+}
+
+AudioBlockStatus AudioOutput::stopAfterDeviceFailure() noexcept
+{
+    const auto resetStatus = stopAndResetChecked();
+    if (resetStatus != AudioBlockStatus::Success) shutdown();
+    // Preserve a cleanup contract failure instead of hiding it under the
+    // original device operation failure. A owns the recovery decision.
+    return resetStatus != AudioBlockStatus::Success && resetStatus != AudioBlockStatus::DeviceFailure
+        ? AudioBlockStatus::InvalidRequest : AudioBlockStatus::DeviceFailure;
+}
+
+AudioBlockStatus AudioOutput::stopAndResetChecked() noexcept
+{
 #if defined(_WIN32)
-    if (impl_ == nullptr)
+    if (!impl_) return AudioBlockStatus::Success;
+    if (impl_->client)
     {
-        return;
+        const auto classify = [](HRESULT result) noexcept
+        {
+            return result == AUDCLNT_E_DEVICE_INVALIDATED
+                || result == AUDCLNT_E_SERVICE_NOT_RUNNING
+                || result == AUDCLNT_E_RESOURCES_INVALIDATED
+                ? AudioBlockStatus::DeviceFailure : AudioBlockStatus::WrongMode;
+        };
+        const HRESULT stopped = impl_->client->Stop();
+        if (FAILED(stopped)) return classify(stopped);
+        const HRESULT reset = impl_->client->Reset();
+        if (FAILED(reset)) return classify(reset);
     }
+    clearSubmissionState();
+#endif
+    return AudioBlockStatus::Success;
+}
 
-    if (impl_->client != nullptr)
-    {
-        (void)impl_->client->Stop();
-        (void)impl_->client->Reset();
-    }
-
+void AudioOutput::clearSubmissionState() noexcept
+{
+#if defined(_WIN32)
+    if (!impl_) return;
     impl_->started = false;
     impl_->paused = false;
     impl_->mode = OutputMode::Idle;
@@ -730,13 +841,23 @@ void AudioOutput::shutdown() noexcept
     }
 
 #if defined(_WIN32)
-    stop();
+    // Release is the safe fallback for an untrusted stream. Never recurse
+    // through the legacy stop wrapper, or clear queue ancestry before close.
+    if (impl_->mode != OutputMode::Idle || impl_->started || impl_->pcm != nullptr)
+        (void)stopAndResetChecked();
     impl_->renderClient.Reset();
     impl_->streamVolume.Reset();
     impl_->client.Reset();
     impl_->device.Reset();
+    clearSubmissionState();
+    if (impl_->readinessEvent != nullptr)
+    {
+        CloseHandle(impl_->readinessEvent);
+        impl_->readinessEvent = nullptr;
+    }
     impl_->initialized = false;
     impl_->bufferFrameCount = 0U;
+    impl_->periodFrames = 0U;
     if (impl_->comInitialized)
     {
         CoUninitialize();

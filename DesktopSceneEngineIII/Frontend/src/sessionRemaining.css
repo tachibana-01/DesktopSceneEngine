@@ -1,0 +1,6 @@
+/* Hide projects native request/result facts; it never hides the browser itself.
+   Keep the accepted caption/keyboard mock observable and preserve all HWND
+   layout bounds. This restore affordance is explicitly a DEV/mock seam. */
+.session-hidden-mock { display: flex; align-items: center; gap: 8px; color: #9aa7b9; font-size: 9px; }
+.session-hidden-mock button { border: 1px solid #3b4757; background: #171d26; color: #b4c0d1; padding: 5px 7px; font: inherit; }
+.preview-view-options [data-reset-layout] { margin-top: 10px; border: 1px solid #394452; background: transparent; color: #a4afc0; padding: 5px 8px; font: inherit; }

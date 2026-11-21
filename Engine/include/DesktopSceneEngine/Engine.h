@@ -1,13 +1,17 @@
 #pragma once
 
 #include <DesktopSceneEngine/BackgroundMusicControl.h>
+#include <DesktopSceneEngine/BackgroundMusicObservation.h>
 #include <DesktopSceneEngine/Domain/AspectRatio.h>
 #include <DesktopSceneEngine/Domain/EntityId.h>
 #include <DesktopSceneEngine/Domain/Project.h>
+#include <DesktopSceneEngine/EnginePresentation.h>
+#include <DesktopSceneEngine/HostedCompositionContent.h>
 #include <DesktopSceneEngine/PresentationTarget.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,6 +33,8 @@ namespace Rendering
 class Renderer;
 class CanvasTargetFitTestAccess;
 
+namespace Detail { struct MediaView; }
+
 }
 
 namespace Resources
@@ -36,6 +42,7 @@ namespace Resources
 
 class MediaResource;
 class AudioResource;
+class DetachedMediaProducer;
 
 }
 
@@ -77,26 +84,81 @@ class DefaultAudioEndpointWatcher;
 
 }
 
-namespace Windows
-{
-
-class DesktopWindowHost;
-
-}
 }
 
 class Engine
 {
 public:
 
-    // Borrowed presentation target supplied by an external application window.
-    // The caller owns the native window and must keep it alive until its
-    // presentation target is detached or Engine shutdown completes.
-    struct ExternalWindowTarget
+    enum class PresentationMode { Inline, Detached };
+
+    // Native control operations reserve their bounded completion before any
+    // authored mutation. This is an execution receipt, never an audibility ACK.
+    enum class AudioEffectScope : std::uint8_t
     {
-        void* handle = nullptr;
-        PresentationTransport transport = PresentationTransport::HwndSwapChain;
+        Structural, EmbeddedGain, PlaylistBgmGain, ItemBgmGain, OutputMute
     };
+    enum class AudioEffectPhase : std::uint8_t
+    {
+        Rejected, Preparing, Pending, Applied, DeferredUnavailable, Failed,
+        Cancelled, Expired
+    };
+    enum class AudioDeviceHealth : std::uint8_t
+    {
+        Healthy, DeviceUnavailable, ContractFaulted
+    };
+    struct AudioEffectToken
+    {
+        std::uint64_t execution = 0;
+        std::uint64_t sequence = 0;
+        [[nodiscard]] explicit operator bool() const noexcept
+        { return execution != 0 && sequence != 0; }
+        bool operator==(const AudioEffectToken&) const = default;
+    };
+    struct AudioEffectResult
+    {
+        AudioEffectToken token{};
+        AudioEffectScope scope = AudioEffectScope::Structural;
+        AudioEffectPhase phase = AudioEffectPhase::Expired;
+        std::string error;
+        std::int64_t effectTimeNs = 0;
+        [[nodiscard]] bool pending() const noexcept
+        { return phase == AudioEffectPhase::Preparing || phase == AudioEffectPhase::Pending; }
+        [[nodiscard]] bool terminal() const noexcept { return !pending(); }
+    };
+    struct AudioExecutionState
+    {
+        std::uint64_t incarnation = 0;
+        std::uint64_t capacityRevision = 0;
+        bool started = false;
+        bool closing = false;
+        bool stopped = true;
+        bool desiredMuted = false;
+        bool appliedMuted = false;
+        bool muteKnown = true;
+        AudioDeviceHealth deviceHealth = AudioDeviceHealth::Healthy;
+        std::array<AudioEffectResult, 5> effects{};
+    };
+
+    struct PlaybackClockSample
+    {
+        std::uint64_t asOfEffectSequence = 0;
+        std::int64_t asOfTimeNs = 0;
+        double position = 0, duration = 0, rate = 1;
+        bool paused = false, outputMuted = false, muteKnown = true;
+    };
+    // One C receipt frontier and one QPC instant for a detached readback.
+    [[nodiscard]] PlaybackClockSample playbackClockSample() const;
+
+    [[nodiscard]] std::optional<AudioEffectToken> beginAudioEffect(AudioEffectScope scope) noexcept;
+    [[nodiscard]] AudioEffectResult finishAudioEffect(AudioEffectToken token, bool logicalAccepted = true);
+    [[nodiscard]] AudioEffectResult audioEffect(AudioEffectToken token) const;
+    void pollAudioExecution();
+    [[nodiscard]] AudioExecutionState audioExecutionState() const;
+    void beginAudioShutdown() noexcept;
+    [[nodiscard]] bool audioShutdownComplete() const noexcept;
+
+    using ExternalWindowTarget = EnginePresentation::ExternalWindowTarget;
 
     enum class MediaKind
     {
@@ -120,16 +182,42 @@ public:
     };
 
     Engine();
+    explicit Engine(PresentationMode presentationMode);
 
     ~Engine();
 
     void initialize();
 
+    // Detached control owns no HWND, renderer, or composition content lease.
+    [[nodiscard]] bool initializeRuntimeOnly();
+
+    // Borrowed auto-reset event. Keep it alive until this Engine's audio and
+    // producer retirement is complete. Set it before logical initialization.
+    [[nodiscard]] bool setControlWakeEvent(void* borrowedEvent) noexcept;
+
+    // Read on the control owner. The returned pixels and geometry can be
+    // retained independently by an EnginePresentation on the UI thread.
+    [[nodiscard]] PresentationInput presentationInput(const Domain::AspectRatio& canvasAspect) const;
+
     [[nodiscard]] PresentationTargetId initialize(
         const ExternalWindowTarget& target);
 
+    [[nodiscard]] PresentationTargetId initialize(
+        const HostedCompositionTarget& target);
+
     [[nodiscard]] PresentationTargetId attachPresentationTarget(
         const ExternalWindowTarget& target);
+
+    [[nodiscard]] PresentationTargetId attachPresentationTarget(
+        const HostedCompositionTarget& target);
+
+    // Explicit allocation input for windowless content; placement belongs to
+    // the application that attaches the leased composition content.
+    [[nodiscard]] bool setHostedPresentationExtent(
+        PresentationTargetId id, PresentationExtent extent) noexcept;
+
+    [[nodiscard]] CompositionContentLease acquireHostedCompositionContent(
+        PresentationTargetId id) const noexcept;
 
     [[nodiscard]] bool detachPresentationTarget(
         PresentationTargetId id) noexcept;
@@ -151,8 +239,31 @@ public:
 
     void detachProject();
 
+    // CP3 control path. Preparation publishes resource facts without mutating
+    // the active binding or playback clock. Commit consumes only the exact
+    // ready ticket and owns an immutable runtime copy of the project.
+    enum class MediaPreparationStatus { Pending, Ready, Failed, Expired };
+    using MediaPreparationToken = std::uint64_t;
+    [[nodiscard]] bool enableAsyncMediaPreparation();
+    [[nodiscard]] std::optional<MediaPreparationToken> prepareSceneMedia(
+        const Domain::Project& project, const Domain::EntityId& scene, float initialTime = 0.0F);
+    [[nodiscard]] std::optional<MediaPreparationToken> prepareSeek(float seconds);
+    [[nodiscard]] MediaPreparationStatus preparedMediaStatus(MediaPreparationToken ticket) const noexcept;
+    [[nodiscard]] bool commitPreparedScene(const Domain::Project& project, const Domain::EntityId& scene,
+        MediaPreparationToken ticket, bool paused = false, std::optional<float> playbackRate = std::nullopt);
+    [[nodiscard]] bool commitPreparedSeek(MediaPreparationToken ticket);
+    void cancelMediaPreparation(MediaPreparationToken ticket) noexcept;
+    enum class MediaPresentationResolution { Ignored, Pending, Acknowledged, RolledBack };
+    [[nodiscard]] std::optional<MediaPreparationToken> pendingMediaPresentation() const noexcept;
+    [[nodiscard]] MediaPresentationResolution resolveMediaPresentation(MediaPreparationToken ticket,
+        PresentationUploadResult result);
+    void beginMediaShutdown() noexcept;
+    [[nodiscard]] bool mediaShutdownComplete() const noexcept;
+
     void update();
 
+    // Compatibility signature. Logical time uses the transition-anchored QPC
+    // clock; caller/UI delta is never accumulated or used for time stepping.
     void update(float deltaTime);
 
     void setSceneCompletionPolicy(SceneCompletionPolicy policy) noexcept;
@@ -161,6 +272,7 @@ public:
     // scene changes, seeks, project lifecycle changes, and policy changes
     // invalidate an unconsumed fact.
     [[nodiscard]] bool consumeNaturalSceneCompletion() noexcept;
+    [[nodiscard]] bool naturalSceneCompletionPending() const noexcept;
 
     // Seeks within the active scene using scene-local media time. Finite
     // requests are clamped to the playable range; invalid lifecycle, duration,
@@ -210,6 +322,8 @@ public:
     [[nodiscard]] std::optional<BackgroundMusicControl::TrackId>
         currentItemBackgroundMusicTrackId() const;
 
+    [[nodiscard]] BackgroundMusicObservation::Snapshot backgroundMusicObservation() const;
+
     [[nodiscard]] std::size_t activeSceneIndex() const noexcept;
 
     [[nodiscard]] std::size_t sceneCount() const noexcept;
@@ -240,47 +354,33 @@ public:
 
 private:
 
+    struct AudioControl;
+    std::unique_ptr<AudioControl> audioControl_;
+
     friend class Core::BackgroundMusicEngineTestAccess;
     friend class Core::AudioOutputRecoveryEngineTestAccess;
     friend class Rendering::CanvasTargetFitTestAccess;
 
-    bool initializeWithWindowHost(
-        PresentationTransport transport = PresentationTransport::HwndSwapChain);
+    [[nodiscard]] bool initializeRuntime();
+    [[nodiscard]] Rendering::Renderer& renderer() noexcept;
+    [[nodiscard]] bool stageMedia(const Rendering::Detail::MediaView& media, PresentationFrameKind kind);
+    [[nodiscard]] bool prepareInitialMedia(Resources::MediaResource& media);
+    void clearPresentationMedia() noexcept;
+    void updateDetachedVideo();
+    struct MediaPresentationCheckpoint;
+    [[nodiscard]] std::unique_ptr<MediaPresentationCheckpoint> captureMediaPresentation(
+        MediaPreparationToken ticket, bool seek) const;
 
-    void removeEmbeddedAudioInput() noexcept;
-
-    void stopSharedAudioOutput() noexcept;
-
-    [[nodiscard]] bool hasAudioInputPresence() const noexcept;
-
-    [[nodiscard]] Core::SharedAudioOutputState desiredSharedAudioOutputState() const noexcept;
-
-    [[nodiscard]] bool reconcileAudioOutputState(bool allowPrime) noexcept;
-
-    void enterAudioOutputDeviceUnavailable() noexcept;
-
-    void enterAudioOutputContractFaulted() noexcept;
-
-    void advanceAudioOutputRecovery(float deltaTime) noexcept;
-
-    void observeDefaultAudioEndpointGeneration() noexcept;
-
-    void rerouteDefaultAudioEndpoint() noexcept;
-
-    [[nodiscard]] bool recoverAudioOutput(
-        Core::SharedAudioOutputState desiredState
-    ) noexcept;
-
-    void releaseEmbeddedAudioResource() noexcept;
-
-    [[nodiscard]] bool setEmbeddedAudioTempo(float speed) noexcept;
-
-    [[nodiscard]] bool configureEmbeddedAudioInputAt(
-        float mediaTime,
-        float playbackSpeed
-    ) noexcept;
-
-    [[nodiscard]] bool pumpMixedAudio() noexcept;
+    struct PendingMediaPreparation
+    {
+        MediaPreparationToken ticket;
+        Domain::EntityId scene;
+        std::optional<std::string> source;
+        float declaredDuration = 0;
+        float position = 0;
+        bool seek = false;
+        bool seekWithoutVideo = false;
+    };
 
     bool initialized_ = false;
     bool projectBound_ = false;
@@ -288,36 +388,28 @@ private:
         = SceneCompletionPolicy::InternalSceneNavigation;
     bool pendingNaturalSceneCompletion_ = false;
     bool naturalSceneCompletionHalted_ = false;
-    // Application owns the project and must keep it alive until detachProject().
+    // Inline compatibility binds caller-owned storage. CP3 binds detachedProject_.
     const Domain::Project* boundProject_ = nullptr;
+    std::unique_ptr<const Domain::Project> detachedProject_;
+    std::unique_ptr<MediaPresentationCheckpoint> mediaPresentation_;
     std::unique_ptr<Runtime::SceneRuntime> sceneRuntime_{};
     std::unique_ptr<Runtime::PlaybackRuntime> playbackRuntime_{};
-    std::unique_ptr<Rendering::Renderer> renderer_{};
+    std::unique_ptr<EnginePresentation> presentation_{};
+    std::shared_ptr<const PresentationFrame> detachedFrame_;
+    void* controlWakeEvent_ = nullptr;
+    std::unique_ptr<Resources::DetachedMediaProducer> mediaProducer_;
+    std::optional<PendingMediaPreparation> pendingMediaPreparation_;
+    MediaPreparationToken nextMediaTicket_ = 0;
+    MediaPreparationToken detachedMediaBinding_ = 0;
+    MediaKind detachedMediaKind_ = MediaKind::Unknown;
+    bool detachedVideoAtEnd_ = false;
+    bool mediaShuttingDown_ = false;
     std::unique_ptr<Resources::MediaResource> mediaResource_{};
-    std::unique_ptr<Resources::AudioResource> audioResource_{};
     float videoFrameTime_ = -1.0F;
     double videoPresentedTime_ = -1.0;
     std::uint64_t syncDiagnosticUpdates_ = 0U;
-    std::unique_ptr<Audio::AudioMixer> audioMixer_{};
-    std::unique_ptr<Platform::Audio::AudioOutput> audioOutput_{};
-    std::unique_ptr<Platform::Audio::DefaultAudioEndpointWatcher> defaultAudioEndpointWatcher_{};
-    std::unique_ptr<Audio::MixedOutputBridge> mixedOutputBridge_{};
     std::unique_ptr<Music::BackgroundMusicRuntime> backgroundMusicRuntime_{};
-    std::unique_ptr<Music::BackgroundMusicExecutor> backgroundMusicExecutor_{};
     std::unique_ptr<Music::BackgroundMusicOrchestrator> backgroundMusicOrchestrator_{};
-    std::uint8_t sharedAudioOutputState_ = 0U;
-    Core::AudioOutputOperationalState audioOutputOperationalState_;
-    double audioOutputRetryElapsedSeconds_ = 0.0;
-    std::uint64_t embeddedAudioInputHandleValue_ = 0U;
-    float embeddedAudioGain_ = 1.0F;
-    bool embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-    bool audioOutputInactiveDiagnosticReported_ = false;
-    bool defaultAudioEndpointWatcherAvailable_ = false;
-    std::uint64_t lastSeenDefaultAudioEndpointGeneration_ = 0U;
-    bool defaultAudioEndpointRerouteRequested_ = false;
-    std::unique_ptr<Core::AudioOutputRecoveryTestHooks> audioOutputRecoveryTestHooks_{};
-    std::unique_ptr<Platform::Windows::DesktopWindowHost> desktopWindowHost_{};
-    PresentationTargetId defaultPresentationTargetId_{};
 };
 
 }

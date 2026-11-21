@@ -65,6 +65,8 @@ enum class DisplayIdentifyStatus
     ApiFailure
 };
 
+inline constexpr std::uint32_t DisplayIdentifyDurationMs = 2500U;
+
 // Enumerates active Windows display paths into a value-only snapshot. Native
 // display handles and CCD structures are confined to the implementation.
 [[nodiscard]] DisplayEnumerationResult enumerateActiveDisplays();

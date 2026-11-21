@@ -507,6 +507,40 @@ const Domain::AuthoredProject& WorkspaceModel::authoredProject() const noexcept
     return authoredProject_;
 }
 
+std::optional<AuthoredBackgroundMusicRead> WorkspaceModel::authoredBackgroundMusic(
+    PlaylistId playlistId, std::optional<ItemId> itemId) const
+{
+    const Domain::AuthoredPlaylist* const playlist = authoredPlaylist(playlistId);
+    if (playlist == nullptr)
+    {
+        return std::nullopt;
+    }
+
+    const Domain::AuthoredItem* item = nullptr;
+    if (itemId.has_value())
+    {
+        const Domain::ItemId authoredItemId = toAuthoredId(*itemId);
+        const auto found = std::find_if(playlist->items.cbegin(), playlist->items.cend(),
+            [&authoredItemId](const Domain::AuthoredItem& candidate)
+            {
+                return candidate.id == authoredItemId;
+            });
+        if (found == playlist->items.cend())
+        {
+            return std::nullopt;
+        }
+        item = &*found;
+    }
+
+    AuthoredBackgroundMusicRead result{playlist->id, playlist->globalMusicQueue};
+    if (item != nullptr)
+    {
+        result.itemId = item->id;
+        result.itemMusic = item->musicQueue;
+    }
+    return result;
+}
+
 const QVector<WorkspacePlaylist>& WorkspaceModel::playlists() const noexcept
 {
     return compatibilityPlaylists_;
@@ -953,7 +987,10 @@ bool WorkspaceModel::setPlaylistMasterVolume(PlaylistId id, double volume)
     }
 
     entry->masterVolume = normalizedVolume;
-    rebuildCompatibilityView();
+    // Scalar projection only: dragging Master must not reconstruct every Item,
+    // media attachment and music queue in the compatibility view.
+    for (auto& playlist : compatibilityPlaylists_)
+        if (playlist.id == id) { playlist.masterVolume = normalizedVolume; break; }
     bumpAuthoredRevision();
     return true;
 }

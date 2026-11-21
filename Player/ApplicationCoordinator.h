@@ -3,6 +3,7 @@
 #include "InstanceActivation.h"
 #include "DesktopDeployment.h"
 #include "RoleClose.h"
+#include "LauncherSessionsProjection.h"
 
 #include <QElapsedTimer>
 #include <QLocalSocket>
@@ -46,6 +47,13 @@ public:
     [[nodiscard]] QWidget* launcherWindow() const { return launcher_.get(); }
     [[nodiscard]] QUuid launcherIncarnation() const { return launcherIncarnation_; }
     [[nodiscard]] std::size_t sessionCount() const { return sessions_.size(); }
+    [[nodiscard]] QUuid coordinatorEpoch() const { return epoch_; }
+    [[nodiscard]] std::vector<LauncherRegisteredSession> verifiedRegisteredSessions() const;
+    // Read-only registry facts; revision orders transport snapshots, never admission/lifecycle.
+    [[nodiscard]] LauncherSessionsSnapshot launcherSessionSnapshot();
+    void setSessionProjectionChanged(std::function<void(const LauncherSessionsSnapshot&)> callback);
+    [[nodiscard]] LauncherCreateResult createSession(const QUuid& coordinatorEpoch, const DisplayId& displayId);
+    [[nodiscard]] LauncherOpenResult openSession(const QUuid& coordinatorEpoch, const QUuid& incarnation);
     void showSession(const QUuid& incarnation);
     void requestSessionDeployment(const QUuid& incarnation, DesktopDeploymentIntent intent);
     [[nodiscard]] DesktopDeploymentResult sessionDeploymentResult(const QUuid& incarnation) const;
@@ -56,9 +64,16 @@ public:
 private:
     friend class ::ApplicationCoordinatorTestAccess;
     struct SessionRecord;
+    struct CreateRecord;
     void acceptConnections();
     bool registerSession(QLocalSocket& socket, const QByteArray& body);
     void removeTerminatedSessions();
+    void refreshSessionProjection();
+    void reconcileCreateOperations(const std::vector<LauncherRegisteredSession>& registered);
+    void finishCreateOperation(CreateRecord& record, LauncherCreateState state,
+        std::optional<QUuid> incarnation = std::nullopt);
+    [[nodiscard]] bool hasPendingCreate() const;
+    [[nodiscard]] std::vector<LauncherCreateOperation> createOperationProjection() const;
     void scheduleDrain();
     void updateActivationProvider();
     void restoreRegisteredSessions();
@@ -111,6 +126,17 @@ private:
     std::unique_ptr<QWidget> launcher_;
     QUuid launcherIncarnation_;
     std::vector<std::unique_ptr<SessionRecord>> sessions_;
+    std::vector<LauncherRegisteredSession> sessionProjection_;
+    std::vector<std::unique_ptr<CreateRecord>> createOperations_;
+    std::vector<LauncherCreateOperation> createProjection_;
+    // Private seams are available only to the existing native test friend.
+    // Production returns the original CreateProcess HANDLE, never a reopened PID.
+    std::function<void*(const DisplaySessionLaunchRequest&)> launchSessionProcess_;
+    int createObservationMs_ = ActivationDeadlineMs;
+    quint64 sessionProjectionRevision_ = 0;
+    std::optional<quint64> publishedSessionRevision_;
+    bool sessionProjectionQueued_ = false;
+    std::function<void(const LauncherSessionsSnapshot&)> sessionProjectionChanged_;
     bool launcherClosing_ = false;
     bool closing_ = false;
     QSystemTrayIcon tray_;
@@ -141,8 +167,11 @@ public:
     ~SessionCoordinatorJoin() override;
     void start(QWidget& primaryWindow, bool allowBootstrap = true);
     void enableControl(SessionPresentation& presentation);
-    void enableDesktopDeployment(std::function<DesktopDeploymentProjection()> projection,
-        std::function<DesktopDeploymentResult(DesktopDeploymentIntent)> execute);
+    using DesktopDeploymentCompletion = std::function<void(DesktopDeploymentResult)>;
+    // Effects return on the Session GUI executor. The coordinator transport
+    // correlates the terminal reply to the exact epoch and request.
+    void enableDesktopDeploymentAsync(std::function<DesktopDeploymentProjection()> projection,
+        std::function<void(DesktopDeploymentIntent, DesktopDeploymentCompletion)> execute);
     void publishDesktopDeployment();
     void publishCloseCapability();
     void beginRoleTeardown();
@@ -161,9 +190,10 @@ private:
     void consumeControl();
     void revokeQualification();
     void recoverDeadCoordinator(void* observedLifetime);
-    void requestHidePermit();
+    void requestHidePermit(std::function<bool()> stillAllowed);
     void renewQualification();
     void finishDraining();
+    void completeDesktopDeployment(const QUuid& epoch, quint64 request, DesktopDeploymentResult result);
     InstanceSlot sessionSlot_;
     InstanceSlot launcherSlot_;
     QPointer<QWidget> primaryWindow_;
@@ -196,10 +226,11 @@ private:
     quint64 renewalRequest_ = 0;
     quint64 hideRequest_ = 0;
     quint64 hideShowGeneration_ = 0;
+    std::function<bool()> hideStillAllowed_;
     quint64 lastShowRequest_ = 0;
     bool recoveryQualified_ = false;
     std::function<DesktopDeploymentProjection()> deploymentProjection_;
-    std::function<DesktopDeploymentResult(DesktopDeploymentIntent)> deploymentExecute_;
+    std::function<void(DesktopDeploymentIntent, DesktopDeploymentCompletion)> deploymentExecute_;
     std::optional<DesktopDeploymentProjection> lastDeploymentProjection_;
     quint64 deploymentRevision_ = 0;
     quint64 lastDeploymentRequest_ = 0;

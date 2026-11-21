@@ -1,0 +1,19 @@
+@import './anchoredPopover.css';
+
+.playlist-volume-trigger { display: grid; place-items: center; align-self: center; flex-shrink: 0; width: 26px; height: 28px; padding: 0; border: 0; border-radius: 2px; background: transparent; color: #7e8a9b; }
+.playlist-volume-trigger svg { stroke: currentColor; stroke-width: 1; }
+.playlist-volume-trigger:hover, .playlist-volume-trigger[aria-expanded=true] { color: #c1cbd7; background: #252c35; }
+.playlist-volume-trigger[data-muted=true] { color: #a08d88; }
+.playlist-volume-trigger:focus-visible { outline: 1px solid #aab7c9; outline-offset: -1px; }
+.playlist-volume-overlay { position: fixed; z-index: 30; width: 56px; pointer-events: none; }
+/* The corridor is geometry only: it retains hover but lets wheel hit the list below. */
+.playlist-volume-corridor { height: 12px; pointer-events: none; }
+.playlist-volume-popover { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: space-between; width: 56px; height: 174px; padding: 12px 10px; border: 0; border-radius: var(--dse-popover-radius); background: var(--dse-popover-surface); box-shadow: var(--dse-popover-shadow); pointer-events: auto; }
+.playlist-volume-popover::before { content: ''; position: absolute; left: 22px; top: -6px; width: 12px; height: 6px; clip-path: polygon(50% 0, 100% 100%, 0 100%); background: inherit; pointer-events: auto; }
+.playlist-volume-popover input { writing-mode: vertical-lr; direction: rtl; appearance: none; width: 20px; height: 116px; flex-shrink: 0; margin: 0; padding: 0; border: 0; background: transparent; cursor: ns-resize; }
+.playlist-volume-popover input::-webkit-slider-runnable-track { width: 2px; height: 100%; background: #586474; }
+.playlist-volume-popover input::-webkit-slider-thumb { appearance: none; width: 8px; height: 8px; margin-left: -3px; border: 0; border-radius: 1px; background: #bcc7d5; }
+.playlist-volume-popover input::-moz-range-track { width: 2px; height: 100%; background: #586474; }
+.playlist-volume-popover input::-moz-range-thumb { width: 8px; height: 8px; border: 0; border-radius: 1px; background: #bcc7d5; }
+.playlist-volume-popover input:focus-visible { outline: 1px solid #9aa8ba; outline-offset: 3px; }
+.playlist-volume-percent { font-size: 10px; line-height: 14px; color: #b6c0ce; font-variant-numeric: tabular-nums; }

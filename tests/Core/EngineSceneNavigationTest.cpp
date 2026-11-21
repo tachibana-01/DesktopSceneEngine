@@ -8,12 +8,15 @@
 #include <DesktopSceneEngine/Domain/Scene.h>
 #include <DesktopSceneEngine/Engine.h>
 
+#include "AudioExecutionEngineFixture.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -25,6 +28,19 @@ using DesktopSceneEngine::Domain::Media;
 using DesktopSceneEngine::Domain::Playback;
 using DesktopSceneEngine::Domain::Project;
 using DesktopSceneEngine::Domain::Scene;
+using DesktopSceneEngine::Engine;
+namespace Tests = DesktopSceneEngine::Tests;
+
+class NavigationEngine : public Tests::AwaitAudioEngine
+{
+public:
+    bool switchScene(const Project& project, const EntityId& scene)
+    { return Tests::effect(*this, [&] { return Engine::switchScene(project, scene); }); }
+    bool switchToNextScene()
+    { return Tests::effect(*this, [&] { return Engine::switchToNextScene(); }); }
+    bool switchToPreviousScene()
+    { return Tests::effect(*this, [&] { return Engine::switchToPreviousScene(); }); }
+};
 
 bool require(bool condition, const char* message)
 {
@@ -35,6 +51,23 @@ bool require(bool condition, const char* message)
 
     std::cerr << "Test failed: " << message << std::endl;
     return false;
+}
+
+template<class Predicate>
+bool observePlayback(Engine& engine, Predicate predicate)
+{
+    // A GUI delta does not advance the authoritative playback clock.
+    return Tests::waitUntil(engine, [&] {
+        engine.update();
+        return predicate();
+    });
+}
+
+bool awaitExternalCompletion(Engine& engine)
+{
+    return require(observePlayback(engine, [&] { return engine.naturalSceneCompletionPending(); }),
+            "The native clock must reach the external completion boundary")
+        && require(Tests::settle(engine), "The completion pause must reach the audio owner");
 }
 
 Project makeProject()
@@ -77,7 +110,7 @@ bool verifyNaturalSceneCompletionHandoff()
     const EntityId sceneA{std::string{"timed-scene-0"}};
     const EntityId sceneB{std::string{"timed-scene-1"}};
 
-    DesktopSceneEngine::Engine externalEngine{};
+    NavigationEngine externalEngine{};
     externalEngine.initialize();
     externalEngine.setSceneCompletionPolicy(
         DesktopSceneEngine::Engine::SceneCompletionPolicy::ExternalSceneCompletion);
@@ -89,7 +122,7 @@ bool verifyNaturalSceneCompletionHandoff()
         return false;
     }
 
-    externalEngine.update(5.0F);
+    if (!awaitExternalCompletion(externalEngine)) return false;
     const float stabilizedTime = externalEngine.playbackTime();
     if (!require(
             externalEngine.activeSceneIndex() == 0U
@@ -100,7 +133,7 @@ bool verifyNaturalSceneCompletionHandoff()
         return false;
     }
 
-    externalEngine.update(5.0F);
+    externalEngine.update();
     if (!require(
         externalEngine.activeSceneIndex() == 0U
                 && std::fabs(externalEngine.playbackTime() - stabilizedTime) < 0.001F
@@ -114,7 +147,7 @@ bool verifyNaturalSceneCompletionHandoff()
 
     externalEngine.togglePause();
     externalEngine.setPlaybackSpeed(2.0F);
-    externalEngine.update(5.0F);
+    externalEngine.update();
     if (!require(
             externalEngine.isPaused()
                 && std::fabs(externalEngine.playbackTime() - stabilizedTime) < 0.001F
@@ -132,7 +165,7 @@ bool verifyNaturalSceneCompletionHandoff()
         externalEngine.shutdown();
         return false;
     }
-    externalEngine.update(5.0F);
+    if (!awaitExternalCompletion(externalEngine)) return false;
     if (!require(
             externalEngine.switchScene(twoSceneProject, sceneB)
                 && !externalEngine.consumeNaturalSceneCompletion(),
@@ -149,7 +182,7 @@ bool verifyNaturalSceneCompletionHandoff()
         externalEngine.shutdown();
         return false;
     }
-    externalEngine.update(5.0F);
+    if (!awaitExternalCompletion(externalEngine)) return false;
     if (!require(
             externalEngine.switchScene(twoSceneProject, sceneA)
                 && !externalEngine.consumeNaturalSceneCompletion(),
@@ -159,7 +192,7 @@ bool verifyNaturalSceneCompletionHandoff()
         return false;
     }
 
-    externalEngine.update(5.0F);
+    if (!awaitExternalCompletion(externalEngine)) return false;
     if (!require(
             externalEngine.seek(0.5F)
                 && !externalEngine.consumeNaturalSceneCompletion(),
@@ -169,7 +202,9 @@ bool verifyNaturalSceneCompletionHandoff()
         return false;
     }
 
-    externalEngine.update(5.0F);
+    // Seek preserves pause; resume to produce a new, real pending fact.
+    externalEngine.togglePause();
+    if (!awaitExternalCompletion(externalEngine)) return false;
     externalEngine.detachProject();
     if (!require(
             !externalEngine.consumeNaturalSceneCompletion(),
@@ -186,7 +221,7 @@ bool verifyNaturalSceneCompletionHandoff()
         externalEngine.shutdown();
         return false;
     }
-    externalEngine.update(5.0F);
+    if (!awaitExternalCompletion(externalEngine)) return false;
     externalEngine.detachProject();
     if (!require(
             externalEngine.bindProject(twoSceneProject, sceneB)
@@ -197,7 +232,7 @@ bool verifyNaturalSceneCompletionHandoff()
         return false;
     }
 
-    externalEngine.update(5.0F);
+    if (!awaitExternalCompletion(externalEngine)) return false;
     externalEngine.setSceneCompletionPolicy(
         DesktopSceneEngine::Engine::SceneCompletionPolicy::InternalSceneNavigation);
     if (!require(
@@ -216,7 +251,8 @@ bool verifyNaturalSceneCompletionHandoff()
         externalEngine.shutdown();
         return false;
     }
-    externalEngine.update(5.0F);
+    if (!require(observePlayback(externalEngine, [&] { return externalEngine.activeSceneIndex() == 1U; }),
+            "The native clock must advance the internal Scene")) return false;
     if (!require(
             externalEngine.activeSceneIndex() == 1U
                 && !externalEngine.consumeNaturalSceneCompletion(),
@@ -237,7 +273,7 @@ bool verifyNaturalSceneCompletionHandoff()
     }
     externalEngine.shutdown();
 
-    DesktopSceneEngine::Engine defaultEngine{};
+    NavigationEngine defaultEngine{};
     defaultEngine.initialize();
     if (!require(
             defaultEngine.bindProject(twoSceneProject, sceneA),
@@ -246,8 +282,7 @@ bool verifyNaturalSceneCompletionHandoff()
         defaultEngine.shutdown();
         return false;
     }
-    defaultEngine.update(5.0F);
-    const bool defaultPolicyPasses = defaultEngine.activeSceneIndex() == 1U
+    const bool defaultPolicyPasses = observePlayback(defaultEngine, [&] { return defaultEngine.activeSceneIndex() == 1U; })
         && !defaultEngine.consumeNaturalSceneCompletion();
     defaultEngine.shutdown();
     if (!require(
@@ -257,7 +292,7 @@ bool verifyNaturalSceneCompletionHandoff()
         return false;
     }
 
-    DesktopSceneEngine::Engine shutdownEngine{};
+    NavigationEngine shutdownEngine{};
     shutdownEngine.initialize();
     shutdownEngine.setSceneCompletionPolicy(
         DesktopSceneEngine::Engine::SceneCompletionPolicy::ExternalSceneCompletion);
@@ -268,7 +303,7 @@ bool verifyNaturalSceneCompletionHandoff()
         shutdownEngine.shutdown();
         return false;
     }
-    shutdownEngine.update(5.0F);
+    if (!awaitExternalCompletion(shutdownEngine)) return false;
     shutdownEngine.shutdown();
     if (!require(
             !shutdownEngine.consumeNaturalSceneCompletion(),
@@ -278,7 +313,7 @@ bool verifyNaturalSceneCompletionHandoff()
     }
 
     const Project oneSceneProject = makeTimedNavigationProject(1U);
-    DesktopSceneEngine::Engine oneSceneExternalEngine{};
+    NavigationEngine oneSceneExternalEngine{};
     oneSceneExternalEngine.initialize();
     oneSceneExternalEngine.setSceneCompletionPolicy(
         DesktopSceneEngine::Engine::SceneCompletionPolicy::ExternalSceneCompletion);
@@ -289,7 +324,7 @@ bool verifyNaturalSceneCompletionHandoff()
         oneSceneExternalEngine.shutdown();
         return false;
     }
-    oneSceneExternalEngine.update(5.0F);
+    if (!awaitExternalCompletion(oneSceneExternalEngine)) return false;
     const bool oneSceneExternalPasses = oneSceneExternalEngine.activeSceneIndex() == 0U
         && oneSceneExternalEngine.consumeNaturalSceneCompletion()
         && !oneSceneExternalEngine.consumeNaturalSceneCompletion();
@@ -301,7 +336,7 @@ bool verifyNaturalSceneCompletionHandoff()
         return false;
     }
 
-    DesktopSceneEngine::Engine oneSceneInternalEngine{};
+    NavigationEngine oneSceneInternalEngine{};
     oneSceneInternalEngine.initialize();
     if (!require(
             oneSceneInternalEngine.bindProject(oneSceneProject, sceneA),
@@ -310,8 +345,10 @@ bool verifyNaturalSceneCompletionHandoff()
         oneSceneInternalEngine.shutdown();
         return false;
     }
-    oneSceneInternalEngine.update(5.0F);
-    const bool oneSceneInternalPasses = oneSceneInternalEngine.activeSceneIndex() == 0U
+    const auto initialEffect = oneSceneInternalEngine.playbackClockSample().asOfEffectSequence;
+    const bool oneSceneInternalPasses = observePlayback(oneSceneInternalEngine, [&] {
+        return oneSceneInternalEngine.playbackClockSample().asOfEffectSequence > initialEffect;
+    }) && oneSceneInternalEngine.activeSceneIndex() == 0U
         && !oneSceneInternalEngine.consumeNaturalSceneCompletion();
     oneSceneInternalEngine.shutdown();
     return require(
@@ -401,7 +438,7 @@ bool hasValidDimensions(const DesktopSceneEngine::Engine& engine)
 
 }
 
-int main()
+int main(int argc, char* argv[])
 {
     if (!verifyNaturalSceneCompletionHandoff())
     {
@@ -411,7 +448,7 @@ int main()
     const Project project = makeProject();
     const EntityId firstSceneId{std::string{"scene-0"}};
 
-    DesktopSceneEngine::Engine engine{};
+    NavigationEngine engine{};
     if (!require(
             !engine.switchToPreviousScene(),
             "Previous scene should safely fail without a bound Project")
@@ -470,8 +507,15 @@ int main()
 
     engine.shutdown();
 
+    if (argc == 2 && std::string_view{argv[1]} == "--fixture-independent")
+        return 0;
     const std::filesystem::path resourceRoot{
         DESKTOP_SCENE_ENGINE_TEST_RESOURCES_DIR};
+    if (resourceRoot.empty())
+    {
+        std::cerr << "External navigation media unavailable; use --fixture-independent for the public cases.\n";
+        return 77;
+    }
     const auto images = filesWithExtensions(
         resourceRoot / "Images", {".jpg", ".jpeg", ".png"});
     const auto videos = filesWithExtensions(resourceRoot / "Videos", {".mp4"});
@@ -483,7 +527,7 @@ int main()
 
     const Project mediaProject = makeMediaProject(
         images[0], videos[0], images[1], videos[1]);
-    DesktopSceneEngine::Engine mediaEngine{};
+    NavigationEngine mediaEngine{};
     mediaEngine.initialize();
     if (!require(
             mediaEngine.bindProject(

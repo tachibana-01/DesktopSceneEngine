@@ -66,6 +66,9 @@ std::optional<TimelinePreviewRequest> TimelinePreviewRequestState::takeLatest() 
     std::scoped_lock lock{mutex_};
     if (!acceptingRequests_ || !latestRequest_.has_value())
     {
+        // The serial worker consumed a wakeup whose request was cancelled.
+        // Returning it to idle lets a subsequent submit schedule fresh work.
+        workScheduled_ = false;
         return std::nullopt;
     }
 
@@ -290,7 +293,16 @@ void TimelinePreviewWorker::processHoverRequest(const TimelinePreviewRequest& re
     result.timing = request.timing;
     result.timing.workerStarted = TimelinePreviewTiming::Clock::now();
 
-    if (request.source.mediaType == WorkspaceMediaType::Video
+    if (request.source.mediaType == WorkspaceMediaType::Image)
+    {
+        if (!requestState_.cancellationRequested() && configureSource(request.source))
+            result.image = provider_.frameAt(request.timeSeconds);
+        if (requestState_.cancellationRequested())
+            outcome = TimelinePreviewDecodeOutcome::Cancelled;
+        else if (!result.image.isNull())
+            outcome = TimelinePreviewDecodeOutcome::Completed;
+    }
+    else if (request.source.mediaType == WorkspaceMediaType::Video
         && configureSource(request.source))
     {
         const float requestedTimeSeconds = request.representativeTimestampMilliseconds.has_value()

@@ -3,6 +3,12 @@ include("${CMAKE_CURRENT_LIST_DIR}/cmake/ExternalFixtures.cmake")
 add_test(NAME DesktopSceneEngine_PublicFixtureRegistrationTest
     COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_LIST_DIR}/cmake/PublicFixtureRegistrationTest.cmake")
 
+function(add_dse_external_media_test name)
+    if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
+        add_test(NAME "${name}_ExternalMedia" COMMAND "${name}" ${ARGN})
+        set_tests_properties("${name}_ExternalMedia" PROPERTIES LABELS external-media)
+    endif()
+endfunction()
 
 find_package(
     nlohmann_json
@@ -10,13 +16,65 @@ find_package(
     REQUIRED
 )
 
-
 find_package(
     Qt6
     CONFIG
     REQUIRED
     COMPONENTS Core Widgets
 )
+
+include(${CMAKE_SOURCE_DIR}/Player/SessionApplication.cmake)
+
+if(WIN32 AND BUILD_PLAYER)
+    include(${CMAKE_SOURCE_DIR}/DesktopSceneEngineIII/cmake/WebView2.cmake)
+
+    function(add_dse_product_test name)
+        add_executable(DesktopSceneEngine_${name} Player/${name}.cpp)
+        target_include_directories(DesktopSceneEngine_${name}
+            PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
+        target_compile_features(DesktopSceneEngine_${name} PRIVATE cxx_std_20)
+        target_compile_options(DesktopSceneEngine_${name} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+        target_link_libraries(DesktopSceneEngine_${name} PRIVATE DSE::ProductPresentation)
+        deploy_ffmpeg_dlls(DesktopSceneEngine_${name})
+    endfunction()
+
+    add_executable(DesktopSceneEngine_ProductWindowHostTest Player/ProductWindowHostTest.cpp)
+    target_include_directories(DesktopSceneEngine_ProductWindowHostTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
+    target_link_libraries(DesktopSceneEngine_ProductWindowHostTest PRIVATE DSE::ProductWindowHost user32 dwmapi)
+    add_test(NAME DesktopSceneEngine_ProductWindowHostTest COMMAND DesktopSceneEngine_ProductWindowHostTest)
+    set_tests_properties(DesktopSceneEngine_ProductWindowHostTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+
+    foreach(name LauncherSessionsProjectionTest LauncherBootstrapTest LauncherBridgeContractTest
+            LauncherIdentifyTest LauncherLanguageTest LauncherSessionLifecycleTest LauncherCreateOpenTest
+            LauncherCreateOpenLifecycleTest LauncherHostLifetimeTest LauncherHardeningLifecycleTest
+            SessionBridgeContractTest SessionHostLifetimeTest SessionModelCProductionTest)
+        add_dse_product_test(${name})
+        add_test(NAME DesktopSceneEngine_${name} COMMAND DesktopSceneEngine_${name})
+    endforeach()
+    set_tests_properties(DesktopSceneEngine_SessionBridgeContractTest DesktopSceneEngine_SessionHostLifetimeTest
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+    set_tests_properties(DesktopSceneEngine_LauncherLanguageTest DesktopSceneEngine_SessionModelCProductionTest
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    set_tests_properties(DesktopSceneEngine_LauncherSessionLifecycleTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+    set_tests_properties(DesktopSceneEngine_LauncherCreateOpenTest DesktopSceneEngine_LauncherCreateOpenLifecycleTest
+        DesktopSceneEngine_LauncherHostLifetimeTest DesktopSceneEngine_LauncherHardeningLifecycleTest
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
+    target_link_libraries(DesktopSceneEngine_LauncherHostLifetimeTest PRIVATE DSEIII::WebView2Loader)
+    target_link_libraries(DesktopSceneEngine_SessionHostLifetimeTest PRIVATE DSEIII::WebView2Loader)
+
+    # The frontend language check launches this real host against isolated preferences.
+    add_dse_product_test(LauncherLanguageHostFixture)
+    foreach(name LauncherLanguageTest LauncherLanguageHostFixture LauncherSessionLifecycleTest LauncherCreateOpenTest
+            LauncherCreateOpenLifecycleTest LauncherHostLifetimeTest LauncherHardeningLifecycleTest SessionModelCProductionTest)
+        add_dependencies(DesktopSceneEngine_${name} DesktopSceneEngine_QtPlayer)
+    endforeach()
+
+    add_dse_product_test(ApplicationCoordinatorTest)
+    foreach(case ui-lifetime protocol-lifetime bootstrap-timeout unavailable-join pending-teardown)
+        add_test(NAME DesktopSceneEngine_Coordinator_${case} COMMAND DesktopSceneEngine_ApplicationCoordinatorTest ${case})
+        set_tests_properties(DesktopSceneEngine_Coordinator_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
+endif()
 
 
 add_executable(
@@ -250,8 +308,6 @@ add_test(
 )
 
 
-if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
-
 add_executable(
     DesktopSceneEngine_ActiveProjectionRebuildTest
 )
@@ -272,6 +328,7 @@ target_include_directories(
     PRIVATE
 
     ${CMAKE_SOURCE_DIR}/Player
+    ${CMAKE_SOURCE_DIR}/Engine/src
 )
 
 
@@ -316,77 +373,9 @@ if(WIN32)
 endif()
 
 
-add_test(
-    NAME
-
-    DesktopSceneEngine_ActiveProjectionRebuildTest
-
-    COMMAND
-
-    DesktopSceneEngine_ActiveProjectionRebuildTest
-)
-
-endif()
-
-
-add_executable(
-    DesktopSceneEngine_PreviewViewportHostTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_PreviewViewportHostTest
-    PRIVATE
-
-    Player/PreviewViewportHostTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-    ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_PreviewViewportHostTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-    ${CMAKE_SOURCE_DIR}/Engine/include
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_PreviewViewportHostTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_PreviewViewportHostTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_PreviewViewportHostTest
-    PRIVATE
-
-    Qt6::Widgets
-)
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_PreviewViewportHostTest
-
-    COMMAND
-
-    DesktopSceneEngine_PreviewViewportHostTest
-)
+add_test(NAME DesktopSceneEngine_ActiveProjectionRebuildTest_FixtureIndependent
+    COMMAND DesktopSceneEngine_ActiveProjectionRebuildTest --fixture-independent)
+add_dse_external_media_test(DesktopSceneEngine_ActiveProjectionRebuildTest)
 
 
 add_executable(
@@ -1234,8 +1223,6 @@ add_test(
 )
 
 
-if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
-
 add_executable(
     DesktopSceneEngine_EngineSceneNavigationTest
 )
@@ -1246,6 +1233,12 @@ target_sources(
     PRIVATE
 
     Core/EngineSceneNavigationTest.cpp
+)
+
+
+target_include_directories(
+    DesktopSceneEngine_EngineSceneNavigationTest
+    PRIVATE ${CMAKE_SOURCE_DIR}/Engine/src
 )
 
 
@@ -1289,20 +1282,10 @@ if(WIN32)
 endif()
 
 
-add_test(
-    NAME
+add_test(NAME DesktopSceneEngine_EngineSceneNavigationTest_FixtureIndependent
+    COMMAND DesktopSceneEngine_EngineSceneNavigationTest --fixture-independent)
+add_dse_external_media_test(DesktopSceneEngine_EngineSceneNavigationTest)
 
-    DesktopSceneEngine_EngineSceneNavigationTest
-
-    COMMAND
-
-    DesktopSceneEngine_EngineSceneNavigationTest
-)
-
-endif()
-
-
-if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
 
 add_executable(
     DesktopSceneEngine_EngineSeekTest
@@ -1366,17 +1349,9 @@ if(WIN32)
 endif()
 
 
-add_test(
-    NAME
-
-    DesktopSceneEngine_EngineSeekTest
-
-    COMMAND
-
-    DesktopSceneEngine_EngineSeekTest
-)
-
-endif()
+add_test(NAME DesktopSceneEngine_EngineSeekTest_Generated
+    COMMAND DesktopSceneEngine_EngineSeekTest --generated)
+add_dse_external_media_test(DesktopSceneEngine_EngineSeekTest)
 
 
 add_executable(
@@ -1521,15 +1496,9 @@ target_link_libraries(
 )
 
 
-add_test(
-    NAME
-
-    DesktopSceneEngine_VideoResourceTest
-
-    COMMAND
-
-    DesktopSceneEngine_VideoResourceTest
-)
+add_test(NAME DesktopSceneEngine_VideoResourceTest_MissingPath
+    COMMAND DesktopSceneEngine_VideoResourceTest)
+add_dse_external_media_test(DesktopSceneEngine_VideoResourceTest "${DSE_EXTERNAL_FIRST_VIDEO}")
 
 
 add_executable(
@@ -1584,7 +1553,7 @@ add_test(
     COMMAND
 
     DesktopSceneEngine_AudioResourceTest
-    "${CMAKE_SOURCE_DIR}/tests/TestData/Audio/SequentialAudioSourceCompressed.mp3"
+    "${CMAKE_CURRENT_SOURCE_DIR}/TestData/Audio/SequentialAudioSourceCompressed.mp3"
 )
 
 
@@ -2081,7 +2050,6 @@ add_test(
 
 
 if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
-
 add_executable(
     DesktopSceneEngine_PreviewVideoDecoderTest
 )
@@ -2143,20 +2111,9 @@ if(WIN32)
 endif()
 
 
-add_test(
-    NAME
-
-    DesktopSceneEngine_PreviewVideoDecoderTest
-
-    COMMAND
-
-    DesktopSceneEngine_PreviewVideoDecoderTest
-)
-
+add_dse_external_media_test(DesktopSceneEngine_PreviewVideoDecoderTest)
 endif()
 
-
-if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
 
 add_executable(
     DesktopSceneEngine_TimelinePreviewProviderTest
@@ -2222,74 +2179,9 @@ if(WIN32)
 endif()
 
 
-add_test(
-    NAME
-
-    DesktopSceneEngine_TimelinePreviewProviderTest
-
-    COMMAND
-
-    DesktopSceneEngine_TimelinePreviewProviderTest
-)
-
-endif()
-
-
-add_executable(
-    DesktopSceneEngine_TimelineHoverGeometryTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_TimelineHoverGeometryTest
-    PRIVATE
-
-    Player/TimelineHoverGeometryTest.cpp
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_TimelineHoverGeometryTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_TimelineHoverGeometryTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_TimelineHoverGeometryTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_TimelineHoverGeometryTest
-    PRIVATE
-
-    Qt6::Widgets
-)
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_TimelineHoverGeometryTest
-
-    COMMAND
-
-    DesktopSceneEngine_TimelineHoverGeometryTest
-)
+add_test(NAME DesktopSceneEngine_TimelinePreviewProviderTest_Generated
+    COMMAND DesktopSceneEngine_TimelinePreviewProviderTest --generated)
+add_dse_external_media_test(DesktopSceneEngine_TimelinePreviewProviderTest)
 
 
 add_executable(
@@ -2410,8 +2302,6 @@ add_test(
 )
 
 
-if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
-
 add_executable(
     DesktopSceneEngine_TimelinePreviewWorkerTest
 )
@@ -2487,17 +2377,9 @@ if(WIN32)
 endif()
 
 
-add_test(
-    NAME
-
-    DesktopSceneEngine_TimelinePreviewWorkerTest
-
-    COMMAND
-
-    DesktopSceneEngine_TimelinePreviewWorkerTest
-)
-
-endif()
+add_test(NAME DesktopSceneEngine_TimelinePreviewWorkerTest_Generated
+    COMMAND DesktopSceneEngine_TimelinePreviewWorkerTest --generated)
+add_dse_external_media_test(DesktopSceneEngine_TimelinePreviewWorkerTest)
 
 
 add_executable(
@@ -3167,113 +3049,6 @@ add_test(
 
 
 add_executable(
-    DesktopSceneEngine_InspectorDeferredRefreshTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_InspectorDeferredRefreshTest
-    PRIVATE
-
-    Player/InspectorDeferredRefreshTest.cpp
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_InspectorDeferredRefreshTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_InspectorDeferredRefreshTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_InspectorDeferredRefreshTest
-    PRIVATE
-
-    Qt6::Widgets
-)
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_InspectorDeferredRefreshTest
-
-    COMMAND
-
-    DesktopSceneEngine_InspectorDeferredRefreshTest
-)
-
-
-add_executable(
-    DesktopSceneEngine_CanvasChromeFrameTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_CanvasChromeFrameTest
-    PRIVATE
-
-    Player/CanvasChromeFrameTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_CanvasChromeFrameTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_CanvasChromeFrameTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_CanvasChromeFrameTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_CanvasChromeFrameTest
-    PRIVATE
-
-    Qt6::Widgets
-)
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_CanvasChromeFrameTest
-
-    COMMAND
-
-    DesktopSceneEngine_CanvasChromeFrameTest
-)
-
-
-add_executable(
     DesktopSceneEngine_RepresentativeFrameCacheContractTest
 )
 
@@ -3452,7 +3227,6 @@ add_test(
 
 
 if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
-
 add_executable(
     DesktopSceneEngine_RepresentativeFrameStoreIntegrationTest
 )
@@ -3514,680 +3288,8 @@ if(WIN32)
 endif()
 
 
-add_test(
-    NAME
-
-    DesktopSceneEngine_RepresentativeFrameStoreIntegrationTest
-
-    COMMAND
-
-    DesktopSceneEngine_RepresentativeFrameStoreIntegrationTest
-)
-
+add_dse_external_media_test(DesktopSceneEngine_RepresentativeFrameStoreIntegrationTest)
 endif()
-
-
-add_executable(
-    DesktopSceneEngine_BackgroundMusicWindowTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_BackgroundMusicWindowTest
-    PRIVATE
-
-    Player/BackgroundMusicWindowTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_BackgroundMusicWindowTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-    ${CMAKE_SOURCE_DIR}/Engine/include
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_BackgroundMusicWindowTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_BackgroundMusicWindowTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_BackgroundMusicWindowTest
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-)
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_BackgroundMusicWindowTest
-
-    COMMAND
-
-    DesktopSceneEngine_BackgroundMusicWindowTest
-)
-
-
-add_executable(
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-    PRIVATE
-
-    Player/MainWindowBackgroundMusicLifecycleTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-    ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-    ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-    ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp
-)
-
-
-set_target_properties(
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-    PROPERTIES
-
-    AUTOMOC ON
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-    ${CMAKE_SOURCE_DIR}/Engine/src
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-)
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-
-    COMMAND
-
-    DesktopSceneEngine_MainWindowBackgroundMusicLifecycleTest
-)
-
-
-if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
-
-add_executable(
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-    PRIVATE
-
-    Player/MainWindowBackgroundMusicForwardingTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-    ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-    ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-    ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp
-)
-
-
-set_target_properties(
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-    PROPERTIES
-
-    AUTOMOC ON
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-    ${CMAKE_SOURCE_DIR}/Engine/src
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_compile_definitions(
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-    PRIVATE
-
-    DESKTOP_SCENE_ENGINE_TEST_RESOURCES_DIR="${DESKTOP_SCENE_ENGINE_EXTERNAL_FIXTURES_DIR}"
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-)
-
-
-if(WIN32)
-
-    deploy_ffmpeg_dlls(DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest)
-
-endif()
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-
-    COMMAND
-
-    DesktopSceneEngine_MainWindowBackgroundMusicForwardingTest
-)
-
-endif()
-
-
-if(DSE_EXTERNAL_FIXTURES_AVAILABLE)
-
-add_executable(
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-    PRIVATE
-
-    Player/MainWindowPlaybackSequenceTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-    ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-    ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-    ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp
-)
-
-
-set_target_properties(
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-    PROPERTIES
-
-    AUTOMOC ON
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-    ${CMAKE_SOURCE_DIR}/Engine/src
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_compile_definitions(
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-    PRIVATE
-
-    DESKTOP_SCENE_ENGINE_TEST_RESOURCES_DIR="${DESKTOP_SCENE_ENGINE_EXTERNAL_FIXTURES_DIR}"
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-)
-
-
-if(WIN32)
-
-    deploy_ffmpeg_dlls(DesktopSceneEngine_MainWindowPlaybackSequenceTest)
-
-endif()
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-
-    COMMAND
-
-    DesktopSceneEngine_MainWindowPlaybackSequenceTest
-)
-
-endif()
-
-
-add_executable(
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-    PRIVATE
-
-    Player/MainWindowPlaybackModeUiTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-    ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-    ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-    ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp
-)
-
-
-set_target_properties(
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-    PROPERTIES
-
-    AUTOMOC ON
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-    ${CMAKE_SOURCE_DIR}/Engine/src
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-add_dependencies(
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-
-    DesktopSceneEngine_QtPlayer_lrelease
-)
-
-
-add_custom_command(
-    TARGET DesktopSceneEngine_MainWindowPlaybackModeUiTest
-    POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-        $<TARGET_FILE_DIR:DesktopSceneEngine_MainWindowPlaybackModeUiTest>/i18n
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
-        $<TARGET_FILE_DIR:DesktopSceneEngine_MainWindowPlaybackModeUiTest>/i18n
-    VERBATIM
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-)
-
-
-if(WIN32)
-
-    deploy_ffmpeg_dlls(DesktopSceneEngine_MainWindowPlaybackModeUiTest)
-
-endif()
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-
-    COMMAND
-
-    DesktopSceneEngine_MainWindowPlaybackModeUiTest
-)
-
-
-add_executable(
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-    PRIVATE
-
-    Player/MainWindowAvailabilityOrderingUiTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-    ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-    ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-    ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp
-)
-
-
-set_target_properties(
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-    PROPERTIES
-
-    AUTOMOC ON
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-    ${CMAKE_SOURCE_DIR}/Engine/src
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-add_dependencies(
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-
-    DesktopSceneEngine_QtPlayer_lrelease
-)
-
-
-add_custom_command(
-    TARGET DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-    POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-        $<TARGET_FILE_DIR:DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest>/i18n
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
-        $<TARGET_FILE_DIR:DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest>/i18n
-    VERBATIM
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-)
-
-
-if(WIN32)
-
-    deploy_ffmpeg_dlls(DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest)
-
-endif()
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-
-    COMMAND
-
-    DesktopSceneEngine_MainWindowAvailabilityOrderingUiTest
-)
-
-
-add_executable(
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-    PRIVATE
-
-    Player/MainWindowDocumentLifecycleTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-    ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-    ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-    ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-    ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-    ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-    ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-    ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp
-)
-
-
-set_target_properties(
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-    PROPERTIES
-
-    AUTOMOC ON
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-    ${CMAKE_SOURCE_DIR}/Engine/src
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-add_dependencies(
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-
-    DesktopSceneEngine_QtPlayer_lrelease
-)
-
-
-add_custom_command(
-    TARGET DesktopSceneEngine_MainWindowDocumentLifecycleTest
-    POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-        $<TARGET_FILE_DIR:DesktopSceneEngine_MainWindowDocumentLifecycleTest>/i18n
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
-        $<TARGET_FILE_DIR:DesktopSceneEngine_MainWindowDocumentLifecycleTest>/i18n
-    VERBATIM
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-)
-
-
-if(WIN32)
-
-    deploy_ffmpeg_dlls(DesktopSceneEngine_MainWindowDocumentLifecycleTest)
-
-endif()
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-
-    COMMAND
-
-    DesktopSceneEngine_MainWindowDocumentLifecycleTest
-)
 
 
 add_executable(
@@ -4238,11 +3340,16 @@ target_link_libraries(
 )
 
 
-add_dependencies(
-    DesktopSceneEngine_ApplicationPreferencesTest
-
-    DesktopSceneEngine_QtPlayer_lrelease
-)
+if(TARGET DesktopSceneEngine_QtPlayer_lrelease)
+    add_dependencies(DesktopSceneEngine_ApplicationPreferencesTest DesktopSceneEngine_QtPlayer_lrelease)
+    set(preferences_test_catalog "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm")
+else()
+    find_package(Qt6 CONFIG REQUIRED COMPONENTS LinguistTools)
+    qt_add_lrelease(DesktopSceneEngine_ApplicationPreferencesTest
+        TS_FILES "${CMAKE_SOURCE_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.ts"
+        QM_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/i18n"
+        QM_FILES_OUTPUT_VARIABLE preferences_test_catalog)
+endif()
 
 
 add_custom_command(
@@ -4251,7 +3358,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E make_directory
         $<TARGET_FILE_DIR:DesktopSceneEngine_ApplicationPreferencesTest>/i18n
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
+        "${preferences_test_catalog}"
         $<TARGET_FILE_DIR:DesktopSceneEngine_ApplicationPreferencesTest>/i18n
     VERBATIM
 )
@@ -4604,66 +3711,6 @@ add_test(
 )
 
 
-add_executable(
-    DesktopSceneEngine_LauncherWindowTest
-)
-
-
-target_sources(
-    DesktopSceneEngine_LauncherWindowTest
-    PRIVATE
-
-    Player/LauncherWindowTest.cpp
-    ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-    ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp
-    ${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp
-)
-
-
-target_include_directories(
-    DesktopSceneEngine_LauncherWindowTest
-    PRIVATE
-
-    ${CMAKE_SOURCE_DIR}/Player
-)
-
-
-target_compile_features(
-    DesktopSceneEngine_LauncherWindowTest
-    PRIVATE
-
-    cxx_std_20
-)
-
-
-target_compile_options(
-    DesktopSceneEngine_LauncherWindowTest
-    PRIVATE
-
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
-
-target_link_libraries(
-    DesktopSceneEngine_LauncherWindowTest
-    PRIVATE
-
-    DesktopSceneEngine::Engine
-    Qt6::Widgets
-)
-
-
-add_test(
-    NAME
-
-    DesktopSceneEngine_LauncherWindowTest
-
-    COMMAND
-
-    DesktopSceneEngine_LauncherWindowTest
-)
-
 if(WIN32)
     find_package(Qt6 CONFIG REQUIRED COMPONENTS Network)
 
@@ -4714,264 +3761,134 @@ if(WIN32)
         set_tests_properties(DesktopSceneEngine_ApplicationIconTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
     endif()
 
-    add_executable(DesktopSceneEngine_InstanceProductionProcessTest
-        Player/InstanceProductionProcessTest.cpp
-        ${CMAKE_SOURCE_DIR}/Player/InstanceAdmission.cpp
-        ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp)
-    target_include_directories(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
-    target_compile_features(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_compile_definitions(DesktopSceneEngine_InstanceProductionProcessTest
-        PRIVATE P0_PLAYER_EXECUTABLE="$<TARGET_FILE:DesktopSceneEngine_QtPlayer>")
-    target_link_libraries(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE DesktopSceneEngine::Engine Qt6::Core user32 advapi32 ole32 oleaut32 uiautomationcore)
-    add_dependencies(DesktopSceneEngine_InstanceProductionProcessTest DesktopSceneEngine_QtPlayer)
-    foreach(case launcher session launcher-race session-race different restart crash launcher-crash launcher-crash-bootstrap launcher-crash-unobserved-teardown normal-close coordinator-lifetime coordinator-direct session-visibility hidden-close-exit)
-        add_test(NAME DesktopSceneEngine_InstanceProduction_${case} COMMAND DesktopSceneEngine_InstanceProductionProcessTest ${case})
-        set_tests_properties(DesktopSceneEngine_InstanceProduction_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
-    endforeach()
-
-    add_executable(DesktopSceneEngine_ApplicationCoordinatorTest
-        Player/ApplicationCoordinatorTest.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ApplicationCoordinator.cpp
-        ${CMAKE_SOURCE_DIR}/Player/SessionPresentation.cpp
-        ${CMAKE_SOURCE_DIR}/Player/InstanceActivation.cpp
-        ${CMAKE_SOURCE_DIR}/Player/InstanceAdmission.cpp
-        ${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp)
-    target_include_directories(DesktopSceneEngine_ApplicationCoordinatorTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
-    target_compile_features(DesktopSceneEngine_ApplicationCoordinatorTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_ApplicationCoordinatorTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_link_libraries(DesktopSceneEngine_ApplicationCoordinatorTest
-        PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network advapi32 user32)
-    deploy_ffmpeg_dlls(DesktopSceneEngine_ApplicationCoordinatorTest)
-    foreach(case ui-lifetime protocol-lifetime bootstrap-timeout unavailable-join pending-teardown)
-        add_test(NAME DesktopSceneEngine_Coordinator_${case} COMMAND DesktopSceneEngine_ApplicationCoordinatorTest ${case})
-        set_tests_properties(DesktopSceneEngine_Coordinator_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-    endforeach()
-
-    add_executable(DesktopSceneEngine_InstanceSessionLifecycleTest
-        Player/InstanceSessionLifecycleTest.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ApplicationCoordinator.cpp
-        ${CMAKE_SOURCE_DIR}/Player/Player.manifest
-        ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-        ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-        ${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp
-        ${CMAKE_SOURCE_DIR}/Player/InstanceAdmission.cpp
-        ${CMAKE_SOURCE_DIR}/Player/InstanceActivation.cpp
-        ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-        ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-        ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-        ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-        ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp)
-    set_target_properties(DesktopSceneEngine_InstanceSessionLifecycleTest PROPERTIES AUTOMOC ON)
-    target_include_directories(DesktopSceneEngine_InstanceSessionLifecycleTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
-    target_compile_features(DesktopSceneEngine_InstanceSessionLifecycleTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_InstanceSessionLifecycleTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_compile_definitions(DesktopSceneEngine_InstanceSessionLifecycleTest PRIVATE P0_PLAYER_EXECUTABLE="$<TARGET_FILE:DesktopSceneEngine_QtPlayer>")
-    target_link_libraries(DesktopSceneEngine_InstanceSessionLifecycleTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network advapi32 user32)
-    add_dependencies(DesktopSceneEngine_InstanceSessionLifecycleTest DesktopSceneEngine_QtPlayer)
-    deploy_ffmpeg_dlls(DesktopSceneEngine_InstanceSessionLifecycleTest)
-    add_test(NAME DesktopSceneEngine_InstanceSessionLifecycleTest COMMAND DesktopSceneEngine_InstanceSessionLifecycleTest)
-    foreach(case tray-core tray-state tray-loss tray-expiry tray-epoch tray-stale tray-maximized tray-playing tray-modal tray-native-modal tray-unqualified tray-unavailable tray-retire-control tray-pending tray-ending tray-delayed-batch tray-expired-permit tray-backpressure)
-        add_test(NAME DesktopSceneEngine_SessionPresentation_${case} COMMAND DesktopSceneEngine_InstanceSessionLifecycleTest ${case})
-        set_tests_properties(DesktopSceneEngine_SessionPresentation_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-    endforeach()
-    set_tests_properties(DesktopSceneEngine_InstanceSessionLifecycleTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-
-    get_target_property(tray_role_sources DesktopSceneEngine_InstanceSessionLifecycleTest SOURCES)
-    list(REMOVE_ITEM tray_role_sources Player/InstanceSessionLifecycleTest.cpp)
-    add_executable(DesktopSceneEngine_TrayRolePresentationTest Player/TrayRolePresentationTest.cpp ${tray_role_sources})
-    set_target_properties(DesktopSceneEngine_TrayRolePresentationTest PROPERTIES AUTOMOC ON)
-    target_include_directories(DesktopSceneEngine_TrayRolePresentationTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
-    target_compile_features(DesktopSceneEngine_TrayRolePresentationTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_TrayRolePresentationTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_link_libraries(DesktopSceneEngine_TrayRolePresentationTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network advapi32 user32)
-    deploy_ffmpeg_dlls(DesktopSceneEngine_TrayRolePresentationTest)
-    add_dependencies(DesktopSceneEngine_TrayRolePresentationTest DesktopSceneEngine_QtPlayer_lrelease)
-    add_custom_command(TARGET DesktopSceneEngine_TrayRolePresentationTest POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:DesktopSceneEngine_TrayRolePresentationTest>/i18n
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
-            $<TARGET_FILE_DIR:DesktopSceneEngine_TrayRolePresentationTest>/i18n VERBATIM)
-    foreach(case menu launcher all lifecycle ordering modal qualification snapshot terminal-loss replacement overlap unavailable nonactivation native-modal-all application-modal-all drain-join)
-        add_test(NAME DesktopSceneEngine_TrayRoles_${case} COMMAND DesktopSceneEngine_TrayRolePresentationTest ${case})
-        set_tests_properties(DesktopSceneEngine_TrayRoles_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-    endforeach()
-
-    add_executable(DesktopSceneEngine_TrayControlPresentationTest Player/TrayControlPresentationTest.cpp ${tray_role_sources})
-    set_target_properties(DesktopSceneEngine_TrayControlPresentationTest PROPERTIES AUTOMOC ON)
-    target_include_directories(DesktopSceneEngine_TrayControlPresentationTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
-    target_compile_features(DesktopSceneEngine_TrayControlPresentationTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_TrayControlPresentationTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_link_libraries(DesktopSceneEngine_TrayControlPresentationTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network advapi32 user32)
-    deploy_ffmpeg_dlls(DesktopSceneEngine_TrayControlPresentationTest)
-    foreach(scale 1 1.5 2)
-        add_test(NAME DesktopSceneEngine_TrayControl_dpi-${scale} COMMAND DesktopSceneEngine_TrayControlPresentationTest)
-        set_tests_properties(DesktopSceneEngine_TrayControl_dpi-${scale} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60 ENVIRONMENT "QT_SCALE_FACTOR=${scale}")
-    endforeach()
-
-    add_executable(DesktopSceneEngine_GlobalLanguageSettingsTest
-        Player/GlobalLanguageSettingsTest.cpp
-        ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-        ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-        ${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp
-        ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-        ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-        ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-        ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-        ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp)
-    set_target_properties(DesktopSceneEngine_GlobalLanguageSettingsTest PROPERTIES AUTOMOC ON)
-    target_include_directories(DesktopSceneEngine_GlobalLanguageSettingsTest
-        PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/tests/Player ${CMAKE_SOURCE_DIR}/Engine/src)
-    target_compile_features(DesktopSceneEngine_GlobalLanguageSettingsTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_GlobalLanguageSettingsTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_link_libraries(DesktopSceneEngine_GlobalLanguageSettingsTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets user32)
-    add_dependencies(DesktopSceneEngine_GlobalLanguageSettingsTest DesktopSceneEngine_QtPlayer_lrelease)
-    add_custom_command(TARGET DesktopSceneEngine_GlobalLanguageSettingsTest POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:DesktopSceneEngine_GlobalLanguageSettingsTest>/i18n
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
-            $<TARGET_FILE_DIR:DesktopSceneEngine_GlobalLanguageSettingsTest>/i18n VERBATIM)
-    deploy_ffmpeg_dlls(DesktopSceneEngine_GlobalLanguageSettingsTest)
-    foreach(case launcher authority persistence rejected-commit partial-success native-persistence consumer-clean consumer-dirty startup queued-lifecycle processes)
-        add_test(NAME DesktopSceneEngine_GlobalLanguage_${case} COMMAND DesktopSceneEngine_GlobalLanguageSettingsTest ${case})
-    endforeach()
-
-    add_executable(DesktopSceneEngine_MainWindowDesktopPresentationTest
-        Player/MainWindowDesktopPresentationTest.cpp
-        ${CMAKE_SOURCE_DIR}/Player/Player.manifest
-        ${CMAKE_SOURCE_DIR}/Player/MainWindow.h
-        ${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ApplicationPreferences.cpp
-        ${CMAKE_SOURCE_DIR}/Player/DisplaySelectionState.cpp
-        ${CMAKE_SOURCE_DIR}/Player/ActivePlaybackProjection.cpp
-        ${CMAKE_SOURCE_DIR}/Player/PreviewViewportHost.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewProvider.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewWorker.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPreloadPlanner.cpp
-        ${CMAKE_SOURCE_DIR}/Player/TimelinePreviewPresentation.cpp
-        ${CMAKE_SOURCE_DIR}/Player/CanvasChromeFrame.cpp
-        ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicControlAdapter.cpp
-        ${CMAKE_SOURCE_DIR}/Player/BackgroundMusicWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/WorkspaceModel.cpp)
-    set_target_properties(DesktopSceneEngine_MainWindowDesktopPresentationTest PROPERTIES AUTOMOC ON)
-    target_include_directories(DesktopSceneEngine_MainWindowDesktopPresentationTest
-        PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
-    target_compile_features(DesktopSceneEngine_MainWindowDesktopPresentationTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_MainWindowDesktopPresentationTest
-        PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_link_libraries(DesktopSceneEngine_MainWindowDesktopPresentationTest
-        PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network user32 advapi32)
-    target_sources(DesktopSceneEngine_MainWindowDesktopPresentationTest PRIVATE
-        ${CMAKE_SOURCE_DIR}/Player/ApplicationCoordinator.cpp
-        ${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp
-        ${CMAKE_SOURCE_DIR}/Player/InstanceAdmission.cpp
-        ${CMAKE_SOURCE_DIR}/Player/InstanceActivation.cpp
-        ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp)
-    add_test(NAME DesktopSceneEngine_SessionPresentation_tray-deployed
-        COMMAND DesktopSceneEngine_MainWindowDesktopPresentationTest --tray-deployed)
-    foreach(case menu visible hidden stale disconnected minimized failure disconnect-flight revision detach sequential showall loss peer rapid busy translation unavailable unavailable-flight)
-        add_test(NAME DesktopSceneEngine_TrayDeployment_${case}
-            COMMAND DesktopSceneEngine_MainWindowDesktopPresentationTest --tray-deployment-${case})
-        set_tests_properties(DesktopSceneEngine_TrayDeployment_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-    endforeach()
-    set_tests_properties(DesktopSceneEngine_SessionPresentation_tray-deployed PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-    foreach(case menu launcher-minimized launcher-hidden launcher-settings clean minimized-clean hidden-clean visible-cancel visible-save visible-discard hidden-save hidden-discard hidden-cancel save-as-cancel save-failure modal bgm-modal native-modal bgm-native-modal query query-old control-loss show-pending showall-pending duplicate pending-wait uncertain deploy-race peer-last peer-replacement peer-late peer-pending-death)
-        add_test(NAME DesktopSceneEngine_TrayClose_${case}
-            COMMAND DesktopSceneEngine_MainWindowDesktopPresentationTest --tray-close-${case})
-        set_tests_properties(DesktopSceneEngine_TrayClose_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-    endforeach()
-    add_dependencies(DesktopSceneEngine_MainWindowDesktopPresentationTest
-        DesktopSceneEngine_QtPlayer_lrelease)
-    add_custom_command(TARGET DesktopSceneEngine_MainWindowDesktopPresentationTest POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory
-            $<TARGET_FILE_DIR:DesktopSceneEngine_MainWindowDesktopPresentationTest>/i18n
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
-            $<TARGET_FILE_DIR:DesktopSceneEngine_MainWindowDesktopPresentationTest>/i18n
-        VERBATIM)
-    deploy_ffmpeg_dlls(DesktopSceneEngine_MainWindowDesktopPresentationTest)
-    add_test(NAME DesktopSceneEngine_MainWindowDesktopPresentationTest
-        COMMAND DesktopSceneEngine_MainWindowDesktopPresentationTest)
-
-    # Real independent Session children, ordinary Close and current coordinator.
-    get_target_property(tray_close_all_sources DesktopSceneEngine_MainWindowDesktopPresentationTest SOURCES)
-    list(REMOVE_ITEM tray_close_all_sources Player/MainWindowDesktopPresentationTest.cpp)
-    add_executable(DesktopSceneEngine_TrayCloseAllTest Player/TrayCloseAllTest.cpp ${tray_close_all_sources})
-    set_target_properties(DesktopSceneEngine_TrayCloseAllTest PROPERTIES AUTOMOC ON)
-    target_include_directories(DesktopSceneEngine_TrayCloseAllTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
-    target_compile_features(DesktopSceneEngine_TrayCloseAllTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_TrayCloseAllTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_link_libraries(DesktopSceneEngine_TrayCloseAllTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network user32 advapi32)
-    add_dependencies(DesktopSceneEngine_TrayCloseAllTest DesktopSceneEngine_QtPlayer_lrelease)
-    add_custom_command(TARGET DesktopSceneEngine_TrayCloseAllTest POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:DesktopSceneEngine_TrayCloseAllTest>/i18n
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/Player/i18n/DesktopSceneEngine_zh_CN.qm"
-            $<TARGET_FILE_DIR:DesktopSceneEngine_TrayCloseAllTest>/i18n VERBATIM)
-    deploy_ffmpeg_dlls(DesktopSceneEngine_TrayCloseAllTest)
-    foreach(case action order cancel later replacement busy pending uncertain all-abort save-as save-failure bgm-busy preexisting-close preexisting-request unavailable launcher-recreate pending-death ordinary-overlap old-result full-accept launcher-only discard save late-drain hidden translation)
-        add_test(NAME DesktopSceneEngine_TrayCloseAll_${case} COMMAND DesktopSceneEngine_TrayCloseAllTest ${case})
-        set_tests_properties(DesktopSceneEngine_TrayCloseAll_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-    endforeach()
-endif()
-
-if(TARGET DesktopSceneEngine_TrayCloseAllTest)
-    get_target_property(tray_recovery_sources DesktopSceneEngine_TrayCloseAllTest SOURCES)
-    list(REMOVE_ITEM tray_recovery_sources Player/TrayCloseAllTest.cpp)
-    add_executable(DesktopSceneEngine_TrayRecoveryTest Player/TrayRecoveryTest.cpp ${tray_recovery_sources})
-    set_target_properties(DesktopSceneEngine_TrayRecoveryTest PROPERTIES AUTOMOC ON)
-    target_include_directories(DesktopSceneEngine_TrayRecoveryTest PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
-    target_compile_features(DesktopSceneEngine_TrayRecoveryTest PRIVATE cxx_std_20)
-    target_compile_options(DesktopSceneEngine_TrayRecoveryTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
-    target_link_libraries(DesktopSceneEngine_TrayRecoveryTest PRIVATE DesktopSceneEngine::Engine Qt6::Widgets Qt6::Network user32 advapi32 ole32 oleaut32)
-    add_dependencies(DesktopSceneEngine_TrayRecoveryTest DesktopSceneEngine_QtPlayer)
-    qt_add_resources(DesktopSceneEngine_TrayRecoveryTest s7_application_icon
-        PREFIX "/icons" BASE "${CMAKE_SOURCE_DIR}/Player/resources"
-        FILES "${CMAKE_SOURCE_DIR}/Player/resources/DesktopSceneEngine.ico")
-    deploy_ffmpeg_dlls(DesktopSceneEngine_TrayRecoveryTest)
-    foreach(case death concurrent rejoin fencing relaunch shell shell-pending disconnect maximized-loss minimized-max-loss failed disconnect-death pending-death batch-death production-recovery gate-diagnostics prior-key-terminal prior-key-pending prior-key-fencing)
-        add_test(NAME DesktopSceneEngine_TrayRecovery_${case} COMMAND DesktopSceneEngine_TrayRecoveryTest ${case})
-        set_tests_properties(DesktopSceneEngine_TrayRecovery_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 65)
-    endforeach()
-endif()
-
-# Every existing MainWindow fixture builds the same local presentation implementation.
-get_property(session_fixture_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-foreach(session_fixture_target IN LISTS session_fixture_targets)
-    get_target_property(session_fixture_sources ${session_fixture_target} SOURCES)
-    list(FIND session_fixture_sources "${CMAKE_SOURCE_DIR}/Player/MainWindow.cpp" session_main_source)
-    list(FIND session_fixture_sources "${CMAKE_SOURCE_DIR}/Player/LauncherWindow.cpp" session_launcher_source)
-    list(FIND session_fixture_sources "${CMAKE_SOURCE_DIR}/Player/SessionPresentation.cpp" session_presentation_source)
-    if((NOT session_main_source EQUAL -1 OR NOT session_launcher_source EQUAL -1) AND session_presentation_source EQUAL -1)
-        target_sources(${session_fixture_target} PRIVATE ${CMAKE_SOURCE_DIR}/Player/SessionPresentation.cpp)
-    endif()
-    if(NOT session_launcher_source EQUAL -1)
-        target_sources(${session_fixture_target} PRIVATE ${CMAKE_SOURCE_DIR}/Player/DisplayPresentation.cpp)
-    endif()
-    if(NOT session_main_source EQUAL -1 OR NOT session_launcher_source EQUAL -1)
-        # S5 hidden ordinary-Close interactions reuse the existing activation helper.
-        # Compile that same helper in legacy local fixtures, not a test-only substitute.
-        foreach(session_activation_source InstanceActivation.cpp InstanceAdmission.cpp)
-            list(FIND session_fixture_sources "${CMAKE_SOURCE_DIR}/Player/${session_activation_source}" session_activation_index)
-            if(session_activation_index EQUAL -1)
-                target_sources(${session_fixture_target} PRIVATE "${CMAKE_SOURCE_DIR}/Player/${session_activation_source}")
-            endif()
+    if(TARGET DesktopSceneEngine_QtPlayer)
+        add_executable(DesktopSceneEngine_InstanceProductionProcessTest
+            Player/InstanceProductionProcessTest.cpp
+            ${CMAKE_SOURCE_DIR}/Player/InstanceAdmission.cpp
+            ${CMAKE_SOURCE_DIR}/Player/DisplaySessionBootstrap.cpp)
+        target_include_directories(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
+        target_compile_features(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE cxx_std_20)
+        target_compile_options(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+        target_compile_definitions(DesktopSceneEngine_InstanceProductionProcessTest
+            PRIVATE P0_PLAYER_EXECUTABLE="$<TARGET_FILE:DesktopSceneEngine_QtPlayer>")
+        target_link_libraries(DesktopSceneEngine_InstanceProductionProcessTest PRIVATE DesktopSceneEngine::Engine Qt6::Core user32 advapi32 ole32 oleaut32 uiautomationcore)
+        add_dependencies(DesktopSceneEngine_InstanceProductionProcessTest DesktopSceneEngine_QtPlayer)
+        foreach(case launcher session launcher-race session-race different restart crash launcher-crash launcher-crash-bootstrap launcher-crash-unobserved-teardown normal-close coordinator-lifetime coordinator-direct session-visibility hidden-close-exit)
+            add_test(NAME DesktopSceneEngine_InstanceProduction_${case} COMMAND DesktopSceneEngine_InstanceProductionProcessTest ${case})
+            set_tests_properties(DesktopSceneEngine_InstanceProduction_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
         endforeach()
-        target_link_libraries(${session_fixture_target} PRIVATE Qt6::Network advapi32 user32)
     endif()
+endif()
+
+if(WIN32 AND BUILD_PLAYER)
+    # The focused test includes the implementation to inspect the actual card
+    # rasterizer and HWND; do not also compile that .cpp into this target.
+    add_executable(DesktopSceneEngine_NativeTimelineHoverWindowTest Player/NativeTimelineHoverWindowTest.cpp)
+    target_include_directories(DesktopSceneEngine_NativeTimelineHoverWindowTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
+    target_compile_features(DesktopSceneEngine_NativeTimelineHoverWindowTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_NativeTimelineHoverWindowTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_NativeTimelineHoverWindowTest PRIVATE Qt6::Widgets user32 gdi32)
+    add_test(NAME DesktopSceneEngine_NativeTimelineHoverWindowTest COMMAND DesktopSceneEngine_NativeTimelineHoverWindowTest)
+    set_tests_properties(DesktopSceneEngine_NativeTimelineHoverWindowTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+endif()
+
+if(WIN32)
+    add_executable(DesktopSceneEngine_EnginePlaybackEofTest EnginePlaybackEofTest.cpp)
+    target_include_directories(DesktopSceneEngine_EnginePlaybackEofTest PRIVATE ${CMAKE_SOURCE_DIR}/Engine/src)
+    target_compile_features(DesktopSceneEngine_EnginePlaybackEofTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_EnginePlaybackEofTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_EnginePlaybackEofTest PRIVATE DesktopSceneEngine::Engine)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_EnginePlaybackEofTest)
+    add_test(NAME DesktopSceneEngine_EnginePlaybackEofTest COMMAND DesktopSceneEngine_EnginePlaybackEofTest)
+    set_tests_properties(DesktopSceneEngine_EnginePlaybackEofTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+endif()
+
+if(WIN32 AND BUILD_PLAYER)
+    add_executable(DesktopSceneEngine_SessionCompositionCapture Player/SessionCompositionCapture.cpp)
+    target_compile_features(DesktopSceneEngine_SessionCompositionCapture PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_SessionCompositionCapture PRIVATE /utf-8)
+    target_link_libraries(DesktopSceneEngine_SessionCompositionCapture PRIVATE d3d11 dxgi dwmapi windowsapp ole32 user32)
+endif()
+
+if(WIN32 AND BUILD_PLAYER)
+    add_executable(DesktopSceneEngine_SessionCompositionInputTest Player/SessionCompositionInputTest.cpp)
+    target_include_directories(DesktopSceneEngine_SessionCompositionInputTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
+    target_compile_features(DesktopSceneEngine_SessionCompositionInputTest PRIVATE cxx_std_20)
+    target_link_libraries(DesktopSceneEngine_SessionCompositionInputTest PRIVATE
+        DSE::ProductPresentation DSEIII::WebView2Loader Qt6::Widgets user32 UIAutomationCore)
+    add_test(NAME DesktopSceneEngine_SessionCompositionInputTest COMMAND DesktopSceneEngine_SessionCompositionInputTest)
+    set_tests_properties(DesktopSceneEngine_SessionCompositionInputTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+    add_executable(DesktopSceneEngine_SessionWebViewCompositionTest Player/SessionWebViewCompositionTest.cpp)
+    target_include_directories(DesktopSceneEngine_SessionWebViewCompositionTest
+        PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src/Rendering)
+    target_compile_features(DesktopSceneEngine_SessionWebViewCompositionTest PRIVATE cxx_std_20)
+    target_compile_definitions(DesktopSceneEngine_SessionWebViewCompositionTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(DesktopSceneEngine_SessionWebViewCompositionTest PRIVATE DSE::ProductPresentation Qt6::Widgets d3d11 dxgi dcomp user32 UIAutomationCore)
+    add_test(NAME DesktopSceneEngine_SessionWebViewCompositionTest COMMAND DesktopSceneEngine_SessionWebViewCompositionTest)
+    set_tests_properties(DesktopSceneEngine_SessionWebViewCompositionTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+endif()
+
+if(WIN32)
+    add_executable(DesktopSceneEngine_HostedCompositionContentTest
+        Rendering/HostedCompositionContentTest.cpp)
+    target_include_directories(DesktopSceneEngine_HostedCompositionContentTest
+        PRIVATE ${CMAKE_SOURCE_DIR}/Engine/src/Rendering)
+    target_compile_features(DesktopSceneEngine_HostedCompositionContentTest PRIVATE cxx_std_20)
+    target_compile_definitions(DesktopSceneEngine_HostedCompositionContentTest
+        PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(DesktopSceneEngine_HostedCompositionContentTest
+        PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_HostedCompositionContentTest
+        PRIVATE DesktopSceneEngine::Engine dxgi dcomp)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_HostedCompositionContentTest)
+    add_test(NAME DesktopSceneEngine_HostedCompositionContentTest
+        COMMAND DesktopSceneEngine_HostedCompositionContentTest)
+    set_tests_properties(DesktopSceneEngine_HostedCompositionContentTest
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+endif()
+
+# CP1 tests exercise the production bounded execution/producer implementations.
+if(WIN32)
+foreach(cp1_test AudioExecution AudioPcmPipe AudioSourcePreparation)
+    add_executable(DesktopSceneEngine_${cp1_test}Test Audio/${cp1_test}Test.cpp)
+    target_include_directories(DesktopSceneEngine_${cp1_test}Test PRIVATE ${CMAKE_SOURCE_DIR}/Engine/src)
+    target_compile_features(DesktopSceneEngine_${cp1_test}Test PRIVATE cxx_std_20)
+    target_link_libraries(DesktopSceneEngine_${cp1_test}Test PRIVATE DesktopSceneEngine::Engine)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_${cp1_test}Test)
+    if(cp1_test STREQUAL "AudioSourcePreparation")
+        add_test(NAME DesktopSceneEngine_${cp1_test}Test COMMAND DesktopSceneEngine_${cp1_test}Test "${CMAKE_CURRENT_SOURCE_DIR}/TestData/Audio")
+    else()
+        add_test(NAME DesktopSceneEngine_${cp1_test}Test COMMAND DesktopSceneEngine_${cp1_test}Test)
+    endif()
+    set_tests_properties(DesktopSceneEngine_${cp1_test}Test PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 endforeach()
+endif()
+
+if(TARGET DSE::Application)
+    add_executable(DesktopSceneEngine_SessionApplicationTest Player/SessionApplicationTest.cpp)
+    target_include_directories(DesktopSceneEngine_SessionApplicationTest PRIVATE ${CMAKE_SOURCE_DIR}/Player)
+    target_compile_features(DesktopSceneEngine_SessionApplicationTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_SessionApplicationTest PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_SessionApplicationTest PRIVATE DSE::Application Qt6::Core)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_SessionApplicationTest)
+    add_test(NAME DesktopSceneEngine_SessionApplicationTest COMMAND DesktopSceneEngine_SessionApplicationTest)
+    set_tests_properties(DesktopSceneEngine_SessionApplicationTest PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+
+    add_executable(DesktopSceneEngine_SessionRuntimeOperationTest Player/SessionRuntimeOperationTest.cpp)
+    target_include_directories(DesktopSceneEngine_SessionRuntimeOperationTest
+        PRIVATE ${CMAKE_SOURCE_DIR}/Player ${CMAKE_SOURCE_DIR}/Engine/src)
+    target_compile_features(DesktopSceneEngine_SessionRuntimeOperationTest PRIVATE cxx_std_20)
+    target_compile_options(DesktopSceneEngine_SessionRuntimeOperationTest PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus> $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+    target_link_libraries(DesktopSceneEngine_SessionRuntimeOperationTest PRIVATE DSE::Application Qt6::Widgets)
+    deploy_ffmpeg_dlls(DesktopSceneEngine_SessionRuntimeOperationTest)
+    foreach(case control-stall-completion reserved-close authored-rebuild)
+        add_test(NAME DesktopSceneEngine_SessionRuntime_${case}
+            COMMAND DesktopSceneEngine_SessionRuntimeOperationTest --cp3-${case})
+        set_tests_properties(DesktopSceneEngine_SessionRuntime_${case} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
+    add_test(NAME DesktopSceneEngine_SessionRuntime_bgm-authority
+        COMMAND DesktopSceneEngine_SessionRuntimeOperationTest --bgm-authority)
+    set_tests_properties(DesktopSceneEngine_SessionRuntime_bgm-authority PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+endif()

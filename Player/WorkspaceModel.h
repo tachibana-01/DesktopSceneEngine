@@ -136,6 +136,15 @@ struct WorkspacePlaylist
     bool enabled = true;
 };
 
+// Detached authored read value. No document/runtime/editor state or mutation API.
+struct AuthoredBackgroundMusicRead
+{
+    Domain::PlaylistId playlistId{};
+    Domain::BackgroundMusicQueue playlistMusic{};
+    std::optional<Domain::ItemId> itemId{};
+    std::optional<Domain::BackgroundMusicQueue> itemMusic{};
+};
+
 class WorkspaceModel final
 {
 public:
@@ -148,6 +157,8 @@ public:
     void resetAuthoredProject();
     [[nodiscard]] std::uint64_t authoredRevision() const noexcept;
     [[nodiscard]] const Domain::AuthoredProject& authoredProject() const noexcept;
+    [[nodiscard]] std::optional<AuthoredBackgroundMusicRead> authoredBackgroundMusic(
+        PlaylistId playlistId, std::optional<ItemId> itemId = std::nullopt) const;
     [[nodiscard]] const Domain::AuthoredPlaylist* authoredPlaylist(
         PlaylistId id) const noexcept;
     [[nodiscard]] const Domain::AuthoredItem* authoredItem(ItemId id) const noexcept;

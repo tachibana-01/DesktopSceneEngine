@@ -19,11 +19,18 @@ namespace DesktopSceneEngine::Platform::Audio
 namespace
 {
 
+struct EndpointNotificationState
+{
+    std::atomic<std::uint64_t> generation{0U};
+    std::atomic<std::uint32_t> inFlight{0U};
+    std::atomic_bool retiring{false};
+};
+
 class EndpointNotificationClient final : public IMMNotificationClient
 {
 public:
-    explicit EndpointNotificationClient(std::atomic<std::uint64_t>* generation) noexcept
-        : generation_(generation)
+    explicit EndpointNotificationClient(std::shared_ptr<EndpointNotificationState> state) noexcept
+        : state_(std::move(state))
     {
     }
 
@@ -84,10 +91,13 @@ public:
         LPCWSTR
     ) override
     {
-        if (flow == eRender && role == eConsole && generation_ != nullptr)
+        state_->inFlight.fetch_add(1U, std::memory_order_acq_rel);
+        if (!state_->retiring.load(std::memory_order_acquire)
+            && flow == eRender && role == eConsole)
         {
-            generation_->fetch_add(1U, std::memory_order_relaxed);
+            state_->generation.fetch_add(1U, std::memory_order_relaxed);
         }
+        state_->inFlight.fetch_sub(1U, std::memory_order_release);
         return S_OK;
     }
 
@@ -101,7 +111,8 @@ public:
 
 private:
     std::atomic<ULONG> referenceCount_{1U};
-    std::atomic<std::uint64_t>* generation_ = nullptr;
+    // A late COM callback can never reference a destroyed Engine atomic.
+    std::shared_ptr<EndpointNotificationState> state_;
 };
 
 }
@@ -110,13 +121,15 @@ private:
 
 struct DefaultAudioEndpointWatcher::Impl
 {
-    std::atomic<std::uint64_t> generation{0U};
 #if defined(_WIN32)
+    std::shared_ptr<EndpointNotificationState> state = std::make_shared<EndpointNotificationState>();
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator{};
     Microsoft::WRL::ComPtr<EndpointNotificationClient> callback{};
     bool comInitialized = false;
     bool registered = false;
     bool registrationReferenceHeld = false;
+#else
+    std::atomic<std::uint64_t> generation{0U};
 #endif
 };
 
@@ -142,6 +155,7 @@ bool DefaultAudioEndpointWatcher::initialize() noexcept
     {
         return true;
     }
+    impl_->state->retiring.store(false, std::memory_order_release);
 
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (comResult == S_OK || comResult == S_FALSE)
@@ -164,7 +178,7 @@ bool DefaultAudioEndpointWatcher::initialize() noexcept
     }
 
     EndpointNotificationClient* const callback = new (std::nothrow)
-        EndpointNotificationClient(&impl_->generation);
+        EndpointNotificationClient(impl_->state);
     if (callback == nullptr)
     {
         shutdown();
@@ -191,19 +205,27 @@ bool DefaultAudioEndpointWatcher::initialize() noexcept
 
 void DefaultAudioEndpointWatcher::shutdown() noexcept
 {
-    if (impl_ == nullptr)
+    while (!shutdownAndQuiesce())
     {
-        return;
+#if defined(_WIN32)
+        Sleep(1U);
+#endif
     }
+}
+
+bool DefaultAudioEndpointWatcher::shutdownAndQuiesce() noexcept
+{
+    if (impl_ == nullptr) return true;
 
 #if defined(_WIN32)
+    impl_->state->retiring.store(true, std::memory_order_release);
     if (impl_->registered && impl_->enumerator != nullptr && impl_->callback != nullptr)
     {
-        // The callback remains strongly held until this synchronous attempt
-        // returns. A failed unregister is diagnostic-only in this V1 watcher.
-        (void)impl_->enumerator->UnregisterEndpointNotificationCallback(impl_->callback.Get());
+        if (FAILED(impl_->enumerator->UnregisterEndpointNotificationCallback(impl_->callback.Get())))
+            return false;
     }
     impl_->registered = false;
+    if (impl_->state->inFlight.load(std::memory_order_acquire) != 0U) return false;
 
     if (impl_->registrationReferenceHeld && impl_->callback != nullptr)
     {
@@ -219,13 +241,17 @@ void DefaultAudioEndpointWatcher::shutdown() noexcept
         impl_->comInitialized = false;
     }
 #endif
+    return true;
 }
 
 std::uint64_t DefaultAudioEndpointWatcher::generation() const noexcept
 {
-    return impl_ == nullptr
-        ? 0U
-        : impl_->generation.load(std::memory_order_relaxed);
+    if (!impl_) return 0U;
+#if defined(_WIN32)
+    return impl_->state->generation.load(std::memory_order_relaxed);
+#else
+    return impl_->generation.load(std::memory_order_relaxed);
+#endif
 }
 
 void DefaultAudioEndpointWatcher::recordDefaultDeviceChangedForTesting(
@@ -235,7 +261,7 @@ void DefaultAudioEndpointWatcher::recordDefaultDeviceChangedForTesting(
 ) noexcept
 {
 #if defined(_WIN32)
-    EndpointNotificationClient callback{&impl_->generation};
+    EndpointNotificationClient callback{impl_->state};
     (void)callback.OnDefaultDeviceChanged(
         static_cast<EDataFlow>(flow),
         static_cast<ERole>(role),
@@ -250,7 +276,7 @@ void DefaultAudioEndpointWatcher::recordDefaultDeviceChangedForTesting(
 void DefaultAudioEndpointWatcher::recordOtherCallbacksForTesting() noexcept
 {
 #if defined(_WIN32)
-    EndpointNotificationClient callback{&impl_->generation};
+    EndpointNotificationClient callback{impl_->state};
     const PROPERTYKEY key{};
     (void)callback.OnDeviceStateChanged(L"device", 0U);
     (void)callback.OnDeviceAdded(L"device");
@@ -262,9 +288,9 @@ void DefaultAudioEndpointWatcher::recordOtherCallbacksForTesting() noexcept
 bool DefaultAudioEndpointWatcher::verifyCallbackComContractForTesting() noexcept
 {
 #if defined(_WIN32)
-    std::atomic<std::uint64_t> generation{0U};
+    auto state = std::make_shared<EndpointNotificationState>();
     EndpointNotificationClient* const callback = new (std::nothrow)
-        EndpointNotificationClient(&generation);
+        EndpointNotificationClient(std::move(state));
     if (callback == nullptr)
     {
         return false;

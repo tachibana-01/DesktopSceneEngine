@@ -29,7 +29,7 @@ makeScenePresentationRenderState(
         return std::nullopt;
     }
 
-    const auto geometry = Presentation::resolvePresentationGeometry({
+    return Presentation::resolvePresentationGeometry({
         sourceWidth,
         sourceHeight,
         canvasAspect.numerator,
@@ -37,20 +37,6 @@ makeScenePresentationRenderState(
         crop,
         layout,
         presentation});
-    if (!geometry)
-    {
-        return std::nullopt;
-    }
-
-    return Rendering::RenderPresentation{
-        {geometry->sourceUv.x,
-         geometry->sourceUv.y,
-         geometry->sourceUv.width,
-         geometry->sourceUv.height},
-        {geometry->destination.x,
-         geometry->destination.y,
-         geometry->destination.width,
-         geometry->destination.height}};
 }
 
 }

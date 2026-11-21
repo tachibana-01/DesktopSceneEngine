@@ -25,6 +25,16 @@ namespace DesktopSceneEngine::Resources
 namespace
 {
 
+bool cancelled(const std::atomic_bool* cancellation) noexcept
+{
+    return cancellation && cancellation->load(std::memory_order_acquire);
+}
+
+int interruptAudio(void* opaque) noexcept
+{
+    return cancelled(static_cast<const std::atomic_bool*>(opaque)) ? 1 : 0;
+}
+
 constexpr int OutputChannels = 2;
 constexpr int OutputSampleRate = 48000;
 constexpr std::size_t MaximumPendingPcmBytes = 1024U * 1024U;
@@ -151,6 +161,7 @@ struct SequentialAudioSourceImpl
     bool packetPending = false;
     Phase phase = Phase::ReadingPackets;
     AudioSourceStatus failureStatus = AudioSourceStatus::DecodeFailure;
+    const std::atomic_bool* cancellation = nullptr;
 };
 
 struct SequentialAudioSource::Impl final : SequentialAudioSourceImpl
@@ -343,6 +354,11 @@ bool advanceUntilPcmOrTerminal(SequentialAudioSourceImpl& impl) noexcept
         && impl.phase != SequentialAudioSourceImpl::Phase::Finished
         && impl.phase != SequentialAudioSourceImpl::Phase::Failed)
     {
+        if (cancelled(impl.cancellation))
+        {
+            fail(impl, AudioSourceStatus::ResourceFailure);
+            return false;
+        }
         switch (impl.phase)
         {
         case SequentialAudioSourceImpl::Phase::ReadingPackets:
@@ -498,14 +514,18 @@ bool initializeSession(
         }
 
         const std::string pathUtf8 = pathAsUtf8(path);
-        AVFormatContext* rawFormat = nullptr;
+        if (cancelled(candidate.cancellation)) return false;
+        AVFormatContext* rawFormat = avformat_alloc_context();
+        if (!rawFormat) { failureStatus = AudioSourceStatus::ResourceFailure; return false; }
+        rawFormat->interrupt_callback = {interruptAudio, const_cast<std::atomic_bool*>(candidate.cancellation)};
         if (avformat_open_input(&rawFormat, pathUtf8.c_str(), nullptr, nullptr) < 0)
         {
+            avformat_close_input(&rawFormat);
             failureStatus = AudioSourceStatus::OpenFailure;
             return false;
         }
         candidate.format.reset(rawFormat);
-        if (avformat_find_stream_info(candidate.format.get(), nullptr) < 0)
+        if (cancelled(candidate.cancellation) || avformat_find_stream_info(candidate.format.get(), nullptr) < 0)
         {
             failureStatus = AudioSourceStatus::OpenFailure;
             return false;
@@ -588,14 +608,14 @@ SequentialAudioSource::SequentialAudioSource() = default;
 
 SequentialAudioSource::~SequentialAudioSource() = default;
 
-bool SequentialAudioSource::open(const std::filesystem::path& source) noexcept
+bool SequentialAudioSource::open(const std::filesystem::path& source, const std::atomic_bool* cancellation) noexcept
 {
     try
     {
         impl_.reset();
         sourcePath_ = source;
         status_ = AudioSourceStatus::OpenFailure;
-        if (sourcePath_.empty())
+        if (sourcePath_.empty() || cancelled(cancellation))
         {
             return false;
         }
@@ -603,12 +623,14 @@ bool SequentialAudioSource::open(const std::filesystem::path& source) noexcept
         std::unique_ptr<Impl> candidate{};
         AudioSourceStatus failureStatus = AudioSourceStatus::OpenFailure;
         candidate = std::make_unique<Impl>();
+        candidate->cancellation = cancellation;
         if (!initializeSession(sourcePath_, *candidate, failureStatus))
         {
             status_ = failureStatus;
             return false;
         }
 
+        if (cancelled(cancellation)) return false;
         impl_ = std::move(candidate);
         status_ = AudioSourceStatus::Ready;
         return true;
@@ -630,7 +652,7 @@ bool SequentialAudioSource::reset() noexcept
         return false;
     }
 
-    return open(sourcePath_);
+    return open(sourcePath_, impl_ ? impl_->cancellation : nullptr);
 }
 
 bool SequentialAudioSource::isOpen() const noexcept
@@ -676,6 +698,7 @@ AudioReadResult SequentialAudioSource::readFrames(
                 : AudioReadStatus::Failure
         };
     }
+    if (cancelled(impl_->cancellation)) return {0U, AudioReadStatus::Failure};
     if (impl_->phase == Impl::Phase::Failed || status_ != AudioSourceStatus::Ready)
     {
         return {0U, AudioReadStatus::Failure};

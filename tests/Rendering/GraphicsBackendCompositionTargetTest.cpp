@@ -2092,6 +2092,44 @@ bool verifyCompositionOnlyRecoveryAndShutdownFence()
     return true;
 }
 
+bool verifyExplicitTargetPresentReceipt()
+{
+    TestWindow desktop, preview{320, 200, 800};
+    GraphicsBackend backend;
+    const auto previewId = backend.initialize({preview.window});
+    const auto desktopId = backend.attachPresentationTarget(compositionFor(desktop.window));
+    if (!require(previewId.isValid() && desktopId.isValid()
+            && backend.setPresentationPacingTarget(desktopId)
+            && backend.beginFrame() == FramePreparationResult::ReadyTargetsAvailable,
+            "desktop and Preview share the renderer before the initial Present"))
+        return false;
+    const auto previewAttempts = backend.presentationTargetDiagnosticsForTesting(previewId).presentAttemptCount;
+    if (!require(backend.renderPrepared({}, desktopId)
+            && backend.presentationTargetDiagnosticsForTesting(previewId).presentAttemptCount == previewAttempts,
+            "the exact desktop target presents an empty canvas without submitting Preview"))
+        return false;
+
+    if (!require(backend.forceNextDxgiPresentResultForTesting(desktopId, static_cast<std::int32_t>(S_FALSE))
+            && !backend.renderPrepared({}, desktopId),
+            "a non-S_OK DXGI status is not the exact target's Present receipt"))
+        return false;
+
+    if (!require(backend.forceNextDxgiPresentResultForTesting(desktopId, static_cast<std::int32_t>(E_FAIL))
+            && !backend.renderPrepared({}, desktopId)
+            && backend.presentationTargetDiagnosticsForTesting(previewId).presentAttemptCount == previewAttempts,
+            "desktop Present failure cannot reuse a prior success or another target's receipt"))
+        return false;
+    if (!require(backend.detachPresentationTarget(desktopId)
+            && !backend.renderPrepared({}, desktopId), "the retired target cannot report a Present"))
+        return false;
+    const auto retry = backend.attachPresentationTarget(compositionFor(desktop.window));
+    return require(retry.isValid() && retry != desktopId
+            && backend.setPresentationPacingTarget(retry)
+            && backend.beginFrame() == FramePreparationResult::ReadyTargetsAvailable
+            && backend.renderPrepared({}, retry),
+        "the same desktop endpoint can be attached and present again after cleanup");
+}
+
 bool verifyCompositionPresentFailuresAndDeviceLoss()
 {
     for (const bool lost : {false, true})
@@ -2275,7 +2313,8 @@ int main(int argc, char** argv)
         && verifyResizeAndUnavailableIsolation() && verifyInitiallySuspendedComposition()
         && verifyPublishedTargetSharedMutationFailureHandsOffToContainment()
         && verifyTrustedSameHwndReconstructionWaitsForOldBinding()
-        && verifyDisconnectFailures() && verifyCompositionPresentFailuresAndDeviceLoss()
+        && verifyDisconnectFailures() && verifyExplicitTargetPresentReceipt()
+        && verifyCompositionPresentFailuresAndDeviceLoss()
         && verifySharedCompositionFailureQuarantinesPeers()
         && verifyRequiredDisconnectSetterFailureContainsPeers()
         && verifyDisconnectSetterDeviceLostUsesGenerationRecovery()

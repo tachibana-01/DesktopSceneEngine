@@ -510,7 +510,7 @@ bool verifyInvalidValuesFallbackSafely()
         "Numeric false must be accepted");
 }
 
-bool verifySavedLanguageActivatesBeforeMainWindow()
+bool verifySavedLanguageActivatesBeforeProductWindow()
 {
     QTemporaryDir directory{};
     if (!require(directory.isValid(), "A temporary preferences directory is required"))
@@ -537,9 +537,9 @@ bool verifySavedLanguageActivatesBeforeMainWindow()
         return false;
     }
     if (!require(
-            QObject::tr("Display Session Unavailable")
-                == QString::fromUtf8("\xE6\x98\xBE\xE7\xA4\xBA\xE4\xBC\x9A\xE8\xAF\x9D\xE4\xB8\x8D\xE5\x8F\xAF\xE7\x94\xA8"),
-            "The startup diagnostic must be translated before any MainWindow exists"))
+            QCoreApplication::translate("ApplicationBootstrap", "Startup Error")
+                == QStringLiteral("\u542f\u52a8\u9519\u8bef"),
+            "The current startup diagnostic must be translated before any product window exists"))
     {
         return false;
     }
@@ -548,8 +548,8 @@ bool verifySavedLanguageActivatesBeforeMainWindow()
     return require(
                preferences.language == UiLanguage::English
                    && translationState.activeLanguage() == UiLanguage::English
-                   && QObject::tr("Display Session Unavailable")
-                       == QStringLiteral("Display Session Unavailable"),
+                   && QCoreApplication::translate("ApplicationBootstrap", "Startup Error")
+                       == QStringLiteral("Startup Error"),
                "Switching to English must remove the active application translation")
         && require(
             store.load().language == UiLanguage::SimplifiedChinese
@@ -574,7 +574,7 @@ int main(int argc, char* argv[])
             && verifyIndependentStoreWritesCompose(true)
             && verifyIndependentStoreWritesCompose(false)
             && verifyInvalidValuesFallbackSafely()
-            && verifySavedLanguageActivatesBeforeMainWindow()
+            && verifySavedLanguageActivatesBeforeProductWindow()
         ? 0
         : 1;
 }

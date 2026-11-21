@@ -203,6 +203,21 @@ bool MusicSession::ownsToken(MusicSourceToken token) const noexcept
     return static_cast<bool>(token) && sourceToken_ == token;
 }
 
+const std::optional<BackgroundMusicObservation::FailedAttempt>&
+MusicSession::lastFailedAttempt() const noexcept
+{
+    return lastFailedAttempt_;
+}
+
+void MusicSession::recordFailedAttempt(const MusicSourceFailed& event)
+{
+    if (ownsToken(event.token) && currentTrackId_.has_value())
+    {
+        lastFailedAttempt_ = BackgroundMusicObservation::FailedAttempt{
+            BackgroundMusicControl::TrackId{currentTrackId_->value}, event.stage, event.code};
+    }
+}
+
 std::vector<MusicRuntimeAction> MusicSession::reconcileConfig(
     const MusicQueueSnapshot& newConfig,
     PlaybackActivity activity,
@@ -392,6 +407,9 @@ std::vector<MusicRuntimeAction> MusicSession::switchToTrack(
 
     MusicSession candidate{*this};
     const std::optional<MusicSourceToken> oldToken = candidate.sourceToken_;
+    // Only an admitted explicit fresh switch supersedes the previous attempt.
+    // Automatic starts/recovery keep it, even when the successor succeeds.
+    candidate.lastFailedAttempt_.reset();
     if (candidate.config_.mode == MusicQueueMode::Shuffle)
     {
         candidate.removeFromShuffleBag(trackId);
@@ -550,6 +568,11 @@ bool MusicSession::hasSupportedSourcePaths(const MusicQueueSnapshot& newConfig) 
 
 void MusicSession::reconcileAttemptedTracks()
 {
+    if (lastFailedAttempt_.has_value()
+        && trackById(TrackId{lastFailedAttempt_->trackId.value}) == nullptr)
+    {
+        lastFailedAttempt_.reset();
+    }
     attemptedTrackIds_.erase(
         std::remove_if(
             attemptedTrackIds_.begin(),
@@ -653,6 +676,7 @@ float MusicSession::effectiveGainForCurrentTrack() const noexcept
 
 void MusicSession::clearForSilentQueue() noexcept
 {
+    lastFailedAttempt_.reset();
     phase_ = MusicSessionPhase::SilentEmptyQueue;
     currentTrackId_.reset();
     sourceToken_.reset();
@@ -813,6 +837,7 @@ void MusicSession::resetFailureTraversal() noexcept
 
 void MusicSession::enterNoPlayableTrack() noexcept
 {
+    currentTrackId_.reset();
     sourceToken_.reset();
     phase_ = MusicSessionPhase::NoPlayableTrack;
 }

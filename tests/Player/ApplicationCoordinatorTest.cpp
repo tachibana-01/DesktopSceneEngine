@@ -1,13 +1,11 @@
 #include "ApplicationCoordinator.h"
-#include "ApplicationPreferences.h"
-#include "LauncherWindow.h"
+#include "ProductWindowHost.h"
 
 #include <QApplication>
+#include <QCloseEvent>
 #include <QElapsedTimer>
 #include <QProcess>
 #include <QProcessEnvironment>
-#include <QSettings>
-#include <QTemporaryDir>
 #include <QThread>
 #include <QtEndian>
 
@@ -118,12 +116,27 @@ int sessionFixture(const QString& identity, quintptr foreignWindow)
     return QApplication::exec();
 }
 
+// Exercises Coordinator lifetime through a local product window. The real
+// Launcher WebView lifecycle is covered by LauncherSessionLifecycleTest.
+class CoordinatorTestWindow final : public ProductWindowHost
+{
+public:
+    explicit CoordinatorTestWindow(ApplicationCoordinator& coordinator)
+        : ProductWindowHost(ProductWindowRole::Launcher), coordinator_(coordinator) {}
+
+protected:
+    void closeEvent(QCloseEvent* event) override
+    {
+        ProductWindowHost::closeEvent(event);
+        if (event->isAccepted()) coordinator_.retireLauncher(*this);
+    }
+
+private:
+    ApplicationCoordinator& coordinator_;
+};
+
 struct CoordinatorFixture
 {
-    QTemporaryDir directory;
-    QSettings settings{directory.filePath("preferences.ini"), QSettings::IniFormat};
-    ApplicationPreferencesStore preferences{settings};
-    ApplicationTranslationState translation;
     InstanceSlot slot = launcherSlot();
     InstanceAdmissionLease admission;
     InstanceActivationEndpoint activation{slot};
@@ -135,11 +148,7 @@ struct CoordinatorFixture
     {
         require(admission.acquire(slot) == InstanceAdmissionOutcome::Acquired, "Existing coordinator: refuse interference");
         require(activation.listen() && coordinator.listen(), "Coordinator endpoints could not start");
-        coordinator.setLauncherFactory([this] {
-            auto* window = new LauncherWindow(translation, preferences);
-            window->setAcceptedCloseCallback([this, window] { coordinator.retireLauncher(*window); });
-            return window;
-        });
+        coordinator.setLauncherFactory([this] { return new CoordinatorTestWindow(coordinator); });
     }
 };
 

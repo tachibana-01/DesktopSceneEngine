@@ -68,6 +68,8 @@ MixedOutputBridgeResult MixedOutputBridge::pump() noexcept
         return {0U, MixedOutputBridgeStatus::NoWritableFrames};
     }
 
+    if (deadlineMaximumFrames_ != 0U && availability.writableFrames > deadlineMaximumFrames_)
+        return {0U, MixedOutputBridgeStatus::OutputContractFailure};
     if (!prepareBuffers(availability.writableFrames))
     {
         return {0U, MixedOutputBridgeStatus::ResourceFailure};
@@ -75,6 +77,13 @@ MixedOutputBridgeResult MixedOutputBridge::pump() noexcept
 
     const AudioMixResult mixerResult = mixer_.mixFrames(mixedF32_);
     return submitMixerResult(mixerResult, availability.writableFrames);
+}
+
+bool MixedOutputBridge::prepareDeadlineMode(std::size_t maximumFrames) noexcept
+{
+    if (maximumFrames == 0U || !prepareBuffers(maximumFrames)) return false;
+    deadlineMaximumFrames_ = maximumFrames;
+    return true;
 }
 
 bool MixedOutputBridge::prepareBuffers(std::size_t frameCount) noexcept

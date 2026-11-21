@@ -2,14 +2,9 @@
 
 Version: 1.1.0
 
-Status: Historical planning/checkpoint reference
+Status: Stable
 
 Last Updated: 2026-09-14
-
-> Publication note: this document preserves earlier planning and the Slice 4
-> checkpoint, including its then-current deferred work. It is not the current
-> completion state or next-task authority. See the [public README](../README.md#development-status)
-> for the prepared source's current capabilities; later sections remain historical.
 
 ---
 
@@ -42,13 +37,23 @@ Every completed milestone should leave the project in a usable state.
 
 # 3. Current Project Status
 
-This section records the historical Slice 4 checkpoint. Its phase descriptions,
-deferred lists and release progression are historical/strategic references, not
-current completion states or immediate-next-task requirements.
+DesktopSceneEngine III uses the production Windows Player. Launcher starts or
+opens a display-bound Session through the Coordinator. The Session editor and
+the separate background-music window use React and TypeScript in WebView2. The
+Engine provides native Preview and desktop deployment, and Qt 6 provides
+Windows application and platform services. See the [root README](../README.md)
+for the current build and startup instructions.
 
-Most recently completed milestone:
+Same-display instance admission is implemented in the normal Player startup.
+A Session slot is scoped to the interactive user, Windows session and bound
+display. The native mutex lease detects occupied slots, and IPC forwards
+activation requests to the existing instance. Launcher starts a new Session
+only through the Coordinator's display-bound admission path.
 
-**L6 — Windows Desktop Deployment, through Slice 4.**
+## Historical milestone — L6 Windows Desktop Deployment, through Slice 4
+
+The L6 milestone and the roadmap phases below record earlier checkpoints and
+long-term goals. They do not establish the current release or immediate work.
 
 | Slice | Status |
 | --- | --- |
@@ -57,7 +62,7 @@ Most recently completed milestone:
 | Slice 3 — Owned Raised-Desktop Presentation Host | CLOSED |
 | Slice 4 — Fixed-Session Desktop Deployment Lifecycle | CLOSED |
 
-Committed implementation checkpoint (branch `main`):
+Historical implementation checkpoint:
 
 ```text
 3b8bf6b24cdfdbd3b2835e7510e88fc83f05698e
@@ -77,7 +82,7 @@ Slice 4 closure evidence:
 - Final read-only adversarial review: P0: 0, P1: 0, P2: 0, P3: 0, Nitpick: 0;
   verdict `READY FOR NARROW SLICE 4 COMMIT`. The narrow shipping commit above is complete.
 
-Deferred work:
+Work deferred at the L6 Slice 4 checkpoint:
 
 - Explorer restart Human Gate / automatic Explorer recovery: **DEFERRED**. It is
   not unfinished Slice 4 work, a required Human Gate, or a Slice 4 shipping blocker.
@@ -85,15 +90,6 @@ Deferred work:
 - L6 Slice 5 — Coordinated Shared Graphics-Generation Recovery: **NOT STARTED**;
   **DEFERRED FROM THE IMMEDIATE NEXT TASK**. It remains future reliability work,
   not the mandatory next milestone because of its numeric order.
-- L7 — cross-process / same-display occupancy: **DEFERRED**. Mutex,
-  single-instance-per-display policy, IPC, registry, daemon, lock files, and
-  multi-session scheduling/occupancy mechanisms are possible future work, not
-  current requirements.
-
-Next planned activity (not started): a separate read-only/product-validation phase
-to audit existing authored-state, persistence, display ownership, and
-application-preference behavior before selecting the next feature milestone. This P0 checkpoint
-synchronization does not begin that audit.
 
 ---
 

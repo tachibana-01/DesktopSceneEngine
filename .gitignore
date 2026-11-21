@@ -3,7 +3,6 @@
 # ==============================
 
 build/
-/build-*/
 
 cmake-build-*/
 
@@ -67,13 +66,3 @@ Desktop.ini
 
 .vscode/
 vcpkg_installed/
-
-
-
-# ==============================
-# Local Media / Runtime Output
-# ==============================
-
-/TestResources/
-/Cache/
-/*.zip

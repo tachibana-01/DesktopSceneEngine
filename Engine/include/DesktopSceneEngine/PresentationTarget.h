@@ -15,13 +15,36 @@ class GraphicsBackend;
 enum class PresentationTransport : std::uint8_t
 {
     HwndSwapChain,
-    DirectCompositionSwapChain
+    DirectCompositionSwapChain,
+    // Windowless content only. Its consumer owns the composition tree.
+    HostedCompositionContent
+};
+
+struct PresentationExtent
+{
+    int width = 0;
+    int height = 0;
+};
+
+// Allocation pixels only: no UI placement, layout, clip or native window.
+// A zero dimension suspends rendering until a positive extent is requested.
+struct HostedCompositionTarget
+{
+    PresentationExtent extent{};
 };
 
 enum class CanvasOutsideMode : std::uint8_t
 {
     Opaque,
     Transparent
+};
+
+enum class PresentationUploadResult
+{
+    Updated,
+    ResourceFailure,
+    DeviceLost,
+    GraphicsUnavailable
 };
 
 class PresentationTargetId

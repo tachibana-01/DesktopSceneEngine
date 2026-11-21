@@ -58,12 +58,18 @@ public:
 
     [[nodiscard]] bool frameAt(float time) noexcept;
 
+    // True only when the most recent frameAt() call failed because the input
+    // ended and its decoder finished draining. Errors and cancellation are false.
+    [[nodiscard]] bool lastFrameAtReachedEndOfStream() const noexcept;
+
     [[nodiscard]] VideoFrameDecodeStatus frameAt(
         float time,
         const VideoFrameDecodeOptions& options
     ) noexcept;
 
     [[nodiscard]] bool open(const std::filesystem::path& path) noexcept;
+    [[nodiscard]] bool open(const std::filesystem::path& path,
+        const std::atomic_bool* cancellationRequested) noexcept;
 
     [[nodiscard]] bool nextFrame(float time) noexcept;
 

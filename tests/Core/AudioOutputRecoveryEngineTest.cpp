@@ -1,1051 +1,397 @@
+// CP1 coverage migration: all former recovery scenarios remain below. Device
+// failures/readiness are injected through the same A executor's external sink;
+// GUI update deltas, raw mixer mutations and exact GUI pump counts are gone.
+#include "AudioExecutionEngineFixture.h"
 #include <DesktopSceneEngine/BackgroundMusicControl.h>
-#include <DesktopSceneEngine/Domain/Playback.h>
-#include <DesktopSceneEngine/Domain/Project.h>
-#include <DesktopSceneEngine/Engine.h>
-
-#include "Core/AudioOutputRecoveryTestHooks.h"
-#include "Core/SharedAudioOutputRecoveryPolicy.h"
-#include "Core/SharedAudioOutputPolicy.h"
-#include "Audio/AudioMixer.h"
-#include "Audio/AudioMixerInput.h"
-#include "Music/BackgroundMusicExecutor.h"
-#include "Music/BackgroundMusicRuntime.h"
-#include "Resources/AudioResource.h"
-#include "Runtime/Playback/PlaybackRuntime.h"
-
-#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <iostream>
-#include <memory>
-#include <optional>
-#include <string>
-#include <span>
-#include <utility>
-#include <vector>
-
-namespace DesktopSceneEngine::Core
-{
-
-class AudioOutputRecoveryEngineTestAccess final
-{
-public:
-    static void preparePlayingEngine(Engine& engine, const Domain::Project& project)
-    {
-        engine.initialized_ = true;
-        engine.projectBound_ = true;
-        engine.boundProject_ = &project;
-        engine.playbackRuntime_ = std::make_unique<Runtime::PlaybackRuntime>();
-
-        Domain::Playback playback{};
-        playback.speed = 1.0F;
-        playback.loop = true;
-        engine.playbackRuntime_->configure(playback, 600.0F);
-    }
-
-    static void installHooks(Engine& engine, AudioOutputRecoveryTestHooks hooks)
-    {
-        engine.audioOutputRecoveryTestHooks_ = std::make_unique<AudioOutputRecoveryTestHooks>(
-            std::move(hooks));
-    }
-
-    [[nodiscard]] static double retryElapsedSeconds(const Engine& engine) noexcept
-    {
-        return engine.audioOutputRetryElapsedSeconds_;
-    }
-
-    [[nodiscard]] static AudioOutputOperationalState operationalState(
-        const Engine& engine
-    ) noexcept
-    {
-        return engine.audioOutputOperationalState_;
-    }
-
-    [[nodiscard]] static SharedAudioOutputState sharedOutputState(
-        const Engine& engine
-    ) noexcept
-    {
-        return static_cast<SharedAudioOutputState>(engine.sharedAudioOutputState_);
-    }
-
-    [[nodiscard]] static const void* audioOutputAddress(const Engine& engine) noexcept
-    {
-        return engine.audioOutput_.get();
-    }
-
-    [[nodiscard]] static bool hasActiveBackgroundMusic(const Engine& engine) noexcept
-    {
-        return engine.backgroundMusicExecutor_->hasActiveSources();
-    }
-
-    [[nodiscard]] static std::optional<Music::MusicSourceToken> playlistToken(
-        const Engine& engine
-    ) noexcept
-    {
-        const Music::MusicSession* const session = engine.backgroundMusicRuntime_->playlistSession();
-        return session == nullptr ? std::nullopt : session->sourceToken();
-    }
-
-    [[nodiscard]] static bool addSyntheticEmbeddedInput(
-        Engine& engine,
-        std::unique_ptr<Audio::AudioMixerInput> input
-    ) noexcept
-    {
-        const Audio::AudioInputHandle handle = engine.audioMixer_->addInput(std::move(input), 1.0F);
-        if (!handle)
-        {
-            return false;
-        }
-
-        engine.embeddedAudioInputHandleValue_ = handle.value;
-        return true;
-    }
-
-    [[nodiscard]] static bool hasEmbeddedInput(const Engine& engine) noexcept
-    {
-        return engine.embeddedAudioInputHandleValue_ != 0U;
-    }
-
-    [[nodiscard]] static bool reconcileOutput(Engine& engine) noexcept
-    {
-        return engine.reconcileAudioOutputState(true);
-    }
-
-    [[nodiscard]] static bool configureEmbeddedAudio(
-        Engine& engine,
-        const std::filesystem::path& path
-    )
-    {
-        auto resource = std::make_unique<Resources::AudioResource>();
-        if (!resource->open(path) || !resource->setTempo(1.0F))
-        {
-            return false;
-        }
-
-        engine.audioResource_ = std::move(resource);
-        return engine.configureEmbeddedAudioInputAt(
-            engine.playbackRuntime_->currentTime(),
-            engine.playbackRuntime_->configuration().speed);
-    }
-
-    [[nodiscard]] static std::uint64_t embeddedInputHandle(const Engine& engine) noexcept
-    {
-        return engine.embeddedAudioInputHandleValue_;
-    }
-};
-
-}
 
 namespace
 {
+using namespace DesktopSceneEngine;
+namespace T = Tests;
+using Lane = Audio::AudioLane;
+using Health = Audio::AudioOutputHealth;
+using Status = Audio::AudioBlockStatus;
+using Access = Core::AudioOutputRecoveryEngineTestAccess;
+using namespace BackgroundMusicControl;
 
-using DesktopSceneEngine::BackgroundMusicControl::ActiveScopeSnapshot;
-using DesktopSceneEngine::BackgroundMusicControl::Event;
-using DesktopSceneEngine::BackgroundMusicControl::PlaybackSessionStarted;
-using DesktopSceneEngine::BackgroundMusicControl::PlaylistId;
-using DesktopSceneEngine::BackgroundMusicControl::PlaylistMusicConfigChanged;
-using DesktopSceneEngine::BackgroundMusicControl::QueueMode;
-using DesktopSceneEngine::BackgroundMusicControl::QueueSnapshot;
-using DesktopSceneEngine::BackgroundMusicControl::TrackId;
-using DesktopSceneEngine::BackgroundMusicControl::TrackSnapshot;
-using DesktopSceneEngine::Audio::MixedOutputBridgeResult;
-using DesktopSceneEngine::Audio::MixedOutputBridgeStatus;
-using DesktopSceneEngine::Audio::AudioMixerInput;
-using DesktopSceneEngine::Audio::AudioMixerInputReadResult;
-using DesktopSceneEngine::Audio::AudioMixerInputReadStatus;
-using DesktopSceneEngine::Core::AudioOutputRecoveryEngineTestAccess;
-using DesktopSceneEngine::Core::AudioOutputRecoveryTestHooks;
-using DesktopSceneEngine::Core::AudioOutputOperationalState;
-using DesktopSceneEngine::Core::SharedAudioOutputState;
-
-bool require(bool condition, const char* message)
-{
-    if (condition)
-    {
-        return true;
-    }
-
-    std::cerr << "Test failed: " << message << std::endl;
-    return false;
-}
-
+bool require(bool value, const char* message)
+{ if (!value) std::cerr << "FAIL: " << message << '\n'; return value; }
 std::filesystem::path fixturePath()
-{
-    return std::filesystem::path{DESKTOP_SCENE_ENGINE_SEQUENTIAL_AUDIO_TEST_DATA_DIR}
-        / "SequentialAudioSourceStereo48k.wav";
-}
-
+{ return std::filesystem::path{DESKTOP_SCENE_ENGINE_SEQUENTIAL_AUDIO_TEST_DATA_DIR} / "SequentialAudioSourceStereo48k.wav"; }
 Event makeStartEvent()
 {
-    return PlaybackSessionStarted{ActiveScopeSnapshot{
-        PlaylistId{"recovery-playlist"},
-        QueueSnapshot{
-            {TrackSnapshot{TrackId{"recovery-track"}, fixturePath(), 1.0}},
-            QueueMode::ListLoop,
-            1.0},
-        std::nullopt,
-        std::nullopt}};
+    return PlaybackSessionStarted{ActiveScopeSnapshot{PlaylistId{"recovery-playlist"},
+        QueueSnapshot{{TrackSnapshot{TrackId{"recovery-track"}, fixturePath(), 1.0}}, QueueMode::ListLoop, 1.0},
+        std::nullopt, std::nullopt}};
 }
-
-Event makeGainChangeEvent(double trackVolume)
+auto token(const Engine& engine)
+{ return Core::BackgroundMusicEngineTestAccess::runtime(engine).playlistSession()->sourceToken(); }
+bool healthy(Engine& engine)
+{ return T::audioState(engine).health == Health::Healthy; }
+bool waitHealth(Engine& engine, Health health)
+{ return T::waitUntil(engine, [&] { return T::audioState(engine).health == health; }); }
+bool failDevice(T::AwaitAudioEngine& engine, Status failure = Status::DeviceFailure)
 {
-    return PlaylistMusicConfigChanged{
-        PlaylistId{"recovery-playlist"},
-        QueueSnapshot{
-            {TrackSnapshot{TrackId{"recovery-track"}, fixturePath(), trackVolume}},
-            QueueMode::ListLoop,
-            1.0}};
+    engine.device.availabilityResult.store(failure);
+    return waitHealth(engine, failure == Status::DeviceFailure ? Health::DeviceUnavailable : Health::ContractFaulted);
 }
-
-struct ScriptedOutput
+bool installEmbedded(T::AwaitAudioEngine& engine)
 {
-    std::vector<bool> initializeResults{true};
-    std::vector<DesktopSceneEngine::Audio::AudioBlockStatus> beginResults{
-        DesktopSceneEngine::Audio::AudioBlockStatus::Success};
-    std::vector<DesktopSceneEngine::Audio::AudioBlockStatus> pauseResults{
-        DesktopSceneEngine::Audio::AudioBlockStatus::Success};
-    std::vector<DesktopSceneEngine::Audio::AudioBlockStatus> resumeResults{
-        DesktopSceneEngine::Audio::AudioBlockStatus::Success};
-    std::vector<MixedOutputBridgeResult> pumpResults{
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-    std::size_t initializeCalls = 0U;
-    std::size_t shutdownCalls = 0U;
-    std::size_t beginCalls = 0U;
-    std::size_t pauseCalls = 0U;
-    std::size_t resumeCalls = 0U;
-    std::size_t pumpCalls = 0U;
-    std::uint64_t defaultAudioEndpointGeneration = 0U;
-    bool exposeDefaultAudioEndpointGeneration = false;
-    std::function<void()> onBegin{};
-    std::vector<DesktopSceneEngine::Platform::Audio::AudioBlockStartMode> beginModes{};
-
-    [[nodiscard]] AudioOutputRecoveryTestHooks hooks()
-    {
-        AudioOutputRecoveryTestHooks result{};
-        result.initialize = [this]()
-        {
-            const std::size_t index = initializeCalls++;
-            return index < initializeResults.size() ? initializeResults[index] : true;
-        };
-        result.shutdown = [this]()
-        {
-            ++shutdownCalls;
-        };
-        result.beginBlockMode = [this](const auto mode)
-        {
-            beginModes.push_back(mode);
-            const std::size_t index = beginCalls++;
-            if (onBegin)
-            {
-                onBegin();
-            }
-            return index < beginResults.size()
-                ? beginResults[index]
-                : DesktopSceneEngine::Audio::AudioBlockStatus::Success;
-        };
-        result.pause = [this]()
-        {
-            const std::size_t index = pauseCalls++;
-            return index < pauseResults.size()
-                ? pauseResults[index]
-                : DesktopSceneEngine::Audio::AudioBlockStatus::Success;
-        };
-        result.resume = [this]()
-        {
-            const std::size_t index = resumeCalls++;
-            return index < resumeResults.size()
-                ? resumeResults[index]
-                : DesktopSceneEngine::Audio::AudioBlockStatus::Success;
-        };
-        result.pump = [this]()
-        {
-            const std::size_t index = pumpCalls++;
-            return index < pumpResults.size()
-                ? pumpResults[index]
-                : MixedOutputBridgeResult{0U, MixedOutputBridgeStatus::WroteFrames};
-        };
-        if (exposeDefaultAudioEndpointGeneration)
-        {
-            result.defaultAudioEndpointGeneration = [this]()
-            {
-                return defaultAudioEndpointGeneration;
-            };
-        }
-        return result;
-    }
-};
-
-class SilentInput final : public AudioMixerInput
+    const auto path = fixturePath().parent_path() / "SequentialAudioSourceCompressed.flac";
+    return T::effect(engine, [&] {
+        Access::prepareEmbedded(engine, path);
+        return true;
+    }) && T::lane(engine, Lane::Embedded).has_value();
+}
+template<class Check> bool withBgm(Check check)
 {
-public:
-    [[nodiscard]] AudioMixerInputReadResult readFrames(
-        std::span<float> destination
-    ) noexcept override
-    {
-        std::fill(destination.begin(), destination.end(), 0.0F);
-        return {destination.size() / 2U, AudioMixerInputReadStatus::Data};
-    }
-};
-
-bool prepareBgmOnlyEngine(
-    DesktopSceneEngine::Engine& engine,
-    const DesktopSceneEngine::Domain::Project& project,
-    ScriptedOutput& output
-)
-{
-    AudioOutputRecoveryEngineTestAccess::preparePlayingEngine(engine, project);
-    AudioOutputRecoveryEngineTestAccess::installHooks(engine, output.hooks());
-    return engine.processBackgroundMusicControl(makeStartEvent());
+    T::AwaitAudioEngine engine;
+    if (!require(engine.processBackgroundMusicControl(makeStartEvent()) && T::lane(engine, Lane::PlaylistBgm),
+        "real prepared BGM registers through A and durable Started receipt")) return false;
+    const bool result = check(engine);
+    return T::shutdown(engine) && result;
 }
 
 bool verifyDeviceFailureDoesNotRecoverBeforeCooldown()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::DeviceFailure},
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "BGM-only setup must register a source and start the shared output")
-        || !require(output.initializeCalls == 1U && output.beginCalls == 1U
-                && output.pumpCalls == 1U,
-            "Initial BGM setup must perform exactly one scripted output start and prime"))
-    {
-        return false;
-    }
-    const void* const audioOutputAddress = AudioOutputRecoveryEngineTestAccess::audioOutputAddress(engine);
-    const auto token = AudioOutputRecoveryEngineTestAccess::playlistToken(engine);
-
-    engine.update(0.0F);
-    if (!require(output.pumpCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable
-            && AudioOutputRecoveryEngineTestAccess::hasActiveBackgroundMusic(engine)
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token,
-            "The first Engine update must preserve BGM state while entering DeviceUnavailable"))
-    {
-        return false;
-    }
-
-    engine.update(0.499F);
-    if (!require(output.initializeCalls == 1U && output.pumpCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable
-            && AudioOutputRecoveryEngineTestAccess::retryElapsedSeconds(engine) < 0.5,
-            "A device outage must not retry before the 500 ms recovery cooldown"))
-    {
-        return false;
-    }
-
-    engine.update(0.001F);
-    if (!require(output.initializeCalls == 2U && output.beginCalls == 2U
-            && output.pumpCalls == 3U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::Healthy
-            && AudioOutputRecoveryEngineTestAccess::sharedOutputState(engine)
-                == SharedAudioOutputState::Running
-            && AudioOutputRecoveryEngineTestAccess::retryElapsedSeconds(engine) == 0.0
-            && AudioOutputRecoveryEngineTestAccess::audioOutputAddress(engine) == audioOutputAddress
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token,
-        "A DeviceFailure must make one same-object recovery attempt at 500 ms without restarting BGM"))
-    {
-        return false;
-    }
-
-    engine.update(0.1F);
-    return require(output.initializeCalls == 2U && output.beginCalls == 2U,
-        "A successful recovery must not schedule an additional lifecycle attempt on the next update");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto original = token(engine); const auto opens = engine.device.openCalls.load();
+        if (!require(failDevice(engine), "device failure is observed by A")) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds{250});
+        if (!require(engine.device.openCalls.load() == opens && !healthy(engine)
+            && token(engine) == original && T::lane(engine, Lane::PlaylistBgm),
+            "before 500ms no retry, source/Current remain retained")) return false;
+        if (!require(waitHealth(engine, Health::Healthy), "A autonomously recovers after cooldown")) return false;
+        return require(engine.device.openCalls.load() == opens + 1
+            && engine.device.lastOpenTime.load() - engine.device.lastFaultTime.load() >= 500000000
+            && token(engine) == original && T::audioState(engine).recoveredCount == 1,
+            "one real reopen follows >=500ms measured post-failure time without replacing BGM");
+    });
 }
-
 bool verifyFailureDoesNotConsumePreFailureUpdateDelta()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::DeviceFailure},
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Pre-failure-delta setup must start BGM"))
-    {
-        return false;
-    }
-
-    engine.update(0.5F);
-    if (!require(output.initializeCalls == 1U && output.pumpCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable
-            && AudioOutputRecoveryEngineTestAccess::retryElapsedSeconds(engine) == 0.0,
-            "A DeviceFailure during update must not consume that update's pre-failure delta"))
-    {
-        return false;
-    }
-
-    engine.update(0.499F);
-    if (!require(output.initializeCalls == 1U,
-            "Only post-failure elapsed time may count toward the recovery cooldown"))
-    {
-        return false;
-    }
-
-    engine.update(0.001F);
-    return require(output.initializeCalls == 2U && output.beginCalls == 2U
-            && output.pumpCalls == 3U,
-        "Recovery must occur once a full 500 ms has elapsed after DeviceFailure");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto opens = engine.device.openCalls.load();
+        if (!failDevice(engine)) return false;
+        engine.update(1000); // Must not shortcut A's native cooldown.
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        return require(engine.device.openCalls.load() == opens && !healthy(engine),
+            "arbitrary old GUI delta cannot count as post-failure native elapsed");
+    });
 }
-
 bool verifyInitialAndBeginDeviceFailuresUseRecovery()
 {
-    DesktopSceneEngine::Domain::Project project{};
-
-    DesktopSceneEngine::Engine initializeEngine{};
-    ScriptedOutput initializeOutput{};
-    initializeOutput.initializeResults = {false, true};
-    if (!require(prepareBgmOnlyEngine(initializeEngine, project, initializeOutput)
-            && AudioOutputRecoveryEngineTestAccess::operationalState(initializeEngine)
-                == AudioOutputOperationalState::DeviceUnavailable
-            && initializeOutput.initializeCalls == 1U && initializeOutput.beginCalls == 0U,
-            "An output initialization failure must enter DeviceUnavailable without beginning output"))
+    for (const bool failOpen : {true, false})
     {
-        return false;
+        T::AwaitAudioEngine engine;
+        if (failOpen) engine.device.failOpen.store(1);
+        else engine.device.configureResult.store(Status::DeviceFailure);
+        if (!require(engine.processBackgroundMusicControl(makeStartEvent())
+            && waitHealth(engine, Health::DeviceUnavailable), "initial open/configure failure enters recoverable unavailable")) return false;
+        const auto original = token(engine);
+        if (!require(waitHealth(engine, Health::Healthy) && token(engine) == original
+            && T::lane(engine, Lane::PlaylistBgm), "recovery keeps native selected source identity")) return false;
     }
-    initializeEngine.update(0.5F);
-    if (!require(initializeOutput.initializeCalls == 2U && initializeOutput.beginCalls == 1U
-            && initializeOutput.pumpCalls == 1U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(initializeEngine)
-                == AudioOutputOperationalState::Healthy,
-            "Initialization failure must recover through the same cooldown path"))
-    {
-        return false;
-    }
-
-    DesktopSceneEngine::Engine beginEngine{};
-    ScriptedOutput beginOutput{};
-    beginOutput.beginResults = {
-        DesktopSceneEngine::Audio::AudioBlockStatus::DeviceFailure,
-        DesktopSceneEngine::Audio::AudioBlockStatus::Success};
-    if (!require(prepareBgmOnlyEngine(beginEngine, project, beginOutput)
-            && AudioOutputRecoveryEngineTestAccess::operationalState(beginEngine)
-                == AudioOutputOperationalState::DeviceUnavailable
-            && beginOutput.initializeCalls == 1U && beginOutput.beginCalls == 1U,
-            "A begin-block device failure must enter DeviceUnavailable"))
-    {
-        return false;
-    }
-
-    beginEngine.update(0.5F);
-    return require(beginOutput.initializeCalls == 2U && beginOutput.beginCalls == 2U
-            && beginOutput.pumpCalls == 1U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(beginEngine)
-                == AudioOutputOperationalState::Healthy,
-        "Begin-block device failure must recover through the same-object retry path");
+    return true;
 }
-
 bool verifyFailedRecoveryResetsCooldown()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.initializeResults = {true, false, true};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::DeviceFailure},
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Failed-recovery setup must start a BGM-only shared output"))
-    {
-        return false;
-    }
-
-    engine.update(0.0F);
-    engine.update(0.5F);
-    if (!require(output.initializeCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable
-            && AudioOutputRecoveryEngineTestAccess::retryElapsedSeconds(engine) == 0.0,
-            "A failed retry must remain unavailable and reset the cooldown"))
-    {
-        return false;
-    }
-
-    engine.update(0.499F);
-    if (!require(output.initializeCalls == 2U && output.pumpCalls == 2U,
-            "A failed retry must not retry again before another full cooldown"))
-    {
-        return false;
-    }
-
-    engine.update(0.001F);
-    return require(output.initializeCalls == 3U && output.beginCalls == 2U
-            && output.pumpCalls == 3U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::Healthy,
-        "The next full cooldown must perform one successful recovery attempt");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto opens = engine.device.openCalls.load();
+        if (!failDevice(engine)) return false;
+        engine.device.failOpen.store(1);
+        if (!T::waitUntil(engine, [&] { return engine.device.openCalls.load() == opens + 1; })) return false;
+        const auto firstAttempt = engine.device.lastOpenTime.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds{250});
+        if (!require(engine.device.openCalls.load() == opens + 1 && !healthy(engine), "failed retry starts a fresh cooldown")) return false;
+        return require(waitHealth(engine, Health::Healthy)
+            && engine.device.lastOpenTime.load() - firstAttempt >= 500000000,
+            "next recovery waits another full native 500ms");
+    });
 }
-
 bool verifyStopCancelsUnavailableRecovery()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::DeviceFailure}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Stop-cancel setup must start BGM"))
-    {
-        return false;
-    }
-    if (!require(AudioOutputRecoveryEngineTestAccess::addSyntheticEmbeddedInput(
-                    engine,
-                    std::make_unique<SilentInput>()),
-            "Stop-cancel setup must also register embedded presence"))
-    {
-        return false;
-    }
-
-    engine.update(0.0F);
-    if (!require(engine.processBackgroundMusicControl(
-                    DesktopSceneEngine::BackgroundMusicControl::PlaybackStopped{}),
-            "Stopping BGM during an outage must be admitted"))
-    {
-        return false;
-    }
-
-    engine.update(10.0F);
-    return require(output.initializeCalls == 1U && output.beginCalls == 1U
-            && !AudioOutputRecoveryEngineTestAccess::hasActiveBackgroundMusic(engine)
-            && !AudioOutputRecoveryEngineTestAccess::hasEmbeddedInput(engine)
-            && AudioOutputRecoveryEngineTestAccess::retryElapsedSeconds(engine) == 0.0,
-        "Stopping the final input during an outage must cancel recovery without reopening output");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        if (!failDevice(engine)) return false;
+        if (!require(engine.processBackgroundMusicControl(PlaybackStopped{}) && !T::lane(engine, Lane::PlaylistBgm),
+            "Stop waits for actual BGM retirement")) return false;
+        const auto opens = engine.device.openCalls.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds{550});
+        return require(engine.device.openCalls.load() == opens && T::audioState(engine).activeVoices == 0,
+            "no-source Stop cancels scheduled reopen");
+    });
 }
-
 bool verifyContractFaultDoesNotRetry()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::OutputContractFailure}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Contract-fault setup must start BGM"))
-    {
-        return false;
-    }
-    const auto token = AudioOutputRecoveryEngineTestAccess::playlistToken(engine);
-
-    engine.update(0.0F);
-    engine.update(10.0F);
-    return require(output.initializeCalls == 1U && output.beginCalls == 1U
-            && output.pumpCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::ContractFaulted
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token,
-        "Output contract failure must fail safe without timed recovery or BGM token replacement");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto original = token(engine);
+        if (!failDevice(engine, Status::InvalidRequest)) return false;
+        const auto opens = engine.device.openCalls.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds{550});
+        return require(T::audioState(engine).health == Health::ContractFaulted
+            && engine.device.openCalls.load() == opens && token(engine) == original,
+            "non-device contract fault stays latched without losing BGM identity");
+    });
 }
-
 bool verifyNonDeviceBridgeStatusDoesNotRetryAndConfigRemainsLive()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::DeviceFailure},
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Config-during-outage setup must start BGM"))
-    {
-        return false;
-    }
-    const auto token = AudioOutputRecoveryEngineTestAccess::playlistToken(engine);
-    engine.update(0.0F);
-    if (!require(engine.processBackgroundMusicControl(makeGainChangeEvent(0.25))
-            && output.pumpCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token,
-            "Gain configuration must remain live during an outage without pulling audio"))
-    {
-        return false;
-    }
-    engine.update(0.5F);
-    if (!require(output.pumpCalls == 3U
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token,
-            "Recovered output must use the surviving current BGM registration"))
-    {
-        return false;
-    }
-
-    DesktopSceneEngine::Engine inactiveEngine{};
-    ScriptedOutput inactiveOutput{};
-    inactiveOutput.pumpResults = {
-        {0U, MixedOutputBridgeStatus::OutputInactive},
-        {0U, MixedOutputBridgeStatus::OutputInactive}};
-    if (!require(prepareBgmOnlyEngine(inactiveEngine, project, inactiveOutput),
-            "OutputInactive setup must start BGM"))
-    {
-        return false;
-    }
-    inactiveEngine.update(1.0F);
-    return require(inactiveOutput.initializeCalls == 1U && inactiveOutput.beginCalls == 1U
-            && inactiveOutput.pumpCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(inactiveEngine)
-                == AudioOutputOperationalState::Healthy,
-        "OutputInactive must remain a diagnostic mismatch, not trigger recovery retry");
+    const Event gain = PlaylistMusicConfigChanged{PlaylistId{"recovery-playlist"},
+        QueueSnapshot{{TrackSnapshot{TrackId{"recovery-track"}, fixturePath(), 0.4}}, QueueMode::ListLoop, 1.0}};
+    if (!withBgm([&](T::AwaitAudioEngine& engine) {
+        if (!failDevice(engine)) return false;
+        const auto original = token(engine); const auto opens = engine.device.openCalls.load();
+        return require(engine.processBackgroundMusicControl(gain) && token(engine) == original
+            && engine.device.openCalls.load() == opens && !healthy(engine)
+            && waitHealth(engine, Health::Healthy) && token(engine) == original,
+            "gain configuration remains live during a real device outage and survives recovery");
+    })) return false;
+    if (!withBgm([&](T::AwaitAudioEngine& engine) {
+        if (!failDevice(engine, Status::InvalidRequest)) return false;
+        const auto original = token(engine);
+        const auto opens = engine.device.openCalls.load();
+        return require(engine.processBackgroundMusicControl(gain) && token(engine) == original
+            && engine.device.openCalls.load() == opens && T::audioState(engine).health == Health::ContractFaulted,
+            "C still accepts gain policy without clearing A contract fault or replacing source");
+    })) return false;
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto original = token(engine); const auto opens = engine.device.openCalls.load();
+        engine.device.availabilityResult.store(Status::NotInitialized);
+        if (!T::waitUntil(engine, [&] { return engine.device.availabilityResult.load() == Status::Success; })) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds{30});
+        return require(healthy(engine) && engine.device.openCalls.load() == opens && token(engine) == original,
+            "OutputInactive remains a diagnostic mismatch without creating recovery or losing BGM");
+    });
 }
-
 bool verifyPausedAndResumedRecovery()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.pauseResults = {DesktopSceneEngine::Audio::AudioBlockStatus::DeviceFailure};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Paused-recovery setup must start BGM"))
-    {
-        return false;
-    }
-
-    engine.togglePause();
-    if (!require(AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable,
-            "A pause DeviceFailure must enter DeviceUnavailable"))
-    {
-        return false;
-    }
-
-    engine.update(0.5F);
-    if (!require(output.initializeCalls == 2U && output.beginCalls == 2U
-            && output.pumpCalls == 1U
-            && !output.beginModes.empty()
-            && output.beginModes.back()
-                == DesktopSceneEngine::Platform::Audio::AudioBlockStartMode::ConfigurePaused
-            && AudioOutputRecoveryEngineTestAccess::sharedOutputState(engine)
-                == SharedAudioOutputState::Paused,
-            "Paused recovery must configure output paused without pulling Mixer data"))
-    {
-        return false;
-    }
-
-    DesktopSceneEngine::Engine resumeEngine{};
-    ScriptedOutput resumeOutput{};
-    resumeOutput.resumeResults = {DesktopSceneEngine::Audio::AudioBlockStatus::DeviceFailure};
-    resumeOutput.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-    if (!require(prepareBgmOnlyEngine(resumeEngine, project, resumeOutput),
-            "Resume-recovery setup must start BGM"))
-    {
-        return false;
-    }
-    resumeEngine.togglePause();
-    resumeEngine.togglePause();
-    if (!require(AudioOutputRecoveryEngineTestAccess::operationalState(resumeEngine)
-                == AudioOutputOperationalState::DeviceUnavailable,
-            "A resume DeviceFailure must enter DeviceUnavailable"))
-    {
-        return false;
-    }
-
-    resumeEngine.update(0.5F);
-    return require(resumeOutput.initializeCalls == 2U && resumeOutput.beginCalls == 2U
-            && resumeOutput.pumpCalls == 2U
-            && !resumeOutput.beginModes.empty()
-            && resumeOutput.beginModes.back()
-                == DesktopSceneEngine::Platform::Audio::AudioBlockStartMode::StartImmediately
-            && AudioOutputRecoveryEngineTestAccess::sharedOutputState(resumeEngine)
-                == SharedAudioOutputState::Running,
-        "Resume during an outage must recover Running output with one recovery prime");
+    const bool paused = withBgm([](T::AwaitAudioEngine& engine) {
+        const auto original = token(engine);
+        engine.device.pauseResult.store(Status::DeviceFailure);
+        if (!require(engine.processBackgroundMusicControl(PlaybackPaused{})
+            && waitHealth(engine, Health::DeviceUnavailable), "actual A pause failure enters unavailable")) return false;
+        const auto written = engine.device.written.load(); engine.device.grant(64);
+        return require(waitHealth(engine, Health::Healthy) && engine.device.paused.load()
+            && engine.device.written.load() == written && token(engine) == original
+            && T::audioState(engine).transport == Audio::AudioTransport::Paused,
+            "paused failure recovery configures paused and never consumes PCM");
+    });
+    if (!paused) return false;
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto original = token(engine);
+        if (!engine.processBackgroundMusicControl(PlaybackPaused{})) return false;
+        engine.device.resumeResult.store(Status::DeviceFailure);
+        return require(engine.processBackgroundMusicControl(PlaybackResumed{})
+            && waitHealth(engine, Health::DeviceUnavailable) && waitHealth(engine, Health::Healthy)
+            && !engine.device.paused.load() && token(engine) == original
+            && T::audioState(engine).transport == Audio::AudioTransport::Playing,
+            "actual A resume failure recovers Running with the original session");
+    });
 }
 
 bool verifyEmbeddedPresenceSurvivesOutageUntilRecoveryPreparation()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::DeviceFailure}};
-    AudioOutputRecoveryEngineTestAccess::preparePlayingEngine(engine, project);
-    AudioOutputRecoveryEngineTestAccess::installHooks(engine, output.hooks());
-    if (!require(AudioOutputRecoveryEngineTestAccess::addSyntheticEmbeddedInput(
-                    engine,
-                    std::make_unique<SilentInput>()),
-            "Synthetic embedded setup must register one Mixer input"))
-    {
-        return false;
-    }
-
-    if (!require(AudioOutputRecoveryEngineTestAccess::reconcileOutput(engine),
-            "Synthetic embedded setup must start the shared output"))
-    {
-        return false;
-    }
-
-    engine.update(0.0F);
-    if (!require(AudioOutputRecoveryEngineTestAccess::hasEmbeddedInput(engine)
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable,
-            "Device failure must retain the embedded registration as recovery-presence evidence"))
-    {
-        return false;
-    }
-
-    engine.update(0.5F);
-    return require(output.initializeCalls == 2U
-            && !AudioOutputRecoveryEngineTestAccess::hasEmbeddedInput(engine)
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::Healthy
-            && AudioOutputRecoveryEngineTestAccess::sharedOutputState(engine)
-                == SharedAudioOutputState::Stopped,
-        "Recovery preparation must replace the old embedded registration only after opening output");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        if (!require(installEmbedded(engine), "real embedded PCM fixture prepared")) return false;
+        const auto embedded = *T::lane(engine, Lane::Embedded);
+        if (!failDevice(engine)) return false;
+        return require(T::lane(engine, Lane::Embedded)->source == embedded.source
+            && waitHealth(engine, Health::Healthy) && T::lane(engine, Lane::Embedded)->source == embedded.source,
+            "outage/recovery retains immutable embedded registration and resyncs its cursor");
+    });
 }
-
 bool verifyEmbeddedAndBgmRecoveryPreservesBgm()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::DeviceFailure},
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-    if (!require(prepareBgmOnlyEngine(engine, project, output)
-            && AudioOutputRecoveryEngineTestAccess::addSyntheticEmbeddedInput(
-                engine,
-                std::make_unique<SilentInput>()),
-            "Embedded+BGM setup must register both inputs"))
-    {
-        return false;
-    }
-    const auto token = AudioOutputRecoveryEngineTestAccess::playlistToken(engine);
-
-    engine.update(0.0F);
-    if (!require(AudioOutputRecoveryEngineTestAccess::hasEmbeddedInput(engine)
-            && AudioOutputRecoveryEngineTestAccess::hasActiveBackgroundMusic(engine),
-            "Outage entry must retain both embedded and BGM registrations"))
-    {
-        return false;
-    }
-
-    engine.update(0.5F);
-    return require(!AudioOutputRecoveryEngineTestAccess::hasEmbeddedInput(engine)
-            && AudioOutputRecoveryEngineTestAccess::hasActiveBackgroundMusic(engine)
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token
-            && output.initializeCalls == 2U && output.beginCalls == 2U
-            && output.pumpCalls == 3U,
-        "Recovery must replace only embedded state while preserving the BGM registration and token");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        if (!installEmbedded(engine)) return false;
+        const auto original = token(engine);
+        const auto source = T::lane(engine, Lane::PlaylistBgm)->source;
+        return require(failDevice(engine) && waitHealth(engine, Health::Healthy)
+            && T::lane(engine, Lane::PlaylistBgm)->source == source && token(engine) == original,
+            "embedded resync does not re-open/re-token surviving BGM");
+    });
 }
-
 bool verifyDefaultEndpointChangeReroutesRunningBgm()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Default-endpoint reroute setup must start BGM"))
-    {
-        return false;
-    }
-
-    const void* const audioOutputAddress = AudioOutputRecoveryEngineTestAccess::audioOutputAddress(engine);
-    const auto token = AudioOutputRecoveryEngineTestAccess::playlistToken(engine);
-    output.defaultAudioEndpointGeneration = 3U;
-
-    engine.update(0.1F);
-    return require(output.shutdownCalls == 1U
-            && output.initializeCalls == 2U
-            && output.beginCalls == 2U
-            && output.pumpCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::audioOutputAddress(engine) == audioOutputAddress
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::Healthy
-            && AudioOutputRecoveryEngineTestAccess::sharedOutputState(engine)
-                == SharedAudioOutputState::Running
-            && AudioOutputRecoveryEngineTestAccess::hasActiveBackgroundMusic(engine)
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token,
-        "A generation change must suppress the old pump and perform one same-object Running reroute");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto original = token(engine); const auto opens = engine.device.openCalls.load();
+        engine.device.endpoint.fetch_add(1);
+        return require(T::waitUntil(engine, [&] { return engine.device.openCalls.load() == opens + 1 && engine.device.configured.load() && healthy(engine); })
+            && token(engine) == original && T::lane(engine, Lane::PlaylistBgm),
+            "running endpoint notification reroutes same source on A");
+    });
 }
-
 bool verifyDefaultEndpointChangeReroutesPausedOutputWithoutPull()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Paused reroute setup must start BGM"))
-    {
-        return false;
-    }
-
-    const auto token = AudioOutputRecoveryEngineTestAccess::playlistToken(engine);
-    engine.togglePause();
-    output.defaultAudioEndpointGeneration = 1U;
-    engine.update(1.0F);
-
-    return require(output.shutdownCalls == 1U
-            && output.initializeCalls == 2U
-            && output.beginCalls == 2U
-            && output.pumpCalls == 1U
-            && !output.beginModes.empty()
-            && output.beginModes.back()
-                == DesktopSceneEngine::Platform::Audio::AudioBlockStartMode::ConfigurePaused
-            && AudioOutputRecoveryEngineTestAccess::sharedOutputState(engine)
-                == SharedAudioOutputState::Paused
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token,
-        "A paused reroute must reopen ConfigurePaused without a Mixer pull or BGM replacement");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto original = token(engine);
+        if (!engine.processBackgroundMusicControl(PlaybackPaused{})) return false;
+        const auto configure = engine.device.configureCalls.load(); const auto written = engine.device.written.load();
+        engine.device.endpoint.fetch_add(1);
+        if (!T::waitUntil(engine, [&] { return engine.device.configureCalls.load() == configure + 1 && engine.device.configured.load() && healthy(engine); })) return false;
+        engine.device.grant(64); std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        return require(engine.device.written.load() == written && engine.device.paused.load()
+            && token(engine) == original && T::audioState(engine).transport == Audio::AudioTransport::Paused,
+            "paused endpoint reroute configures paused without PCM pulls or token replacement");
+    });
 }
-
 bool verifyDefaultEndpointChangeWhileStoppedInvalidatesWithoutReopen()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output)
-            && engine.processBackgroundMusicControl(
-                DesktopSceneEngine::BackgroundMusicControl::PlaybackStopped{}),
-            "Stopped reroute setup must remove the active BGM source"))
-    {
-        return false;
-    }
-
-    output.defaultAudioEndpointGeneration = 1U;
-    engine.update(0.1F);
-
-    return require(output.shutdownCalls == 1U
-            && output.initializeCalls == 1U
-            && output.beginCalls == 1U
-            && output.pumpCalls == 1U
-            && AudioOutputRecoveryEngineTestAccess::sharedOutputState(engine)
-                == SharedAudioOutputState::Stopped,
-        "A stopped reroute must invalidate the stale endpoint without reopening output");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        if (!engine.processBackgroundMusicControl(PlaybackStopped{})) return false;
+        const auto opens = engine.device.openCalls.load(); engine.device.endpoint.fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        return require(engine.device.openCalls.load() == opens && T::audioState(engine).activeVoices == 0,
+            "stopped endpoint notification never creates an unnecessary device");
+    });
 }
-
 bool verifyDefaultEndpointChangeImmediatelyRetriesDeviceUnavailable()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::DeviceFailure},
-        {0U, MixedOutputBridgeStatus::WroteFrames}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Immediate-retry setup must start BGM"))
-    {
-        return false;
-    }
-
-    engine.update(0.0F);
-    output.defaultAudioEndpointGeneration = 1U;
-    engine.update(0.1F);
-
-    return require(output.shutdownCalls == 1U
-            && output.initializeCalls == 2U
-            && output.beginCalls == 2U
-            && output.pumpCalls == 3U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::Healthy
-            && AudioOutputRecoveryEngineTestAccess::retryElapsedSeconds(engine) == 0.0,
-        "A new endpoint generation must bypass the unavailable cooldown with one immediate retry");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        if (!failDevice(engine)) return false;
+        const auto opens = engine.device.openCalls.load();
+        const auto began = Audio::audioMonotonicNow(); engine.device.endpoint.fetch_add(1);
+        if (!T::waitUntil(engine, [&] { return engine.device.openCalls.load() > opens && healthy(engine); })) return false;
+        return require(Audio::audioMonotonicNow() - began < 500000000,
+            "new endpoint notification triggers immediate reroute without waiting failed endpoint cooldown");
+    });
 }
-
 bool verifyDefaultEndpointChangeDoesNotClearContractFault()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-    output.pumpResults = {
-        {0U, MixedOutputBridgeStatus::WroteFrames},
-        {0U, MixedOutputBridgeStatus::OutputContractFailure}};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Contract-fault reroute setup must start BGM"))
-    {
-        return false;
-    }
-
-    engine.update(0.0F);
-    output.defaultAudioEndpointGeneration = 1U;
-    engine.update(1.0F);
-
-    return require(output.shutdownCalls == 0U
-            && output.initializeCalls == 1U
-            && output.beginCalls == 1U
-            && output.pumpCalls == 2U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::ContractFaulted,
-        "A route change must be consumed without retrying or clearing ContractFaulted");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        if (!failDevice(engine, Status::InvalidRequest)) return false;
+        const auto opens = engine.device.openCalls.load(); engine.device.endpoint.fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        return require(engine.device.openCalls.load() == opens && T::audioState(engine).health == Health::ContractFaulted,
+            "endpoint notification cannot clear latched contract fault");
+    });
 }
-
 bool verifyEmbeddedAndBgmDefaultEndpointReroutePreservesBgm()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output)
-            && AudioOutputRecoveryEngineTestAccess::configureEmbeddedAudio(
-                engine,
-                fixturePath().parent_path() / "SequentialAudioSourceCompressed.flac"),
-            "Embedded+BGM reroute setup must create the embedded adapter"))
-    {
-        return false;
-    }
-
-    const std::uint64_t oldEmbeddedHandle =
-        AudioOutputRecoveryEngineTestAccess::embeddedInputHandle(engine);
-    const auto token = AudioOutputRecoveryEngineTestAccess::playlistToken(engine);
-    output.defaultAudioEndpointGeneration = 1U;
-    engine.update(0.1F);
-
-    return require(oldEmbeddedHandle != 0U
-            && AudioOutputRecoveryEngineTestAccess::embeddedInputHandle(engine) > oldEmbeddedHandle
-            && AudioOutputRecoveryEngineTestAccess::hasActiveBackgroundMusic(engine)
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token
-            && output.shutdownCalls == 1U
-            && output.initializeCalls == 2U
-            && output.beginCalls == 2U
-            && output.pumpCalls == 2U,
-        "A reroute must replace embedded input at current playback time while preserving BGM state");
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        if (!installEmbedded(engine)) return false;
+        const auto embedded = T::lane(engine, Lane::Embedded)->source;
+        const auto original = token(engine); const auto opens = engine.device.openCalls.load();
+        engine.device.endpoint.fetch_add(1);
+        return require(T::waitUntil(engine, [&] { return engine.device.openCalls.load() == opens + 1 && engine.device.configured.load() && healthy(engine); })
+            && T::lane(engine, Lane::Embedded)->source == embedded && token(engine) == original,
+            "default reroute preserves BGM token and immutable embedded asset");
+    });
 }
-
 bool verifyGenerationArrivingDuringRerouteWaitsForNextUpdate()
 {
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-    output.onBegin = [&output]()
-    {
-        if (output.beginCalls == 2U)
-        {
-            output.defaultAudioEndpointGeneration = 2U;
-        }
+    return withBgm([](T::AwaitAudioEngine& engine) {
+        const auto opens = engine.device.openCalls.load();
+        engine.device.bumpEndpointOnConfigure.store(true); engine.device.endpoint.fetch_add(1);
+        return require(T::waitUntil(engine, [&] { return engine.device.openCalls.load() == opens + 2 && engine.device.configured.load() && healthy(engine); }),
+            "generation arriving during configure is handled by a later A turn, not recursive reroute");
+    });
+}
+bool rerouteFailure(bool openFailure)
+{
+    return withBgm([&](T::AwaitAudioEngine& engine) {
+        const auto original = token(engine);
+        if (openFailure) engine.device.failOpen.store(1); else engine.device.configureResult.store(Status::DeviceFailure);
+        engine.device.endpoint.fetch_add(1);
+        return require(waitHealth(engine, Health::DeviceUnavailable) && waitHealth(engine, Health::Healthy)
+            && token(engine) == original && T::lane(engine, Lane::PlaylistBgm),
+            "reroute open/configure failure enters ordinary timed recovery without replacing source");
+    });
+}
+bool verifyDefaultEndpointRerouteFailureUsesNormalRecoveryState() { return rerouteFailure(true); }
+bool verifyDefaultEndpointRerouteBeginFailureUsesNormalRecoveryState() { return rerouteFailure(false); }
+
+bool verifyFailureHoldAdoptsRateAndPauseAppliedAfterLastControlPoll()
+{
+    using EngineType = DesktopSceneEngine::Engine;
+    Domain::Project project{}; T::AwaitAudioEngine engine;
+    Access::preparePolicy(engine, project);
+    if (!require(T::settle(engine) && installEmbedded(engine)
+        && engine.processBackgroundMusicControl(makeStartEvent()), "Stale-C gate fixture uses real P PCM and live BGM")) return false;
+    auto& control = Access::control(engine);
+    const auto original = T::lane(engine, Lane::Embedded)->source;
+    const auto bgm = token(engine);
+    const auto stale = control.clock;
+    const auto confirmed = control.lastConfirmedPosition;
+    const auto operation = engine.beginAudioEffect(EngineType::AudioEffectScope::Structural);
+    if (!require(operation.has_value(), "Rate preparation reserves the normal Engine operation")) return false;
+    Access::prepareEmbeddedRate(engine, fixturePath().parent_path() / "SequentialAudioSourceCompressed.flac", 0.5F);
+    (void)engine.finishAudioEffect(*operation);
+    Audio::AudioEffectTicket rateTicket{};
+    if (!T::waitUntil(engine, [&] {
+        for (const auto& source : control.sources)
+            if (source.occupied && source.submitted && !source.retiring
+                && source.key.lane == Lane::Embedded && source.key != original)
+            { rateTicket = source.ticket; return rateTicket.valid(); }
+        return false;
+    })) return false;
+    // Stop polling C exactly after its real prepared view is queued. Observe
+    // A receipts directly until both authorized effects have actually applied.
+    const auto waitAudioOnly = [](auto predicate) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        do { if (predicate()) return true; std::this_thread::sleep_for(std::chrono::milliseconds{1}); }
+        while (std::chrono::steady_clock::now() < end);
+        return false;
     };
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Generation-during-reroute setup must start BGM"))
-    {
-        return false;
-    }
-
-    output.defaultAudioEndpointGeneration = 1U;
-    engine.update(0.1F);
-    if (!require(output.initializeCalls == 2U && output.beginCalls == 2U && output.pumpCalls == 2U,
-            "A generation raised during reroute must not recurse in the same update"))
-    {
-        return false;
-    }
-
-    engine.update(0.1F);
-    return require(output.initializeCalls == 3U && output.beginCalls == 3U && output.pumpCalls == 3U,
-        "A generation raised during reroute must remain pending for the next update");
+    if (!require(waitAudioOnly([&] { return control.execution.receipt(rateTicket).has_value(); }),
+        "A applies real prepared RateContinuous while C remains unpolled")) return false;
+    const auto rateReceipt = *control.execution.receipt(rateTicket);
+    if (!require(rateReceipt.result == Audio::AudioEffectResult::Applied && rateReceipt.clock.rate == 0.5,
+        "The rate receipt proves an actual half-speed effect")) return false;
+    const auto pauseTicket = control.execution.reserve(Audio::AudioEffectClass::Structural, 0x0F, operation->sequence);
+    if (!require(pauseTicket.has_value(), "Same bounded A operation group admits the already-authorized Pause")) return false;
+    Audio::AudioCommand pause{};
+    pause.kind = Audio::AudioCommandKind::SetTransport; pause.clock = rateReceipt.clock;
+    pause.clock.timingVersion = ++control.timing; pause.expectedTimingVersion = rateReceipt.clock.timingVersion;
+    pause.clock.mode = Audio::AudioClockMode::Paused; pause.transport = Audio::AudioTransport::Paused;
+    pause.playbackLifetime = control.playbackLifetime;
+    if (!require(control.execution.enqueue(*pauseTicket, pause)
+        && waitAudioOnly([&] { return control.execution.receipt(*pauseTicket).has_value(); }),
+        "A applies Pause through its public command port before C resumes")) return false;
+    const auto pauseReceipt = *control.execution.receipt(*pauseTicket);
+    const bool paused = pauseReceipt.result == Audio::AudioEffectResult::Applied
+        && pauseReceipt.transport == Audio::AudioTransport::Paused && pauseReceipt.clock.rate == 0.5;
+    (void)control.execution.releaseReceipt(*pauseTicket);
+    if (!require(paused && control.clock.timingVersion == stale.timingVersion && control.clock.rate == stale.rate,
+        "C demonstrably still holds the older running/rate anchor after A Rate/Pause effects")) return false;
+    control.holdFailure(engine, confirmed, confirmed + 0.5);
+    if (!require(T::settle(engine), "Reserved failure gate and prior rate receipt are durably consumed")) return false;
+    const auto actual = T::audioState(engine);
+    return require(control.failureHeld && control.clock.mode == Audio::AudioClockMode::FailureHold
+        && control.clock.rate == 0.5 && actual.clock.rate == 0.5
+        && actual.clock.mode == Audio::AudioClockMode::FailureHold && actual.transport == Audio::AudioTransport::Paused
+        && control.clock.position == confirmed && control.lastConfirmedPosition == confirmed
+        && engine.playbackSpeed() == 0.5F && engine.isPaused()
+        && Core::BackgroundMusicEngineTestAccess::runtime(engine).playbackState() == Music::BackgroundMusicPlaybackState::Paused
+        && token(engine) == bgm,
+        "FailureHold preserves A's applied rate/Pause and synchronizes actual rate, pause and BGM policy back to stale C");
 }
-
-bool verifyDefaultEndpointRerouteFailureUsesNormalRecoveryState()
-{
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-    output.initializeResults = {true, false};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Reroute-failure setup must start BGM"))
-    {
-        return false;
-    }
-
-    const auto token = AudioOutputRecoveryEngineTestAccess::playlistToken(engine);
-    output.defaultAudioEndpointGeneration = 1U;
-    engine.update(0.1F);
-
-    return require(output.shutdownCalls == 1U
-            && output.initializeCalls == 2U
-            && output.beginCalls == 1U
-            && output.pumpCalls == 1U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable
-            && AudioOutputRecoveryEngineTestAccess::retryElapsedSeconds(engine) == 0.0
-            && AudioOutputRecoveryEngineTestAccess::playlistToken(engine) == token,
-        "A reroute initialize failure must enter normal DeviceUnavailable recovery without replacing BGM");
-}
-
-bool verifyDefaultEndpointRerouteBeginFailureUsesNormalRecoveryState()
-{
-    DesktopSceneEngine::Engine engine{};
-    DesktopSceneEngine::Domain::Project project{};
-    ScriptedOutput output{};
-    output.exposeDefaultAudioEndpointGeneration = true;
-    output.beginResults = {
-        DesktopSceneEngine::Audio::AudioBlockStatus::Success,
-        DesktopSceneEngine::Audio::AudioBlockStatus::DeviceFailure};
-
-    if (!require(prepareBgmOnlyEngine(engine, project, output),
-            "Reroute-begin-failure setup must start BGM"))
-    {
-        return false;
-    }
-
-    output.defaultAudioEndpointGeneration = 1U;
-    engine.update(0.1F);
-
-    return require(output.shutdownCalls == 1U
-            && output.initializeCalls == 2U
-            && output.beginCalls == 2U
-            && output.pumpCalls == 1U
-            && AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable
-            && AudioOutputRecoveryEngineTestAccess::retryElapsedSeconds(engine) == 0.0,
-        "A reroute begin device failure must enter DeviceUnavailable without an extra old-output pump");
-}
-
 }
 
 int main()
 {
-    return verifyDeviceFailureDoesNotRecoverBeforeCooldown()
-            && verifyFailureDoesNotConsumePreFailureUpdateDelta()
-            && verifyInitialAndBeginDeviceFailuresUseRecovery()
-            && verifyFailedRecoveryResetsCooldown()
-            && verifyStopCancelsUnavailableRecovery()
-            && verifyContractFaultDoesNotRetry()
-            && verifyNonDeviceBridgeStatusDoesNotRetryAndConfigRemainsLive()
-            && verifyPausedAndResumedRecovery()
-            && verifyEmbeddedPresenceSurvivesOutageUntilRecoveryPreparation()
-            && verifyEmbeddedAndBgmRecoveryPreservesBgm()
-            && verifyDefaultEndpointChangeReroutesRunningBgm()
-            && verifyDefaultEndpointChangeReroutesPausedOutputWithoutPull()
-            && verifyDefaultEndpointChangeWhileStoppedInvalidatesWithoutReopen()
-            && verifyDefaultEndpointChangeImmediatelyRetriesDeviceUnavailable()
-            && verifyDefaultEndpointChangeDoesNotClearContractFault()
-            && verifyEmbeddedAndBgmDefaultEndpointReroutePreservesBgm()
-            && verifyGenerationArrivingDuringRerouteWaitsForNextUpdate()
-            && verifyDefaultEndpointRerouteFailureUsesNormalRecoveryState()
-            && verifyDefaultEndpointRerouteBeginFailureUsesNormalRecoveryState()
-        ? 0 : 1;
+    const bool passed = verifyDeviceFailureDoesNotRecoverBeforeCooldown()
+        && verifyFailureDoesNotConsumePreFailureUpdateDelta()
+        && verifyInitialAndBeginDeviceFailuresUseRecovery()
+        && verifyFailedRecoveryResetsCooldown()
+        && verifyStopCancelsUnavailableRecovery()
+        && verifyContractFaultDoesNotRetry()
+        && verifyNonDeviceBridgeStatusDoesNotRetryAndConfigRemainsLive()
+        && verifyPausedAndResumedRecovery()
+        && verifyEmbeddedPresenceSurvivesOutageUntilRecoveryPreparation()
+        && verifyEmbeddedAndBgmRecoveryPreservesBgm()
+        && verifyDefaultEndpointChangeReroutesRunningBgm()
+        && verifyDefaultEndpointChangeReroutesPausedOutputWithoutPull()
+        && verifyDefaultEndpointChangeWhileStoppedInvalidatesWithoutReopen()
+        && verifyDefaultEndpointChangeImmediatelyRetriesDeviceUnavailable()
+        && verifyDefaultEndpointChangeDoesNotClearContractFault()
+        && verifyEmbeddedAndBgmDefaultEndpointReroutePreservesBgm()
+        && verifyGenerationArrivingDuringRerouteWaitsForNextUpdate()
+        && verifyDefaultEndpointRerouteFailureUsesNormalRecoveryState()
+        && verifyDefaultEndpointRerouteBeginFailureUsesNormalRecoveryState()
+        && verifyFailureHoldAdoptsRateAndPauseAppliedAfterLastControlPoll();
+    if (passed) std::cout << "AudioOutputRecoveryEngineTest CP1 PASS (19 mapped scenarios + stale-C failure gate)\n";
+    return passed ? 0 : 1;
 }

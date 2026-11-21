@@ -19,7 +19,8 @@ AudioInputHandle AudioMixer::addInput(
     float gain
 ) noexcept
 {
-    if (!input || !isValidGain(gain) || nextHandleValue_ == 0U)
+    if (!input || !isValidGain(gain) || nextHandleValue_ == 0U
+        || (deadlineMaximumInputs_ != 0U && inputs_.size() >= deadlineMaximumInputs_))
     {
         return {};
     }
@@ -30,6 +31,7 @@ AudioInputHandle AudioMixer::addInput(
         inputs_.push_back({
             handle,
             std::move(input),
+            nullptr,
             gain,
             AudioInputState::Active,
             false
@@ -49,6 +51,36 @@ AudioInputHandle AudioMixer::addInput(
         ++nextHandleValue_;
     }
 
+    return handle;
+}
+
+bool AudioMixer::prepareDeadlineMode(std::size_t maximumInputs,
+    std::size_t maximumFrames) noexcept
+{
+    if (!inputs_.empty() || maximumInputs == 0U || maximumFrames == 0U
+        || maximumFrames > (std::numeric_limits<std::size_t>::max)() / StereoChannelCount)
+        return false;
+    try
+    {
+        inputs_.reserve(maximumInputs);
+        scratch_.resize(maximumFrames * StereoChannelCount);
+    }
+    catch (...) { return false; }
+    deadlineMaximumInputs_ = maximumInputs;
+    deadlineMaximumFrames_ = maximumFrames;
+    return true;
+}
+
+AudioInputHandle AudioMixer::addBorrowedInput(AudioMixerInput& input, float gain) noexcept
+{
+    if (!isValidGain(gain) || nextHandleValue_ == 0U || deadlineMaximumInputs_ == 0U
+        || inputs_.size() >= deadlineMaximumInputs_) return {};
+    const AudioInputHandle handle{nextHandleValue_};
+    // Capacity was reserved before the stream started; this move-only slot
+    // contains no owning endpoint and removal has no resource destructor.
+    inputs_.push_back({handle, {}, &input, gain, AudioInputState::Active, false});
+    nextHandleValue_ = nextHandleValue_ == (std::numeric_limits<std::uint64_t>::max)()
+        ? 0U : nextHandleValue_ + 1U;
     return handle;
 }
 
@@ -101,6 +133,8 @@ AudioMixResult AudioMixer::mixFrames(
     }
 
     const std::size_t requestedFrames = interleavedDestination.size() / StereoChannelCount;
+    if (deadlineMaximumFrames_ != 0U && requestedFrames > deadlineMaximumFrames_)
+        return {0U, AudioMixStatus::InvalidRequest};
     try
     {
         scratch_.resize(interleavedDestination.size());
@@ -118,7 +152,15 @@ AudioMixResult AudioMixer::mixFrames(
             continue;
         }
 
-        const AudioMixerInputReadResult result = input.input->readFrames(
+        AudioMixerInput* const endpoint = input.borrowedInput != nullptr
+            ? input.borrowedInput : input.input.get();
+        if (endpoint == nullptr)
+        {
+            input.state = AudioInputState::Failed;
+            input.terminalNotificationPending = true;
+            continue;
+        }
+        const AudioMixerInputReadResult result = endpoint->readFrames(
             std::span<float>{scratch_});
         if (result.framesProduced > requestedFrames)
         {
@@ -138,7 +180,8 @@ AudioMixResult AudioMixer::mixFrames(
             input.state = AudioInputState::Ended;
             input.terminalNotificationPending = true;
         }
-        else if (result.status == AudioMixerInputReadStatus::Failure)
+        else if (result.status == AudioMixerInputReadStatus::Failure
+            || result.status == AudioMixerInputReadStatus::Retired)
         {
             input.state = AudioInputState::Failed;
             input.terminalNotificationPending = true;

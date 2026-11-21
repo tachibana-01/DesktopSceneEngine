@@ -138,6 +138,34 @@ const MusicSession* BackgroundMusicRuntime::itemSession() const noexcept
     return itemSession_ ? &*itemSession_ : nullptr;
 }
 
+BackgroundMusicObservation::Snapshot BackgroundMusicRuntime::backgroundMusicObservation() const
+{
+    BackgroundMusicObservation::Snapshot value{};
+    value.playbackState = playbackState_;
+    if (activePlaylistId_) value.activePlaylistId = BackgroundMusicControl::PlaylistId{activePlaylistId_->value};
+    if (activeItemId_) value.activeItemId = BackgroundMusicControl::ItemId{activeItemId_->value};
+    const auto describe = [this](const MusicSession* session, BackgroundMusicObservation::Scope scope, bool active)
+    {
+        BackgroundMusicObservation::ScopeSnapshot result{};
+        result.scope = scope;
+        result.active = active;
+        result.exists = session != nullptr;
+        if (session)
+        {
+            result.phase = session->phase();
+            if (session->currentTrackId())
+                result.currentTrackId = BackgroundMusicControl::TrackId{session->currentTrackId()->value};
+            result.switchEligible = active && session->currentTrackId().has_value() && canAllocateSourceTokens(1U);
+            result.lastFailedAttempt = session->lastFailedAttempt();
+        }
+        return result;
+    };
+    const bool active = playbackState_ != BackgroundMusicPlaybackState::Stopped;
+    value.playlist = describe(playlistSession(), MusicScope::PlaylistGlobal, active && activePlaylistId_.has_value());
+    value.item = describe(itemSession(), MusicScope::Item, active && activeItemId_.has_value());
+    return value;
+}
+
 std::vector<MusicRuntimeAction> BackgroundMusicRuntime::applyEvent(
     const PlaybackSessionStarted& event
 )
@@ -563,6 +591,9 @@ std::vector<MusicRuntimeAction> BackgroundMusicRuntime::applyEvent(
         return {};
     }
 
+    // Receipt is fenced by the existing source-token owner before Current can
+    // advance or C1A clears it at exhaustion. Metadata never chooses the policy.
+    session->recordFailedAttempt(event);
     if (event.failure == MusicSourceFailureClass::TransientResourceFailure)
     {
         session->enterWaitingForExecutor();

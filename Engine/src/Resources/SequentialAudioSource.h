@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -61,7 +62,10 @@ public:
     SequentialAudioSource(SequentialAudioSource&&) = delete;
     SequentialAudioSource& operator=(SequentialAudioSource&&) = delete;
 
-    [[nodiscard]] bool open(const std::filesystem::path& source) noexcept;
+    // cancellation must remain alive until this producer-owned source is
+    // destroyed. It is cooperative; arbitrary backend calls have no time bound.
+    [[nodiscard]] bool open(const std::filesystem::path& source,
+        const std::atomic_bool* cancellation = nullptr) noexcept;
     [[nodiscard]] bool reset() noexcept;
 
     [[nodiscard]] bool isOpen() const noexcept;

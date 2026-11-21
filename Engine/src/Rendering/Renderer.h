@@ -23,8 +23,22 @@ public:
 
     [[nodiscard]] PresentationTargetId initialize(const WindowTarget& target);
 
+    [[nodiscard]] PresentationTargetId initialize(
+        const HostedCompositionTarget& target);
+
     [[nodiscard]] PresentationTargetId attachPresentationTarget(
         const WindowTarget& target);
+
+    [[nodiscard]] PresentationTargetId attachPresentationTarget(
+        const HostedCompositionTarget& target);
+
+    [[nodiscard]] bool setHostedPresentationExtent(
+        PresentationTargetId id, PresentationExtent extent) noexcept;
+
+    [[nodiscard]] CompositionContentLease acquireHostedCompositionContent(
+        PresentationTargetId id) const noexcept;
+
+    void invalidateHostedCompositionContent() noexcept;
 
     [[nodiscard]] bool detachPresentationTarget(
         PresentationTargetId id) noexcept;
@@ -55,7 +69,9 @@ public:
     [[nodiscard]] bool prepareFrame(
         const Detail::MediaView* currentMedia = nullptr);
 
-    void renderPrepared(const RenderData& data);
+    [[nodiscard]] std::uint64_t deviceGeneration() const noexcept;
+
+    bool renderPrepared(const RenderData& data, PresentationTargetId onlyTarget = {});
 
     void render(
         const RenderData& data,

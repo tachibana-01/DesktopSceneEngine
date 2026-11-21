@@ -29,6 +29,8 @@ public:
 
     [[nodiscard]] const MusicSession* itemSession() const noexcept;
 
+    [[nodiscard]] BackgroundMusicObservation::Snapshot backgroundMusicObservation() const;
+
 private:
     [[nodiscard]] std::vector<MusicRuntimeAction> applyEvent(const PlaybackSessionStarted& event);
 

@@ -58,31 +58,18 @@ Temporary shortcuts are prohibited unless documented.
 
 # 4. Project Structure
 
-The repository shall remain organized as follows.
+The main source and maintenance paths are:
 
-
-DesktopSceneEngine/
-
-├── Engine/
-├── Editor/
-├── Sandbox/
-
-├── docs/
-├── assets/
-├── data/
-
-├── tests/
-
-├── tools/
-
-├── third_party/
-
-└── CMakeLists.txt
-
-
-Each directory has one clearly defined responsibility.
-
-Directories shall not contain unrelated files.
+| Path | Responsibility |
+| --- | --- |
+| `Engine/` | Runtime, media, rendering, audio, scene model, persistence, and platform interfaces |
+| `Player/` | Windows Launcher, Coordinator, Session, background-music peer, WebView2 hosts, and native platform adapters |
+| `DesktopSceneEngineIII/Frontend/` | React/TypeScript application, frontend tests, and locked npm build inputs |
+| `Sandbox/` | Separate Engine development and verification executable |
+| `tests/` | Native test targets, generated fixtures, and checked-in synthetic audio |
+| `docs/` | Project and development documentation |
+| `tools/` | Development and Windows distribution tools |
+| `CMakeLists.txt` and `vcpkg.json` | Native build entry and dependency manifest |
 
 ---
 
@@ -100,25 +87,19 @@ Responsible for:
 - Serialization
 - Platform abstraction
 
-Engine shall not depend on Editor or UI implementation.
+Engine shall not depend on the Player or frontend implementation.
 
 Engine shall provide stable public interfaces for external modules.
 
 ---
 
-## Editor
+## Player and frontend
 
-Responsible for:
-
-- User Interface
-- Editing tools
-- Preview
-- Settings management
-- Media management
-
-Editor communicates with Engine only through public interfaces.
-
-Editor shall not contain core business logic.
+The Player owns native application and Session orchestration, the window and
+platform adapters, and the WebView2 bridge. The frontend presents the Launcher,
+Session editor and background-music controls through the bridge. Keep media,
+rendering and playback implementation in the Engine. Keep Session state and
+commands with their native application owners.
 
 ---
 
@@ -153,18 +134,6 @@ Production code shall not be placed here.
 
 ---
 
-## assets
-
-Contains built-in resources shipped with the application.
-
----
-
-## data
-
-Contains runtime configuration and user-generated data.
-
----
-
 ## tools
 
 Contains development utilities.
@@ -173,28 +142,14 @@ Utilities shall never become runtime dependencies.
 
 ---
 
-## third_party
-
-Contains external libraries.
-
-Third-party source code should remain unmodified whenever possible.
-
----
-
 # 6. Dependency Rules
 
 Allowed dependency direction:
 
 
-Editor
-
-↓
-
-Engine
-
-↓
-
-Platform APIs
+```text
+React/TypeScript frontend → Player bridge and application hosts → Engine → Platform APIs
+```
 
 
 Reverse dependencies are prohibited.
@@ -211,7 +166,8 @@ Engine shall remain independently compilable.
 
 # 7. Sandbox Development Policy
 
-Sandbox is used during Engine development before the final Editor implementation.
+Sandbox is a separate Engine development and verification target. It uses a
+minimal native window. The production UI runs in Player.
 
 The purpose of Sandbox is:
 
@@ -224,43 +180,19 @@ Sandbox shall prioritize simplicity.
 
 ---
 
-## UI Strategy
+## Build and test workflow
 
-During early development:
+Follow the [root build instructions](../README.md#build-on-windows) to install
+the supported Windows toolchain, restore the locked WebView2 SDK and npm
+dependencies, and configure the root CMake project. Set `BUILD_PLAYER=ON` for
+the production `DesktopSceneEngine_QtPlayer` target. Launch that executable to
+open Launcher and start a display-bound Session.
 
-- Qt shall NOT be introduced.
-- External GUI frameworks shall NOT be introduced.
-- UI development is not a priority.
-
-If visualization is required:
-
-Use:
-
-- Windows native APIs
-- System-provided components
-- Minimal test windows
-
-The purpose is only functional verification.
-
-UI complexity shall never delay Engine development.
-
----
-
-## Future Editor
-
-The final Editor module will be implemented independently.
-
-Expected architecture:
-
-
-Engine
-
-↑
-
-Editor(Qt)
-
-
-The Engine module must never depend on Editor technology choices.
+Use a separate CMake build tree with `BUILD_TESTING=ON` for native tests. The
+[test guide](../tests/README.md) lists default coverage and the explicit opt-in
+for external media. Building Player and running the default tests requires no
+private media. Use the frontend package's `typecheck` command for React and
+TypeScript changes.
 
 ---
 

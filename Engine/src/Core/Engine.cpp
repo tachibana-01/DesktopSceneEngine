@@ -1,25 +1,14 @@
 #include <DesktopSceneEngine/Engine.h>
+#include "EngineAudioControl.h"
 
-#include "../Audio/AudioMixer.h"
-#include "../Audio/EmbeddedAudioMixerInput.h"
-#include "../Audio/MixedOutputBridge.h"
-#include "../Music/BackgroundMusicExecutor.h"
 #include "../Music/BackgroundMusicOrchestrator.h"
 #include "../Music/BackgroundMusicRuntime.h"
 #include "../Music/MusicRuntimeTypes.h"
-#include "../Platform/Windows/DesktopWindowHost.h"
-#include "../Platform/Audio/AudioOutput.h"
-#include "../Platform/Audio/DefaultAudioEndpointWatcher.h"
-#include "EmbeddedAudioStartFrame.h"
-#include "AudioOutputRecoveryTestHooks.h"
 #include "ScenePresentationMath.h"
-#include "SharedAudioOutputRecoveryPolicy.h"
-#include "SharedAudioOutputPolicy.h"
 #include "../Rendering/RenderData.h"
 #include "../Rendering/Renderer.h"
-#include "../Rendering/WindowTarget.h"
-#include "../Resources/AudioResource.h"
 #include "../Resources/MediaResource.h"
+#include "../Resources/DetachedMediaProducer.h"
 #include "../Resources/ImageResource.h"
 #include "../Resources/VideoResource.h"
 #include "../Runtime/Playback/PlaybackRuntime.h"
@@ -28,9 +17,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
-#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cassert>
 #include <filesystem>
 #include <iostream>
@@ -45,10 +34,12 @@
 #include <unordered_set>
 #include <utility>
 #include <variant>
+#include <thread>
 
 namespace
 {
 
+template<class F> struct ScopeExit { F action; ~ScopeExit() { action(); } };
 std::uint64_t sceneSwitches = 0;
 std::uint64_t videoFrameUpdates = 0;
 
@@ -58,20 +49,10 @@ bool shouldLog(std::uint64_t count) noexcept
 }
 
 using DesktopSceneEngine::Domain::Media;
-using DesktopSceneEngine::Audio::AudioBlockStatus;
-using DesktopSceneEngine::Audio::AudioInputHandle;
-using DesktopSceneEngine::Audio::AudioMixer;
-using DesktopSceneEngine::Audio::EmbeddedAudioMixerInput;
-using DesktopSceneEngine::Audio::MixedOutputBridge;
-using DesktopSceneEngine::Audio::MixedOutputBridgeStatus;
 namespace BackgroundMusicControl = DesktopSceneEngine::BackgroundMusicControl;
 namespace Music = DesktopSceneEngine::Music;
-using DesktopSceneEngine::Platform::Audio::AudioBlockStartMode;
-using DesktopSceneEngine::Platform::Audio::AudioOutput;
 using DesktopSceneEngine::Rendering::Detail::MediaUpdateResult;
 using DesktopSceneEngine::Rendering::Renderer;
-using DesktopSceneEngine::Resources::AudioResource;
-using DesktopSceneEngine::Resources::AudioOpenStatus;
 using DesktopSceneEngine::Resources::ImageResource;
 using DesktopSceneEngine::Resources::MediaResource;
 using DesktopSceneEngine::Resources::MediaType;
@@ -314,7 +295,7 @@ double presentedTimeOrFallback(
 
 void logPlaybackSync(
     const PlaybackRuntime& playback,
-    const AudioOutput* audioOutput,
+    const DesktopSceneEngine::Audio::AudioExecutionSnapshot& audio,
     double videoPresentedTime,
     std::uint64_t& sampleCount) noexcept
 {
@@ -333,51 +314,40 @@ void logPlaybackSync(
 
     std::fprintf(
         stderr,
-        "[Engine] playback-sync sample=%llu logical=%.6f video=%.6f video-valid=%s video-drift=%.6f audio-submitted=%llu audio-queued=%llu audio-played=%llu audio-underflows=%llu\n",
+        "[Engine] playback-sync sample=%llu logical=%.6f video=%.6f video-valid=%s video-drift=%.6f audio-submitted=%llu audio-queued=%llu audio-written-minus-current-queue=%llu audio-underflows=%llu\n",
         static_cast<unsigned long long>(sampleCount),
         logicalTime,
         videoPresentedTime,
         videoValid ? "yes" : "no",
         videoDrift,
-        static_cast<unsigned long long>(audioOutput != nullptr
-            ? audioOutput->submittedFrames() : 0U),
-        static_cast<unsigned long long>(audioOutput != nullptr
-            ? audioOutput->queuedFrames() : 0U),
-        static_cast<unsigned long long>(audioOutput != nullptr
-            ? audioOutput->playedFrames() : 0U),
-        static_cast<unsigned long long>(audioOutput != nullptr
-            ? audioOutput->underflowCount() : 0U));
+        static_cast<unsigned long long>(audio.writtenFrames),
+        static_cast<unsigned long long>(audio.queuedFrames),
+        static_cast<unsigned long long>(audio.writtenFrames >= audio.queuedFrames ? audio.writtenFrames - audio.queuedFrames : 0U),
+        static_cast<unsigned long long>(audio.outputUnderflows));
+    std::fprintf(stderr,
+        "[Engine] audio-execution qpc-ns=%lld publication=%llu publication-ns=%lld effect-sequence=%llu clock-binding=%llu clock-version=%llu clock-position=%.9f clock-time-ns=%lld clock-mode=%u clock-duration=%.9f clock-rate=%.9f mmcss=%u health=%u transport=%u owner-thread=%u buffer=%llu prime=%llu refill=%llu written=%llu queued=%llu underflows=%llu missing=%llu underruns=%llu device-failures=%llu recovery-attempts=%llu recovered=%llu nonzero-submitted=%llu max-zero-run=%llu max-write-gap-ns=%lld max-wake-gap-ns=%lld max-service-ns=%lld embedded-token=%llu embedded-cursor=%llu embedded-tempo=%.9f playlist-token=%llu playlist-cursor=%llu item-token=%llu item-cursor=%llu\n",
+        static_cast<long long>(DesktopSceneEngine::Audio::audioMonotonicNow()),
+        static_cast<unsigned long long>(audio.publication), static_cast<long long>(audio.publicationTimeNs), static_cast<unsigned long long>(audio.lastEffectSequence),
+        static_cast<unsigned long long>(audio.clock.binding), static_cast<unsigned long long>(audio.clock.timingVersion),
+        audio.clock.position, static_cast<long long>(audio.clock.time), static_cast<unsigned>(audio.clock.mode), audio.clock.duration, audio.clock.rate, static_cast<unsigned>(audio.mmcssRegistered),
+        static_cast<unsigned>(audio.health),
+        static_cast<unsigned>(audio.transport), static_cast<unsigned>(audio.ownerThreadId), static_cast<unsigned long long>(audio.bufferFrames),
+        static_cast<unsigned long long>(audio.primeFrames), static_cast<unsigned long long>(audio.refillCount),
+        static_cast<unsigned long long>(audio.writtenFrames), static_cast<unsigned long long>(audio.queuedFrames),
+        static_cast<unsigned long long>(audio.outputUnderflows), static_cast<unsigned long long>(audio.sourceMissingFrames),
+        static_cast<unsigned long long>(audio.sourceUnderruns),
+        static_cast<unsigned long long>(audio.deviceFailures), static_cast<unsigned long long>(audio.recoveryAttempts),
+        static_cast<unsigned long long>(audio.recoveredCount),
+        static_cast<unsigned long long>(audio.nonzeroSubmittedFrames), static_cast<unsigned long long>(audio.maximumConsecutiveZeroSubmittedFrames),
+        static_cast<long long>(audio.maximumWriteGap),
+        static_cast<long long>(audio.maximumWakeGap), static_cast<long long>(audio.maximumServiceDuration),
+        static_cast<unsigned long long>(audio.laneSources[0].sourceToken),
+        static_cast<unsigned long long>(audio.laneCursorFrames[0]), audio.embeddedTempo,
+        static_cast<unsigned long long>(audio.laneSources[1].sourceToken),
+        static_cast<unsigned long long>(audio.laneCursorFrames[1]),
+        static_cast<unsigned long long>(audio.laneSources[2].sourceToken),
+        static_cast<unsigned long long>(audio.laneCursorFrames[2]));
     std::fflush(stderr);
-}
-
-MediaType mediaTypeForPath(const std::filesystem::path& path)
-{
-    std::string extension = path.extension().string();
-    for (char& character : extension)
-    {
-        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-    }
-
-    if (extension == ".mp4"
-        || extension == ".avi"
-        || extension == ".mov"
-        || extension == ".mkv"
-        || extension == ".webm"
-        || extension == ".video")
-    {
-        return MediaType::Video;
-    }
-
-    if (extension == ".png"
-        || extension == ".jpg"
-        || extension == ".jpeg"
-        || extension == ".webp"
-        || extension.empty())
-    {
-        return MediaType::Image;
-    }
-
-    return MediaType::Unknown;
 }
 
 std::filesystem::path pathFromUtf8(const std::string& value)
@@ -388,69 +358,26 @@ std::filesystem::path pathFromUtf8(const std::string& value)
     };
 }
 
-std::unique_ptr<MediaResource> createMediaResource(const Media& media)
+const DesktopSceneEngine::Domain::Scene* findScene(
+    const DesktopSceneEngine::Domain::Project& project, const DesktopSceneEngine::Domain::EntityId& id)
 {
-    const std::filesystem::path resourcePath = pathFromUtf8(
-        media.resourceReference);
-    const MediaType type = mediaTypeForPath(resourcePath);
-    if (type == MediaType::Video)
-    {
-        auto video = std::make_unique<VideoResource>();
-        if (!video->open(resourcePath))
-        {
-            return nullptr;
-        }
-
-        return video;
-    }
-
-    if (type == MediaType::Image || type == MediaType::Unknown)
-    {
-        auto image = std::make_unique<ImageResource>();
-        if (!image->loadFromFile(resourcePath))
-        {
-            return nullptr;
-        }
-
-        return image;
-    }
-
-    return nullptr;
+    const auto found = std::find_if(project.scenes.begin(), project.scenes.end(),
+        [&](const auto& candidate) { return candidate.id == id; });
+    return found != project.scenes.end() ? &*found : nullptr;
 }
 
-std::unique_ptr<AudioResource> createAudioResource(
-    const Media& media,
-    AudioOpenStatus& status)
+const Media* findSceneMedia(
+    const DesktopSceneEngine::Domain::Project& project, const DesktopSceneEngine::Domain::Scene& scene)
 {
-    status = AudioOpenStatus::NotOpened;
-    const std::filesystem::path resourcePath = pathFromUtf8(
-        media.resourceReference);
-    auto audio = std::make_unique<AudioResource>();
-    if (!audio->open(resourcePath))
-    {
-        status = audio->openStatus();
-        return nullptr;
-    }
-
-    status = audio->openStatus();
-    return audio;
+    const auto found = std::find_if(project.library.media.begin(), project.library.media.end(),
+        [&](const auto& candidate) { return candidate.id == scene.mediaId; });
+    return found != project.library.media.end() ? &*found : nullptr;
 }
 
-void reportAudioOpenFailure(AudioOpenStatus status) noexcept
+float clampedSeek(float seconds, float duration) noexcept
 {
-    if (status == AudioOpenStatus::NoAudioStream)
-    {
-        std::fprintf(
-            stderr,
-            "[Engine] video has no embedded audio stream; continuing video-only\n");
-    }
-    else if (status == AudioOpenStatus::DecodeFailure)
-    {
-        std::fprintf(
-            stderr,
-            "[Engine] embedded audio decode failed; continuing video-only\n");
-    }
-    std::fflush(stderr);
+    if (seconds <= 0) return 0;
+    return (std::min)(seconds, std::nextafter(duration, 0.0F));
 }
 
 bool effectiveSceneDuration(
@@ -483,53 +410,6 @@ bool effectiveSceneDuration(
 
     duration = scene.duration;
     return true;
-}
-
-bool uploadInitialMedia(Renderer& renderer, MediaResource& resource, float time)
-{
-    if (resource.type() == MediaType::Image)
-    {
-        const auto* image = dynamic_cast<const ImageResource*>(&resource);
-        return image != nullptr
-            && renderer.updateImage(
-                image->data(),
-                image->width(),
-                image->height(),
-                image->channels(),
-                image->rowStride(),
-                image->byteSize()) != MediaUpdateResult::ResourceFailure;
-    }
-
-    if (resource.type() == MediaType::Video)
-    {
-        auto* video = dynamic_cast<VideoResource*>(&resource);
-        if (video == nullptr || !video->frameAt(time))
-        {
-            return false;
-        }
-
-        const DesktopSceneEngine::Resources::DecodedFrame& frame = video->currentFrame();
-        if (!video->verifyBufferGuard("before-renderer-update"))
-        {
-            return false;
-        }
-
-        const MediaUpdateResult updateResult = renderer.updateFrame(
-            frame.data,
-            frame.width,
-            frame.height,
-            frame.channels,
-            frame.rowStride,
-            frame.byteSize);
-        if (!video->verifyBufferGuard("after-renderer-update"))
-        {
-            return false;
-        }
-
-        return updateResult != MediaUpdateResult::ResourceFailure;
-    }
-
-    return false;
 }
 
 std::optional<DesktopSceneEngine::Rendering::Detail::MediaView> currentMediaView(
@@ -603,25 +483,39 @@ DesktopSceneEngine::Rendering::RenderData makeActiveSceneRenderData(
 namespace DesktopSceneEngine
 {
 
-Engine::Engine()
-    : sceneRuntime_(std::make_unique<Runtime::SceneRuntime>()),
-      renderer_(std::make_unique<Rendering::Renderer>()),
-      audioMixer_(std::make_unique<AudioMixer>()),
-      audioOutput_(std::make_unique<Platform::Audio::AudioOutput>()),
-      defaultAudioEndpointWatcher_(std::make_unique<Platform::Audio::DefaultAudioEndpointWatcher>()),
-      mixedOutputBridge_(std::make_unique<MixedOutputBridge>(
-          *audioMixer_,
-          *audioOutput_)),
-      audioOutputOperationalState_(Core::AudioOutputOperationalState::Healthy)
+struct Engine::MediaPresentationCheckpoint
+{
+    MediaPreparationToken ticket = 0;
+    bool seek = false;
+    std::unique_ptr<const Domain::Project> project;
+    Domain::EntityId scene;
+    Domain::Playback playback;
+    std::filesystem::path source;
+    std::shared_ptr<const PresentationFrame> frame;
+    Audio::AudioClockAnchor clock;
+    MediaPreparationToken binding = 0;
+    MediaKind kind = MediaKind::Unknown;
+    float duration = 0;
+    float frameTime = -1;
+    double presentedTime = -1;
+    bool paused = false;
+    bool videoAtEnd = false;
+    bool completionPending = false;
+    bool completionHalted = false;
+};
+
+Engine::Engine() : Engine(PresentationMode::Inline) {}
+
+Engine::Engine(PresentationMode presentationMode)
+    : audioControl_(std::make_unique<AudioControl>()),
+      sceneRuntime_(std::make_unique<Runtime::SceneRuntime>()),
+      presentation_(presentationMode == PresentationMode::Inline
+          ? std::make_unique<EnginePresentation>() : nullptr)
 {
     backgroundMusicRuntime_ = std::make_unique<Music::BackgroundMusicRuntime>();
-    backgroundMusicExecutor_ = std::make_unique<Music::BackgroundMusicExecutor>(*audioMixer_);
     backgroundMusicOrchestrator_ = std::make_unique<Music::BackgroundMusicOrchestrator>(
         *backgroundMusicRuntime_,
-        [executor = backgroundMusicExecutor_.get()](const Music::MusicRuntimeAction& action)
-        {
-            return executor->execute(action);
-        });
+        [this](const Music::MusicRuntimeAction& action) { return audioControl_->music(action); });
 }
 
 Engine::~Engine()
@@ -629,647 +523,115 @@ Engine::~Engine()
     shutdown();
 }
 
-void Engine::removeEmbeddedAudioInput() noexcept
-{
-    if (embeddedAudioInputHandleValue_ == 0U)
-    {
-        return;
-    }
-
-    if (audioMixer_)
-    {
-        // AudioMixer::removeInput() returns false only when the handle is no
-        // longer present, so the Mixer cannot retain this adapter on failure.
-        (void)audioMixer_->removeInput(
-            AudioInputHandle{embeddedAudioInputHandleValue_});
-    }
-    embeddedAudioInputHandleValue_ = 0U;
-}
-
-void Engine::stopSharedAudioOutput() noexcept
-{
-    if (audioOutput_)
-    {
-        audioOutput_->stop();
-    }
-    sharedAudioOutputState_ = static_cast<std::uint8_t>(
-        Core::SharedAudioOutputState::Stopped);
-    audioOutputInactiveDiagnosticReported_ = false;
-}
-
-bool Engine::hasAudioInputPresence() const noexcept
-{
-    return embeddedAudioInputHandleValue_ != 0U
-        || (backgroundMusicExecutor_ && backgroundMusicExecutor_->hasActiveSources());
-}
-
-Core::SharedAudioOutputState Engine::desiredSharedAudioOutputState() const noexcept
-{
-    const Core::PlaybackActivity activity = !projectBound_
-            || !playbackRuntime_
-            || !playbackRuntime_->isConfigured()
-        ? Core::PlaybackActivity::Stopped
-        : playbackRuntime_->isPaused()
-            ? Core::PlaybackActivity::Paused
-            : Core::PlaybackActivity::Playing;
-    return Core::resolveSharedAudioOutputTransition(
-        activity,
-        hasAudioInputPresence(),
-        Core::SharedAudioOutputState::Stopped).desiredState;
-}
-
-void Engine::enterAudioOutputDeviceUnavailable() noexcept
-{
-    const bool newOutage = audioOutputOperationalState_
-        != Core::AudioOutputOperationalState::DeviceUnavailable;
-    audioOutputOperationalState_ = Core::AudioOutputOperationalState::DeviceUnavailable;
-    audioOutputRetryElapsedSeconds_ = 0.0;
-    embeddedAudioNeedsResyncAfterOutputRecovery_ = embeddedAudioInputHandleValue_ != 0U;
-    stopSharedAudioOutput();
-
-    if (newOutage)
-    {
-        std::fprintf(stderr, "[Engine] shared audio output device unavailable\n");
-        std::fflush(stderr);
-    }
-}
-
-void Engine::enterAudioOutputContractFaulted() noexcept
-{
-    const bool newFault = audioOutputOperationalState_
-        != Core::AudioOutputOperationalState::ContractFaulted;
-    audioOutputOperationalState_ = Core::AudioOutputOperationalState::ContractFaulted;
-    audioOutputRetryElapsedSeconds_ = 0.0;
-    embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-    stopSharedAudioOutput();
-
-    if (newFault)
-    {
-        std::fprintf(stderr, "[Engine] shared audio output contract faulted\n");
-        std::fflush(stderr);
-    }
-}
-
-bool Engine::reconcileAudioOutputState(bool allowPrime) noexcept
-{
-    const Core::SharedAudioOutputState desiredState = desiredSharedAudioOutputState();
-    const Core::SharedAudioOutputTransition transition =
-        Core::resolveSharedAudioOutputTransition(
-            !projectBound_ || !playbackRuntime_ || !playbackRuntime_->isConfigured()
-                ? Core::PlaybackActivity::Stopped
-                : playbackRuntime_->isPaused()
-                    ? Core::PlaybackActivity::Paused
-                    : Core::PlaybackActivity::Playing,
-            hasAudioInputPresence(),
-            static_cast<Core::SharedAudioOutputState>(sharedAudioOutputState_));
-
-    if (audioOutputOperationalState_ != Core::AudioOutputOperationalState::Healthy)
-    {
-        if (desiredState == Core::SharedAudioOutputState::Stopped)
-        {
-            stopSharedAudioOutput();
-            audioOutputRetryElapsedSeconds_ = 0.0;
-            if (!hasAudioInputPresence())
-            {
-                embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-            }
-            return true;
-        }
-
-        return false;
-    }
-
-    if (!audioOutput_)
-    {
-        sharedAudioOutputState_ = static_cast<std::uint8_t>(
-            Core::SharedAudioOutputState::Stopped);
-        return transition.desiredState == Core::SharedAudioOutputState::Stopped;
-    }
-
-    switch (transition.command)
-    {
-    case Core::SharedAudioOutputCommand::None:
-        return true;
-
-    case Core::SharedAudioOutputCommand::Stop:
-        stopSharedAudioOutput();
-        return true;
-
-    case Core::SharedAudioOutputCommand::BeginRunning:
-    case Core::SharedAudioOutputCommand::ConfigurePaused:
-    {
-        const bool initialized = audioOutputRecoveryTestHooks_
-                && audioOutputRecoveryTestHooks_->initialize
-            ? audioOutputRecoveryTestHooks_->initialize()
-            : audioOutput_->initialize();
-        if (!initialized)
-        {
-            enterAudioOutputDeviceUnavailable();
-            return false;
-        }
-
-        audioOutput_->setVolume(1.0F);
-        const AudioBlockStartMode startMode =
-            transition.command == Core::SharedAudioOutputCommand::BeginRunning
-                ? AudioBlockStartMode::StartImmediately
-                : AudioBlockStartMode::ConfigurePaused;
-        const AudioBlockStatus status = audioOutputRecoveryTestHooks_
-                && audioOutputRecoveryTestHooks_->beginBlockMode
-            ? audioOutputRecoveryTestHooks_->beginBlockMode(startMode)
-            : audioOutput_->beginBlockMode(startMode);
-        if (status != AudioBlockStatus::Success)
-        {
-            if (status == AudioBlockStatus::DeviceFailure)
-            {
-                enterAudioOutputDeviceUnavailable();
-            }
-            else
-            {
-                enterAudioOutputContractFaulted();
-            }
-            return false;
-        }
-
-        sharedAudioOutputState_ = static_cast<std::uint8_t>(transition.desiredState);
-        break;
-    }
-
-    case Core::SharedAudioOutputCommand::Pause:
-    {
-        const AudioBlockStatus status = audioOutputRecoveryTestHooks_
-                && audioOutputRecoveryTestHooks_->pause
-            ? audioOutputRecoveryTestHooks_->pause()
-            : audioOutput_->pause();
-        if (status == AudioBlockStatus::DeviceFailure)
-        {
-            enterAudioOutputDeviceUnavailable();
-            return false;
-        }
-        if (status != AudioBlockStatus::Success)
-        {
-            enterAudioOutputContractFaulted();
-            return false;
-        }
-        sharedAudioOutputState_ = static_cast<std::uint8_t>(
-            Core::SharedAudioOutputState::Paused);
-        break;
-    }
-
-    case Core::SharedAudioOutputCommand::Resume:
-    {
-        const AudioBlockStatus status = audioOutputRecoveryTestHooks_
-                && audioOutputRecoveryTestHooks_->resume
-            ? audioOutputRecoveryTestHooks_->resume()
-            : audioOutput_->resume();
-        if (status == AudioBlockStatus::DeviceFailure)
-        {
-            enterAudioOutputDeviceUnavailable();
-            return false;
-        }
-        if (status != AudioBlockStatus::Success)
-        {
-            enterAudioOutputContractFaulted();
-            return false;
-        }
-        sharedAudioOutputState_ = static_cast<std::uint8_t>(
-            Core::SharedAudioOutputState::Running);
-        break;
-    }
-    }
-
-    return !transition.shouldPrime || !allowPrime || pumpMixedAudio();
-}
-
-bool Engine::recoverAudioOutput(Core::SharedAudioOutputState desiredState) noexcept
-{
-    if (!audioOutput_ || desiredState == Core::SharedAudioOutputState::Stopped)
-    {
-        return false;
-    }
-
-    if (audioOutputRecoveryTestHooks_ && audioOutputRecoveryTestHooks_->shutdown)
-    {
-        audioOutputRecoveryTestHooks_->shutdown();
-    }
-    else
-    {
-        audioOutput_->shutdown();
-    }
-    const bool initialized = audioOutputRecoveryTestHooks_
-            && audioOutputRecoveryTestHooks_->initialize
-        ? audioOutputRecoveryTestHooks_->initialize()
-        : audioOutput_->initialize();
-    if (!initialized)
-    {
-        enterAudioOutputDeviceUnavailable();
-        return false;
-    }
-
-    if (embeddedAudioNeedsResyncAfterOutputRecovery_)
-    {
-        removeEmbeddedAudioInput();
-        embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-        if (audioResource_ && playbackRuntime_)
-        {
-            (void)configureEmbeddedAudioInputAt(
-                playbackRuntime_->currentTime(),
-                playbackRuntime_->configuration().speed);
-        }
-    }
-
-    desiredState = desiredSharedAudioOutputState();
-    if (desiredState == Core::SharedAudioOutputState::Stopped)
-    {
-        stopSharedAudioOutput();
-        audioOutputOperationalState_ = Core::AudioOutputOperationalState::Healthy;
-        audioOutputRetryElapsedSeconds_ = 0.0;
-        return true;
-    }
-
-    audioOutput_->setVolume(1.0F);
-    const AudioBlockStartMode startMode = desiredState == Core::SharedAudioOutputState::Running
-        ? AudioBlockStartMode::StartImmediately
-        : AudioBlockStartMode::ConfigurePaused;
-    const AudioBlockStatus status = audioOutputRecoveryTestHooks_
-            && audioOutputRecoveryTestHooks_->beginBlockMode
-        ? audioOutputRecoveryTestHooks_->beginBlockMode(startMode)
-        : audioOutput_->beginBlockMode(startMode);
-    if (status == AudioBlockStatus::DeviceFailure)
-    {
-        enterAudioOutputDeviceUnavailable();
-        return false;
-    }
-    if (status != AudioBlockStatus::Success)
-    {
-        enterAudioOutputContractFaulted();
-        return false;
-    }
-
-    audioOutputOperationalState_ = Core::AudioOutputOperationalState::Healthy;
-    audioOutputRetryElapsedSeconds_ = 0.0;
-    sharedAudioOutputState_ = static_cast<std::uint8_t>(desiredState);
-    std::fprintf(stderr, "[Engine] shared audio output recovered\n");
-    std::fflush(stderr);
-
-    return desiredState != Core::SharedAudioOutputState::Running || pumpMixedAudio();
-}
-
-void Engine::advanceAudioOutputRecovery(float deltaTime) noexcept
-{
-    if (audioOutputOperationalState_ != Core::AudioOutputOperationalState::DeviceUnavailable)
-    {
-        return;
-    }
-
-    if (std::isfinite(deltaTime) && deltaTime > 0.0F)
-    {
-        const double elapsed = audioOutputRetryElapsedSeconds_
-            + static_cast<double>(deltaTime);
-        audioOutputRetryElapsedSeconds_ = std::isfinite(elapsed)
-            ? elapsed
-            : (std::numeric_limits<double>::max)();
-    }
-
-    const Core::SharedAudioOutputState desiredState = desiredSharedAudioOutputState();
-    const double cooldownSeconds = std::chrono::duration<double>(
-        Core::SharedAudioOutputRecoveryCooldown).count();
-    constexpr double floatDeltaToleranceSeconds = 0.000001;
-    const auto elapsedMilliseconds = audioOutputRetryElapsedSeconds_
-            + floatDeltaToleranceSeconds >= cooldownSeconds
-        ? Core::SharedAudioOutputRecoveryCooldown
-        : std::chrono::milliseconds{
-            static_cast<std::chrono::milliseconds::rep>(
-                std::min(
-                    audioOutputRetryElapsedSeconds_ * 1000.0,
-                    static_cast<double>((std::numeric_limits<std::chrono::milliseconds::rep>::max)())))};
-    const Core::SharedAudioOutputRecoveryAction action =
-        Core::resolveSharedAudioOutputRecoveryAction(
-            audioOutputOperationalState_,
-            desiredState,
-            elapsedMilliseconds);
-
-    switch (action)
-    {
-    case Core::SharedAudioOutputRecoveryAction::None:
-        return;
-
-    case Core::SharedAudioOutputRecoveryAction::CancelRecovery:
-        stopSharedAudioOutput();
-        audioOutputRetryElapsedSeconds_ = 0.0;
-        if (!hasAudioInputPresence())
-        {
-            embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-        }
-        return;
-
-    case Core::SharedAudioOutputRecoveryAction::RetryRunning:
-    case Core::SharedAudioOutputRecoveryAction::RetryPaused:
-        (void)recoverAudioOutput(desiredState);
-        return;
-    }
-}
-
-void Engine::observeDefaultAudioEndpointGeneration() noexcept
-{
-    std::uint64_t observedGeneration = lastSeenDefaultAudioEndpointGeneration_;
-    bool observationAvailable = false;
-    if (audioOutputRecoveryTestHooks_
-        && audioOutputRecoveryTestHooks_->defaultAudioEndpointGeneration)
-    {
-        observedGeneration = audioOutputRecoveryTestHooks_->defaultAudioEndpointGeneration();
-        observationAvailable = true;
-    }
-    else if (defaultAudioEndpointWatcherAvailable_ && defaultAudioEndpointWatcher_)
-    {
-        observedGeneration = defaultAudioEndpointWatcher_->generation();
-        observationAvailable = true;
-    }
-
-    if (observationAvailable && observedGeneration != lastSeenDefaultAudioEndpointGeneration_)
-    {
-        lastSeenDefaultAudioEndpointGeneration_ = observedGeneration;
-        defaultAudioEndpointRerouteRequested_ = true;
-    }
-}
-
-void Engine::rerouteDefaultAudioEndpoint() noexcept
-{
-    defaultAudioEndpointRerouteRequested_ = false;
-    if (audioOutputOperationalState_ == Core::AudioOutputOperationalState::ContractFaulted)
-    {
-        return;
-    }
-
-    const Core::SharedAudioOutputState desiredState = desiredSharedAudioOutputState();
-    if (desiredState == Core::SharedAudioOutputState::Stopped)
-    {
-        stopSharedAudioOutput();
-        if (audioOutputRecoveryTestHooks_ && audioOutputRecoveryTestHooks_->shutdown)
-        {
-            audioOutputRecoveryTestHooks_->shutdown();
-        }
-        else if (audioOutput_)
-        {
-            audioOutput_->shutdown();
-        }
-        audioOutputRetryElapsedSeconds_ = 0.0;
-        if (!hasAudioInputPresence())
-        {
-            embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-        }
-        return;
-    }
-
-    embeddedAudioNeedsResyncAfterOutputRecovery_ = embeddedAudioInputHandleValue_ != 0U;
-    (void)recoverAudioOutput(desiredState);
-}
-
-void Engine::releaseEmbeddedAudioResource() noexcept
-{
-    assert(embeddedAudioInputHandleValue_ == 0U);
-    audioResource_.reset();
-}
-
-bool Engine::setEmbeddedAudioTempo(float speed) noexcept
-{
-    assert(embeddedAudioInputHandleValue_ == 0U);
-    return audioResource_ && audioResource_->setTempo(speed);
-}
-
-bool Engine::configureEmbeddedAudioInputAt(
-    float mediaTime,
-    float playbackSpeed
-) noexcept
-{
-    if (!audioResource_ || !audioMixer_ || embeddedAudioInputHandleValue_ != 0U
-        || audioResource_->channels() != 2)
-    {
-        return false;
-    }
-
-    const double mediaDuration = audioResource_->durationSeconds();
-    if (!std::isfinite(mediaDuration)
-        || mediaDuration <= 0.0
-        || !std::isfinite(mediaTime)
-        || mediaTime < 0.0F
-        || static_cast<double>(mediaTime) >= mediaDuration)
-    {
-        return false;
-    }
-
-    const auto startFrame = Core::resolveEmbeddedAudioStartFrame(
-        audioResource_->frameCount(),
-        audioResource_->sampleRate(),
-        mediaTime,
-        playbackSpeed);
-    const std::int16_t* const data = audioResource_->data();
-    if (!startFrame.has_value() || data == nullptr)
-    {
-        return false;
-    }
-
-    std::unique_ptr<EmbeddedAudioMixerInput> input{};
-    try
-    {
-        input = std::make_unique<EmbeddedAudioMixerInput>(
-            std::span<const std::int16_t>{
-                data,
-                audioResource_->sampleCount()},
-            *startFrame);
-    }
-    catch (const std::bad_alloc&)
-    {
-        return false;
-    }
-    const AudioInputHandle handle = audioMixer_->addInput(
-        std::move(input),
-        embeddedAudioGain_);
-    if (!handle)
-    {
-        return false;
-    }
-
-    embeddedAudioInputHandleValue_ = handle.value;
-    return true;
-}
-
-bool Engine::pumpMixedAudio() noexcept
-{
-    if (!mixedOutputBridge_)
-    {
-        return false;
-    }
-
-    const auto result = audioOutputRecoveryTestHooks_
-            && audioOutputRecoveryTestHooks_->pump
-        ? audioOutputRecoveryTestHooks_->pump()
-        : mixedOutputBridge_->pump();
-    if (result.status == MixedOutputBridgeStatus::OutputInactive)
-    {
-        if (!audioOutputInactiveDiagnosticReported_)
-        {
-            std::fprintf(stderr, "[Engine] shared audio output inactive while running\n");
-            std::fflush(stderr);
-            audioOutputInactiveDiagnosticReported_ = true;
-        }
-        return true;
-    }
-    audioOutputInactiveDiagnosticReported_ = false;
-    if (result.status == MixedOutputBridgeStatus::DeviceFailure)
-    {
-        enterAudioOutputDeviceUnavailable();
-        return false;
-    }
-    if (result.status == MixedOutputBridgeStatus::OutputContractFailure)
-    {
-        enterAudioOutputContractFaulted();
-        return false;
-    }
-
-    return true;
-}
-
 void Engine::initialize()
 {
-    if (initialized_)
-    {
-        return;
-    }
+    if (initialized_ || !presentation_) return;
+    presentation_->initialize();
+    if (presentation_->isInitialized() && !initializeRuntime()) presentation_->shutdown();
+}
 
-    desktopWindowHost_ = std::make_unique<Platform::Windows::DesktopWindowHost>();
-    desktopWindowHost_->initialize();
+bool Engine::initializeRuntimeOnly()
+{
+    return !presentation_ && (initialized_ || initializeRuntime());
+}
 
-    if (!desktopWindowHost_->isInitialized())
-    {
-        desktopWindowHost_.reset();
-        return;
-    }
-
-    if (!initializeWithWindowHost())
-    {
-        desktopWindowHost_->shutdown();
-        desktopWindowHost_.reset();
-    }
+bool Engine::setControlWakeEvent(void* borrowedEvent) noexcept
+{
+    if (!borrowedEvent || controlWakeEvent_ || initialized_
+        || audioControl_->started || audioControl_->closing)
+        return false;
+    if (!audioControl_->execution.setControlWakeEvent(borrowedEvent)
+        || !audioControl_->preparation.setControlWakeEvent(borrowedEvent))
+        return false;
+    controlWakeEvent_ = borrowedEvent;
+    return true;
 }
 
 PresentationTargetId Engine::initialize(const ExternalWindowTarget& target)
 {
-    if (initialized_)
+    if (initialized_ || !presentation_) return {};
+    const auto id = presentation_->initialize(target);
+    if (id.isValid() && !initializeRuntime())
     {
+        presentation_->shutdown();
         return {};
     }
-
-    desktopWindowHost_ = std::make_unique<Platform::Windows::DesktopWindowHost>();
-    desktopWindowHost_->initializeExternal(target.handle);
-
-    if (!desktopWindowHost_->isInitialized())
-    {
-        desktopWindowHost_.reset();
-        return {};
-    }
-
-    if (!initializeWithWindowHost(target.transport))
-    {
-        desktopWindowHost_->shutdown();
-        desktopWindowHost_.reset();
-        return {};
-    }
-
-    return defaultPresentationTargetId_;
+    return id;
 }
 
-bool Engine::initializeWithWindowHost(PresentationTransport transport)
+PresentationTargetId Engine::initialize(const HostedCompositionTarget& target)
 {
-    if (!desktopWindowHost_ || !desktopWindowHost_->isInitialized())
+    if (initialized_ || !presentation_) return {};
+    const auto id = presentation_->initialize(target);
+    if (id.isValid() && !initializeRuntime())
     {
-        return false;
+        presentation_->shutdown();
+        return {};
     }
+    return id;
+}
 
-    Rendering::WindowTarget windowTarget = desktopWindowHost_->getWindowTarget();
-    windowTarget.transport = transport;
-    const PresentationTargetId targetId = renderer_->initialize(windowTarget);
-    if (!targetId.isValid())
+Renderer& Engine::renderer() noexcept
+{
+    assert(presentation_);
+    return *presentation_->renderer_;
+}
+
+bool Engine::initializeRuntime()
+{
+    if (audioControl_->closing && audioControl_->stopped())
     {
-        renderer_->shutdown();
-        return false;
+        // Only a completed execution lifetime may create a new incarnation.
+        // Scene/Stop/device transitions never clear ContractFaulted.
+        audioControl_ = std::make_unique<AudioControl>();
+        if (controlWakeEvent_ && (!audioControl_->execution.setControlWakeEvent(controlWakeEvent_)
+            || !audioControl_->preparation.setControlWakeEvent(controlWakeEvent_)))
+            return false;
+        backgroundMusicOrchestrator_.reset();
+        backgroundMusicRuntime_ = std::make_unique<Music::BackgroundMusicRuntime>();
+        backgroundMusicOrchestrator_ = std::make_unique<Music::BackgroundMusicOrchestrator>(
+            *backgroundMusicRuntime_, [this](const Music::MusicRuntimeAction& action) { return audioControl_->music(action); });
     }
-    defaultPresentationTargetId_ = targetId;
-
     playbackRuntime_ = std::make_unique<Runtime::PlaybackRuntime>();
-    if (audioOutput_)
-    {
-        audioOutput_->setVolume(1.0F);
-        const bool audioInitialized = audioOutputRecoveryTestHooks_
-                && audioOutputRecoveryTestHooks_->initialize
-            ? audioOutputRecoveryTestHooks_->initialize()
-            : audioOutput_->initialize();
-        if (!audioInitialized)
-        {
-            enterAudioOutputDeviceUnavailable();
-            std::fprintf(
-                stderr,
-                "[Engine] audio output initialization unavailable; continuing without audio\n");
-            std::fflush(stderr);
-        }
-    }
-
-    defaultAudioEndpointWatcherAvailable_ = false;
-    lastSeenDefaultAudioEndpointGeneration_ = 0U;
-    defaultAudioEndpointRerouteRequested_ = false;
-    if (defaultAudioEndpointWatcher_ && defaultAudioEndpointWatcher_->initialize())
-    {
-        defaultAudioEndpointWatcherAvailable_ = true;
-        lastSeenDefaultAudioEndpointGeneration_ = defaultAudioEndpointWatcher_->generation();
-    }
-    else
-    {
-        std::fprintf(
-            stderr,
-            "[Engine] default audio endpoint monitoring unavailable; continuing without hot-switch support\n");
-        std::fflush(stderr);
-    }
+    // Only A opens WASAPI / installs endpoint notifications. C never services it.
+    (void)audioControl_->start();
     initialized_ = true;
-
-    std::cout
-        << "Desktop Scene Engine initialized."
-        << std::endl;
-
+    std::cout << "Desktop Scene Engine initialized." << std::endl;
     return true;
 }
 
 PresentationTargetId Engine::attachPresentationTarget(
     const ExternalWindowTarget& target)
 {
-    if (!initialized_ || !renderer_ || target.handle == nullptr)
-    {
-        return {};
-    }
+    return presentation_ ? presentation_->attachPresentationTarget(target) : PresentationTargetId{};
+}
 
-    Rendering::WindowTarget windowTarget{};
-    windowTarget.handle = target.handle;
-    windowTarget.transport = target.transport;
-    return renderer_->attachPresentationTarget(windowTarget);
+PresentationTargetId Engine::attachPresentationTarget(
+    const HostedCompositionTarget& target)
+{
+    return presentation_ ? presentation_->attachPresentationTarget(target) : PresentationTargetId{};
+}
+
+bool Engine::setHostedPresentationExtent(
+    PresentationTargetId id, PresentationExtent extent) noexcept
+{
+    return presentation_ && presentation_->setHostedPresentationExtent(id, extent);
+}
+
+CompositionContentLease Engine::acquireHostedCompositionContent(
+    PresentationTargetId id) const noexcept
+{
+    return presentation_ ? presentation_->acquireHostedCompositionContent(id) : CompositionContentLease{};
 }
 
 bool Engine::detachPresentationTarget(PresentationTargetId id) noexcept
 {
-    if (!initialized_ || !renderer_
-        || !renderer_->detachPresentationTarget(id))
-    {
-        return false;
-    }
-
-    if (id == defaultPresentationTargetId_)
-    {
-        defaultPresentationTargetId_ = {};
-    }
-    return true;
+    return presentation_ && presentation_->detachPresentationTarget(id);
 }
 
 bool Engine::setPresentationPacingTarget(PresentationTargetId id) noexcept
 {
-    return initialized_ && renderer_
-        && renderer_->setPresentationPacingTarget(id);
+    return presentation_ && presentation_->setPresentationPacingTarget(id);
 }
 
 bool Engine::isInitialized() const noexcept
@@ -1277,11 +639,90 @@ bool Engine::isInitialized() const noexcept
     return initialized_;
 }
 
+PresentationInput Engine::presentationInput(const Domain::AspectRatio& canvasAspect) const
+{
+    const auto dimensions = detachedFrame_
+        ? std::optional{MediaDimensions{detachedFrame_->width, detachedFrame_->height}}
+        : std::nullopt;
+    const auto data = makeActiveSceneRenderData(
+        projectBound_ ? boundProject_ : nullptr, sceneRuntime_.get(),
+        dimensions, canvasAspect);
+    return {detachedFrame_, data.presentation, canvasAspect.isValid()
+        ? static_cast<double>(canvasAspect.numerator) / canvasAspect.denominator : 0.0};
+}
+
+bool Engine::stageMedia(const Rendering::Detail::MediaView& media, PresentationFrameKind kind)
+{
+    if (presentation_)
+    {
+        const auto result = kind == PresentationFrameKind::Image
+            ? renderer().updateImage(media.data, media.width, media.height, media.channels,
+                media.rowStride, media.byteSize)
+            : renderer().updateFrame(media.data, media.width, media.height, media.channels,
+                media.rowStride, media.byteSize);
+        return result != MediaUpdateResult::ResourceFailure;
+    }
+
+    if (!media.data || !Rendering::Detail::hasValidRgbaBuffer(
+        media.width, media.height, media.channels, media.rowStride, media.byteSize))
+        return false;
+    const auto height = static_cast<std::size_t>(media.height);
+    const auto size = media.rowStride * height;
+    if (size > std::vector<std::byte>{}.max_size()) return false;
+
+    try
+    {
+        auto frame = std::make_shared<PresentationFrame>();
+        frame->kind = kind;
+        frame->width = media.width;
+        frame->height = media.height;
+        frame->rowStride = media.rowStride;
+        frame->pixels.resize(size);
+        std::memcpy(frame->pixels.data(), media.data, size);
+        detachedFrame_ = std::move(frame);
+        return true;
+    }
+    catch (const std::bad_alloc&)
+    {
+        return false;
+    }
+}
+
+bool Engine::prepareInitialMedia(MediaResource& media)
+{
+    if (media.type() == MediaType::Image)
+    {
+        const auto view = currentMediaView(&media);
+        return view && stageMedia(*view, PresentationFrameKind::Image);
+    }
+
+    auto* video = dynamic_cast<VideoResource*>(&media);
+    if (!video || !video->frameAt(0.0F) || !video->verifyBufferGuard("before-renderer-update"))
+        return false;
+    const auto view = currentMediaView(&media);
+    const bool staged = view && stageMedia(*view, PresentationFrameKind::Video);
+    return video->verifyBufferGuard("after-renderer-update") && staged;
+}
+
+void Engine::clearPresentationMedia() noexcept
+{
+    if (presentation_) renderer().clearImage();
+    else detachedFrame_.reset();
+}
+
 bool Engine::bindProject(
     const Domain::Project& project,
     const Domain::EntityId& activeSceneId
 )
 {
+    if (mediaProducer_) return false;
+    pollAudioExecution();
+    const bool needsAdmission = !audioControl_->capture;
+    const auto implicit = needsAdmission ? beginAudioEffect(AudioEffectScope::Structural) : std::nullopt;
+    if (needsAdmission && !implicit) return false;
+    bool logicalAccepted = false;
+    const auto operationExit = ScopeExit{[&] { if (implicit) (void)finishAudioEffect(*implicit, logicalAccepted); }};
+
     if (!initialized_ || projectBound_)
     {
         return false;
@@ -1313,7 +754,7 @@ bool Engine::bindProject(
     {
         if (activeScene != nullptr && media.id == activeScene->mediaId)
         {
-            mediaResource = createMediaResource(media);
+            mediaResource = Resources::openPlaybackResource(pathFromUtf8(media.resourceReference));
             activeMedia = &media;
             if (mediaResource == nullptr)
             {
@@ -1323,25 +764,11 @@ bool Engine::bindProject(
         }
     }
 
-    std::unique_ptr<AudioResource> audioResource{};
-    AudioOpenStatus audioStatus = AudioOpenStatus::NotOpened;
-    if (activeMedia != nullptr
-        && mediaResource
-        && mediaResource->type() == MediaType::Video
-        && audioOutput_)
-    {
-        audioResource = createAudioResource(*activeMedia, audioStatus);
-        if (!audioResource)
-        {
-            reportAudioOpenFailure(audioStatus);
-        }
-    }
-
     float effectiveDuration = 0.0F;
     if (mediaResource)
     {
         if (!effectiveSceneDuration(*activeScene, *mediaResource, effectiveDuration)
-            || !uploadInitialMedia(*renderer_, *mediaResource, 0.0F))
+            || !prepareInitialMedia(*mediaResource))
         {
             return false;
         }
@@ -1355,32 +782,9 @@ bool Engine::bindProject(
     if (!mediaResource)
     {
         effectiveDuration = activeScene->duration;
-        renderer_->clearImage();
+        clearPresentationMedia();
     }
-    if (embeddedAudioInputHandleValue_ != 0U)
-    {
-        // V1 scene-replacement policy: queued samples for the previous
-        // embedded track must not bleed into a newly bound Project. BGM
-        // registrations remain in the Mixer and resume from their cursors.
-        stopSharedAudioOutput();
-    }
-    embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-    removeEmbeddedAudioInput();
-    releaseEmbeddedAudioResource();
-    audioResource_ = std::move(audioResource);
-    if (audioResource_
-        && (!setEmbeddedAudioTempo(playback.speed)
-            || !configureEmbeddedAudioInputAt(
-                0.0F,
-                playback.speed)))
-    {
-        std::fprintf(
-            stderr,
-            "[Engine] audio output rejected decoded audio; continuing video-only\n");
-        std::fflush(stderr);
-        removeEmbeddedAudioInput();
-        releaseEmbeddedAudioResource();
-    }
+    audioControl_->retire(Audio::AudioLane::Embedded);
     sceneRuntime_->setActiveScene(activeSceneId);
     playbackRuntime_->configure(playback, effectiveDuration);
     double initialVideoPresentedTime = -1.0;
@@ -1405,7 +809,12 @@ bool Engine::bindProject(
     pendingNaturalSceneCompletion_ = false;
     naturalSceneCompletionHalted_ = false;
 
-    (void)reconcileAudioOutputState(true);
+    audioControl_->configureClock(*this, 0.0, false);
+    const auto* audioMedia = activeMedia;
+    if (audioMedia && mediaResource_ && mediaResource_->type() == MediaType::Video)
+        audioControl_->prepareEmbedded(*this, pathFromUtf8(audioMedia->resourceReference),
+            playback.speed, AudioControl::SourcePurpose::EmbeddedBind);
+    logicalAccepted = true;
     return true;
 }
 
@@ -1414,6 +823,14 @@ bool Engine::switchScene(
     const Domain::EntityId& sceneId
 )
 {
+    if (mediaProducer_) return false;
+    pollAudioExecution();
+    const bool needsAdmission = !audioControl_->capture;
+    const auto implicit = needsAdmission ? beginAudioEffect(AudioEffectScope::Structural) : std::nullopt;
+    if (needsAdmission && !implicit) return false;
+    bool logicalAccepted = false;
+    const auto operationExit = ScopeExit{[&] { if (implicit) (void)finishAudioEffect(*implicit, logicalAccepted); }};
+
     if (!initialized_ || !projectBound_ || boundProject_ != &project)
     {
         return false;
@@ -1442,27 +859,13 @@ bool Engine::switchScene(
     {
         if (media.id == requestedScene->mediaId)
         {
-            mediaResource = createMediaResource(media);
+            mediaResource = Resources::openPlaybackResource(pathFromUtf8(media.resourceReference));
             requestedMedia = &media;
             if (mediaResource == nullptr)
             {
                 return false;
             }
             break;
-        }
-    }
-
-    std::unique_ptr<AudioResource> audioResource{};
-    AudioOpenStatus audioStatus = AudioOpenStatus::NotOpened;
-    if (requestedMedia != nullptr
-        && mediaResource
-        && mediaResource->type() == MediaType::Video
-        && audioOutput_)
-    {
-        audioResource = createAudioResource(*requestedMedia, audioStatus);
-        if (!audioResource)
-        {
-            reportAudioOpenFailure(audioStatus);
         }
     }
 
@@ -1473,7 +876,7 @@ bool Engine::switchScene(
                 *requestedScene,
                 *mediaResource,
                 effectiveDuration)
-            || !uploadInitialMedia(*renderer_, *mediaResource, 0.0F))
+            || !prepareInitialMedia(*mediaResource))
         {
             return false;
         }
@@ -1486,31 +889,9 @@ bool Engine::switchScene(
     else
     {
         effectiveDuration = requestedScene->duration;
-        renderer_->clearImage();
+        clearPresentationMedia();
     }
-    if (embeddedAudioInputHandleValue_ != 0U)
-    {
-        // V1 scene-replacement policy: flush old embedded media samples while
-        // preserving all BGM registrations and their source cursors.
-        stopSharedAudioOutput();
-    }
-    embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-    removeEmbeddedAudioInput();
-    releaseEmbeddedAudioResource();
-    audioResource_ = std::move(audioResource);
-    if (audioResource_
-        && (!setEmbeddedAudioTempo(playback.speed)
-            || !configureEmbeddedAudioInputAt(
-                0.0F,
-                playback.speed)))
-    {
-        std::fprintf(
-            stderr,
-            "[Engine] audio output rejected decoded audio; continuing video-only\n");
-        std::fflush(stderr);
-        removeEmbeddedAudioInput();
-        releaseEmbeddedAudioResource();
-    }
+    audioControl_->retire(Audio::AudioLane::Embedded);
     sceneRuntime_->setActiveScene(sceneId);
     playbackRuntime_->configure(playback, effectiveDuration);
     double initialVideoPresentedTime = -1.0;
@@ -1547,12 +928,22 @@ bool Engine::switchScene(
         static_cast<double>(requestedScene->duration));
     std::fflush(stderr);
 
-    (void)reconcileAudioOutputState(true);
+    audioControl_->configureClock(*this, 0.0, false);
+    const auto* audioMedia = requestedMedia;
+    if (audioMedia && mediaResource_ && mediaResource_->type() == MediaType::Video)
+        audioControl_->prepareEmbedded(*this, pathFromUtf8(audioMedia->resourceReference),
+            playback.speed, AudioControl::SourcePurpose::EmbeddedBind);
+    logicalAccepted = true;
     return true;
 }
 
 void Engine::detachProject()
 {
+    if (pendingMediaPreparation_) cancelMediaPreparation(pendingMediaPreparation_->ticket);
+    if (mediaProducer_) mediaProducer_->clearBinding();
+    detachedMediaBinding_ = 0;
+    detachedMediaKind_ = MediaKind::Unknown;
+    detachedVideoAtEnd_ = false;
     sceneRuntime_->clearActiveScene();
 
     if (playbackRuntime_)
@@ -1560,17 +951,17 @@ void Engine::detachProject()
         playbackRuntime_->reset();
     }
 
-    if (renderer_)
-    {
-        renderer_->clearImage();
-    }
+    clearPresentationMedia();
 
-    stopSharedAudioOutput();
-    removeEmbeddedAudioInput();
-    embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-    audioOutputRetryElapsedSeconds_ = 0.0;
+    // Detaching a visual projection is also used for an Item rebind. BGM's
+    // Session/token lifetime is independent and is retired only by the explicit
+    // PlaybackStopped control (or execution shutdown), never by this binding.
+    audioControl_->retire(Audio::AudioLane::Embedded);
+    audioControl_->clock = {};
+    audioControl_->plannedClock = {};
+    audioControl_->pendingBinding.reset();
+    audioControl_->embeddedPath.clear();
     mediaResource_.reset();
-    releaseEmbeddedAudioResource();
     videoFrameTime_ = -1.0F;
     videoPresentedTime_ = -1.0;
     syncDiagnosticUpdates_ = 0U;
@@ -1579,12 +970,325 @@ void Engine::detachProject()
 
     boundProject_ = nullptr;
     projectBound_ = false;
-    (void)reconcileAudioOutputState(false);
+    detachedProject_.reset();
+    mediaPresentation_.reset();
+}
+
+bool Engine::enableAsyncMediaPreparation()
+{
+    if (!initialized_ || presentation_ || projectBound_
+        || sceneCompletionPolicy_ != SceneCompletionPolicy::ExternalSceneCompletion)
+        return false;
+    if (mediaProducer_) return true;
+    try
+    {
+        mediaProducer_ = std::make_unique<Resources::DetachedMediaProducer>(controlWakeEvent_);
+        mediaShuttingDown_ = false;
+        return true;
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+}
+
+std::optional<Engine::MediaPreparationToken> Engine::prepareSceneMedia(
+    const Domain::Project& project, const Domain::EntityId& id, float initialTime)
+{
+    if (!mediaProducer_ || mediaShuttingDown_ || pendingMediaPreparation_ || !std::isfinite(initialTime)
+        || nextMediaTicket_ == (std::numeric_limits<MediaPreparationToken>::max)())
+        return std::nullopt;
+    const auto* scene = findScene(project, id);
+    if (!scene) return std::nullopt;
+    const auto* media = findSceneMedia(project, *scene);
+    if (!media && (!std::isfinite(scene->duration) || scene->duration < 0))
+        return std::nullopt;
+    try
+    {
+        PendingMediaPreparation pending{++nextMediaTicket_, id, std::nullopt, scene->duration};
+        std::optional<std::filesystem::path> path;
+        if (media)
+        {
+            pending.source = media->resourceReference;
+            path = pathFromUtf8(*pending.source);
+        }
+        if (!mediaProducer_->prepareScene(pending.ticket, std::move(path), scene->duration, initialTime))
+            return std::nullopt;
+        pendingMediaPreparation_ = std::move(pending);
+        return pendingMediaPreparation_->ticket;
+    }
+    catch (const std::exception&)
+    {
+        return std::nullopt;
+    }
+}
+
+std::optional<Engine::MediaPreparationToken> Engine::prepareSeek(float seconds)
+{
+    const auto duration = effectiveDuration();
+    if (!mediaProducer_ || mediaShuttingDown_ || pendingMediaPreparation_
+        || !projectBound_ || !std::isfinite(seconds) || !std::isfinite(duration) || duration <= 0
+        || nextMediaTicket_ == (std::numeric_limits<MediaPreparationToken>::max)())
+        return std::nullopt;
+    try
+    {
+        PendingMediaPreparation pending{++nextMediaTicket_, sceneRuntime_->activeSceneId(),
+            std::nullopt, duration, clampedSeek(seconds, duration), true, detachedMediaKind_ != MediaKind::Video};
+        if (!pending.seekWithoutVideo
+            && !mediaProducer_->prepareSeek(pending.ticket, detachedMediaBinding_, pending.position, duration))
+            return std::nullopt;
+        pendingMediaPreparation_ = std::move(pending);
+        return pendingMediaPreparation_->ticket;
+    }
+    catch (const std::exception&)
+    {
+        return std::nullopt;
+    }
+}
+
+Engine::MediaPreparationStatus Engine::preparedMediaStatus(MediaPreparationToken ticket) const noexcept
+{
+    if (!pendingMediaPreparation_ || pendingMediaPreparation_->ticket != ticket || !mediaProducer_)
+        return MediaPreparationStatus::Expired;
+    if (pendingMediaPreparation_->seekWithoutVideo) return MediaPreparationStatus::Ready;
+    switch (mediaProducer_->preparedState(ticket))
+    {
+    case Resources::DetachedMediaProducer::State::Pending: return MediaPreparationStatus::Pending;
+    case Resources::DetachedMediaProducer::State::Ready: return MediaPreparationStatus::Ready;
+    case Resources::DetachedMediaProducer::State::Failed: return MediaPreparationStatus::Failed;
+    case Resources::DetachedMediaProducer::State::Expired: return MediaPreparationStatus::Expired;
+    }
+    return MediaPreparationStatus::Expired;
+}
+
+std::unique_ptr<Engine::MediaPresentationCheckpoint> Engine::captureMediaPresentation(
+    MediaPreparationToken ticket, bool seek) const
+{
+    auto checkpoint = std::make_unique<MediaPresentationCheckpoint>();
+    checkpoint->ticket = ticket;
+    checkpoint->seek = seek;
+    if (projectBound_)
+    {
+        checkpoint->scene = sceneRuntime_->activeSceneId();
+        checkpoint->playback = playbackRuntime_->configuration();
+        checkpoint->duration = playbackRuntime_->duration();
+        checkpoint->paused = playbackRuntime_->isPaused();
+        if (!seek && detachedMediaKind_ == MediaKind::Video)
+        {
+            const auto* scene = findScene(*boundProject_, checkpoint->scene);
+            if (const auto* media = scene ? findSceneMedia(*boundProject_, *scene) : nullptr)
+                checkpoint->source = pathFromUtf8(media->resourceReference);
+        }
+    }
+    checkpoint->frame = detachedFrame_;
+    checkpoint->binding = detachedMediaBinding_;
+    checkpoint->kind = detachedMediaKind_;
+    checkpoint->frameTime = videoFrameTime_;
+    checkpoint->presentedTime = videoPresentedTime_;
+    checkpoint->videoAtEnd = detachedVideoAtEnd_;
+    checkpoint->completionPending = pendingNaturalSceneCompletion_;
+    checkpoint->completionHalted = naturalSceneCompletionHalted_;
+    checkpoint->clock = audioControl_->clock.binding == audioControl_->binding
+        ? audioControl_->clock : audioControl_->plannedClock;
+    return checkpoint;
+}
+
+bool Engine::commitPreparedScene(const Domain::Project& project, const Domain::EntityId& id,
+    MediaPreparationToken ticket, bool paused, std::optional<float> playbackRate)
+{
+    if (!pendingMediaPreparation_ || pendingMediaPreparation_->seek || pendingMediaPreparation_->scene != id
+        || preparedMediaStatus(ticket) != MediaPreparationStatus::Ready)
+        return false;
+    const auto* scene = findScene(project, id);
+    const auto* media = scene ? findSceneMedia(project, *scene) : nullptr;
+    const auto& pending = *pendingMediaPreparation_;
+    if (!scene || bool(media) != pending.source.has_value() || (media && media->resourceReference != *pending.source)
+        || (scene->duration != pending.declaredDuration
+            && !(std::isnan(scene->duration) && std::isnan(pending.declaredDuration))))
+        return false;
+    if (playbackRate && (!std::isfinite(*playbackRate) || *playbackRate < 0.5F || *playbackRate > 2.0F))
+        return false;
+    auto playback = scene->playback;
+    if (playbackRate) playback.speed = *playbackRate;
+    std::filesystem::path mediaPath;
+    pollAudioExecution();
+    std::unique_ptr<const Domain::Project> detachedProject;
+    std::unique_ptr<MediaPresentationCheckpoint> checkpoint;
+    try
+    {
+        if (media) mediaPath = pathFromUtf8(media->resourceReference);
+        detachedProject = std::make_unique<const Domain::Project>(project);
+        checkpoint = captureMediaPresentation(ticket, false);
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+    const auto implicit = audioControl_->capture ? std::nullopt : beginAudioEffect(AudioEffectScope::Structural);
+    if (!audioControl_->capture) return false;
+    bool logicalAccepted = false;
+    const auto exit = ScopeExit{[&] { if (implicit) (void)finishAudioEffect(*implicit, logicalAccepted); }};
+    auto prepared = mediaProducer_->commit(ticket, true);
+    if (!prepared) return false;
+    checkpoint->project = std::move(detachedProject_);
+    detachedProject_ = std::move(detachedProject);
+    mediaPresentation_ = std::move(checkpoint);
+
+    const bool video = prepared->type == MediaType::Video;
+    const auto mediaKind = video ? MediaKind::Video
+        : prepared->type == MediaType::Image ? MediaKind::Image : MediaKind::Unknown;
+    audioControl_->retire(Audio::AudioLane::Embedded);
+    sceneRuntime_->setActiveScene(id);
+    playbackRuntime_->configure(playback, prepared->duration);
+    playbackRuntime_->restoreTime(prepared->position);
+    if (paused) playbackRuntime_->pause();
+    detachedFrame_ = std::move(prepared->frame);
+    detachedMediaBinding_ = ticket;
+    detachedMediaKind_ = mediaKind;
+    detachedVideoAtEnd_ = false;
+    pendingMediaPreparation_.reset();
+    videoFrameTime_ = video ? prepared->position : -1.0F;
+    videoPresentedTime_ = prepared->timestamp;
+    syncDiagnosticUpdates_ = 0U;
+    boundProject_ = detachedProject_.get();
+    projectBound_ = true;
+    pendingNaturalSceneCompletion_ = false;
+    naturalSceneCompletionHalted_ = false;
+
+    audioControl_->configureClock(*this, prepared->position, paused);
+    if (video)
+        audioControl_->prepareEmbedded(*this, mediaPath, playback.speed, AudioControl::SourcePurpose::EmbeddedBind);
+    logicalAccepted = true;
+    return true;
+}
+
+bool Engine::commitPreparedSeek(MediaPreparationToken ticket)
+{
+    if (!pendingMediaPreparation_ || !pendingMediaPreparation_->seek
+        || preparedMediaStatus(ticket) != MediaPreparationStatus::Ready || !projectBound_
+        || pendingMediaPreparation_->scene != sceneRuntime_->activeSceneId())
+        return false;
+
+    pollAudioExecution();
+    std::unique_ptr<MediaPresentationCheckpoint> checkpoint;
+    // Image seek does not submit a new upload. Keep any unresolved binding
+    // receipt: an independent clock move is not a frame replacement.
+    if (!pendingMediaPreparation_->seekWithoutVideo)
+    {
+        try { checkpoint = captureMediaPresentation(ticket, true); }
+        catch (const std::exception&) { return false; }
+    }
+    const auto implicit = audioControl_->capture ? std::nullopt : beginAudioEffect(AudioEffectScope::Structural);
+    if (!audioControl_->capture) return false;
+    bool logicalAccepted = false;
+    const auto exit = ScopeExit{[&] { if (implicit) (void)finishAudioEffect(*implicit, logicalAccepted); }};
+    const auto position = pendingMediaPreparation_->position;
+    if (!pendingMediaPreparation_->seekWithoutVideo)
+    {
+        auto prepared = mediaProducer_->commit(ticket, false);
+        if (!prepared) return false;
+        mediaProducer_->releasePreviousBinding(detachedMediaBinding_);
+        mediaPresentation_ = std::move(checkpoint);
+        detachedFrame_ = std::move(prepared->frame);
+        detachedVideoAtEnd_ = false;
+        videoFrameTime_ = position;
+        videoPresentedTime_ = prepared->timestamp;
+    }
+    pendingMediaPreparation_.reset();
+    audioControl_->requestSeek(*this, position);
+    pendingNaturalSceneCompletion_ = false;
+    naturalSceneCompletionHalted_ = false;
+    logicalAccepted = true;
+    return true;
+}
+
+void Engine::cancelMediaPreparation(MediaPreparationToken ticket) noexcept
+{
+    if (!pendingMediaPreparation_ || pendingMediaPreparation_->ticket != ticket) return;
+    if (!pendingMediaPreparation_->seekWithoutVideo) mediaProducer_->cancel(ticket);
+    pendingMediaPreparation_.reset();
+}
+
+std::optional<Engine::MediaPreparationToken> Engine::pendingMediaPresentation() const noexcept
+{
+    return mediaPresentation_ ? std::optional{mediaPresentation_->ticket} : std::nullopt;
+}
+
+Engine::MediaPresentationResolution Engine::resolveMediaPresentation(
+    MediaPreparationToken ticket, PresentationUploadResult result)
+{
+    using Resolution = MediaPresentationResolution;
+    if (!mediaPresentation_ || mediaPresentation_->ticket != ticket || mediaShuttingDown_)
+        return Resolution::Ignored;
+    if (result == PresentationUploadResult::DeviceLost || result == PresentationUploadResult::GraphicsUnavailable)
+        return Resolution::Pending;
+    if (result == PresentationUploadResult::Updated)
+    {
+        mediaProducer_->releasePreviousBinding(detachedMediaBinding_);
+        mediaPresentation_.reset();
+        return Resolution::Acknowledged;
+    }
+
+    pollAudioExecution();
+    const auto implicit = audioControl_->capture ? std::nullopt : beginAudioEffect(AudioEffectScope::Structural);
+    if (!audioControl_->capture) return Resolution::Pending;
+    const auto finish = ScopeExit{[&] { if (implicit) (void)finishAudioEffect(*implicit); }};
+    if (pendingMediaPreparation_) cancelMediaPreparation(pendingMediaPreparation_->ticket);
+    auto checkpoint = std::move(mediaPresentation_);
+
+    if (!checkpoint->seek && !checkpoint->project)
+    {
+        detachProject();
+        return Resolution::RolledBack;
+    }
+
+    const double position = checkpoint->clock.valid()
+        ? Audio::resolveAudioClockPosition(checkpoint->clock, Audio::audioMonotonicNow()) : 0.0;
+    detachedFrame_ = std::move(checkpoint->frame);
+    detachedMediaBinding_ = checkpoint->binding;
+    detachedMediaKind_ = checkpoint->kind;
+    detachedVideoAtEnd_ = checkpoint->videoAtEnd;
+    videoFrameTime_ = checkpoint->frameTime;
+    videoPresentedTime_ = checkpoint->presentedTime;
+    pendingNaturalSceneCompletion_ = checkpoint->completionPending;
+    naturalSceneCompletionHalted_ = checkpoint->completionHalted;
+
+    if (checkpoint->seek)
+        audioControl_->requestSeek(*this, position);
+    else
+    {
+        mediaProducer_->restorePreviousBinding(checkpoint->binding);
+        detachedProject_ = std::move(checkpoint->project);
+        boundProject_ = detachedProject_.get();
+        projectBound_ = true;
+        sceneRuntime_->setActiveScene(checkpoint->scene);
+        playbackRuntime_->configure(checkpoint->playback, checkpoint->duration);
+        playbackRuntime_->restoreTime(static_cast<float>(position));
+        if (checkpoint->paused) playbackRuntime_->pause();
+        audioControl_->retire(Audio::AudioLane::Embedded);
+        audioControl_->configureClock(*this, position, checkpoint->paused);
+        if (checkpoint->kind == MediaKind::Video && !checkpoint->source.empty())
+            audioControl_->prepareEmbedded(*this, checkpoint->source,
+                checkpoint->playback.speed, AudioControl::SourcePurpose::EmbeddedBind);
+    }
+    return Resolution::RolledBack;
+}
+
+void Engine::beginMediaShutdown() noexcept
+{
+    mediaShuttingDown_ = true;
+    if (pendingMediaPreparation_) cancelMediaPreparation(pendingMediaPreparation_->ticket);
+    if (mediaProducer_) mediaProducer_->beginShutdown();
+}
+
+bool Engine::mediaShutdownComplete() const noexcept
+{
+    return !mediaProducer_ || mediaProducer_->shutdownComplete();
 }
 
 void Engine::update()
 {
-    update(0.0F);
+    update(std::numeric_limits<float>::quiet_NaN());
 }
 
 void Engine::setSceneCompletionPolicy(SceneCompletionPolicy policy) noexcept
@@ -1601,75 +1305,69 @@ bool Engine::consumeNaturalSceneCompletion() noexcept
     return completed;
 }
 
+bool Engine::naturalSceneCompletionPending() const noexcept
+{ return pendingNaturalSceneCompletion_; }
+
+void Engine::updateDetachedVideo()
+{
+    using State = Resources::DetachedMediaProducer::FrameState;
+    auto frame = mediaProducer_->takeFrame();
+    if (frame && frame->binding == detachedMediaBinding_)
+    {
+        if (frame->state == State::Ready)
+        {
+            detachedFrame_ = std::move(frame->pixels);
+            videoFrameTime_ = frame->position;
+            videoPresentedTime_ = frame->timestamp;
+            audioControl_->lastConfirmedPosition = frame->position;
+            audioControl_->recoverFailure(*this, frame->position);
+        }
+        else if (frame->state == State::EndOfStream && detachedFrame_
+            && videoFrameTime_ >= 0.0F && videoPresentedTime_ >= 0.0
+            && (frame->timestamp < 0 || frame->timestamp == videoPresentedTime_))
+            detachedVideoAtEnd_ = true;
+        else
+            audioControl_->holdFailure(*this, audioControl_->lastConfirmedPosition, frame->position);
+    }
+
+    const auto target = audioControl_->failureHeld ? audioControl_->failedTarget : audioControl_->position();
+    if (detachedVideoAtEnd_)
+    {
+        audioControl_->lastConfirmedPosition = target;
+        return;
+    }
+    if (target < effectiveDuration() && static_cast<float>(target) != videoFrameTime_)
+        (void)mediaProducer_->requestFrame(detachedMediaBinding_, static_cast<float>(target));
+}
+
 void Engine::update(float deltaTime)
 {
-    observeDefaultAudioEndpointGeneration();
-    const bool audioOutputWasUnavailable = audioOutputOperationalState_
-        == Core::AudioOutputOperationalState::DeviceUnavailable;
-    bool sharedOutputPumpSucceeded = true;
-    if (!defaultAudioEndpointRerouteRequested_
-        && audioOutputOperationalState_ == Core::AudioOutputOperationalState::Healthy
-        && sharedAudioOutputState_ == static_cast<std::uint8_t>(
-            Core::SharedAudioOutputState::Running))
-    {
-        sharedOutputPumpSucceeded = pumpMixedAudio();
-    }
-
-    if (backgroundMusicExecutor_ && backgroundMusicOrchestrator_)
-    {
-        bool processedTerminalEvent = false;
-        for (Music::MusicRuntimeEvent& terminalEvent : backgroundMusicExecutor_->collectTerminalEvents())
-        {
-            processedTerminalEvent = true;
-            (void)processBackgroundMusicEventInternal(
-                backgroundMusicOrchestrator_.get(),
-                std::move(terminalEvent));
-        }
-        // A failed device write is not an A4-8a recovery signal.  In
-        // particular, do not let terminal processing immediately re-open a
-        // stopped shared output in the same update.
-        if (processedTerminalEvent && sharedOutputPumpSucceeded)
-        {
-            (void)reconcileAudioOutputState(false);
-        }
-    }
-
-    const auto finishAudioOutputRouting = [this, audioOutputWasUnavailable, deltaTime]() noexcept
-    {
-        if (defaultAudioEndpointRerouteRequested_)
-        {
-            rerouteDefaultAudioEndpoint();
-            return;
-        }
-
-        // A DeviceFailure detected during this update occurs after the
-        // supplied deltaTime has elapsed. Do not credit that pre-failure
-        // interval toward the new outage's cooldown.
-        if (audioOutputWasUnavailable)
-        {
-            advanceAudioOutputRecovery(deltaTime);
-        }
-    };
-
+    pollAudioExecution();
     if (!initialized_
         || !projectBound_
         || boundProject_ == nullptr
         || !playbackRuntime_
         || !sceneRuntime_)
     {
-        finishAudioOutputRouting();
         return;
     }
 
-    const float previousPlaybackTime = playbackRuntime_->currentTime();
+    const bool asynchronousVideo = mediaProducer_ && detachedMediaKind_ == MediaKind::Video;
+    if (asynchronousVideo && !naturalSceneCompletionHalted_ && !mediaShuttingDown_)
+        updateDetachedVideo();
+
+    const float previousPlaybackTime = static_cast<float>(audioControl_->lastConfirmedPosition);
     const float previousVideoFrameTime = videoFrameTime_;
     const double previousVideoPresentedTime = videoPresentedTime_;
-    playbackRuntime_->update(deltaTime);
+    // Compatibility overload: elapsed GUI delta is never a timing authority.
+    (void)deltaTime;
+    const double progressionTarget = audioControl_->failureHeld ? audioControl_->failedTarget : audioControl_->position();
+    playbackRuntime_->restoreTime(static_cast<float>(progressionTarget));
     const auto logSync = [this]() noexcept
     {
         logPlaybackSync(
             *playbackRuntime_,
-            audioOutput_.get(),
+            audioControl_->execution.snapshot(),
             videoPresentedTime_,
             syncDiagnosticUpdates_);
     };
@@ -1677,9 +1375,7 @@ void Engine::update(float deltaTime)
     if (naturalSceneCompletionHalted_)
     {
         playbackRuntime_->pause();
-        (void)reconcileAudioOutputState(false);
         logSync();
-        finishAudioOutputRouting();
         return;
     }
 
@@ -1691,10 +1387,9 @@ void Engine::update(float deltaTime)
             playbackRuntime_->pause();
             pendingNaturalSceneCompletion_ = true;
             naturalSceneCompletionHalted_ = true;
-            (void)reconcileAudioOutputState(false);
+            audioControl_->requestTransport(*this, true);
             logSync();
-            finishAudioOutputRouting();
-            return;
+                return;
         }
 
         const Domain::EntityId& activeSceneId = sceneRuntime_->activeSceneId();
@@ -1712,18 +1407,16 @@ void Engine::update(float deltaTime)
         {
             playbackRuntime_->restoreTime(previousPlaybackTime);
             logSync();
-            finishAudioOutputRouting();
-            return;
+                return;
         }
 
         const bool atEnd = activeSceneIndex + 1 >= boundProject_->scenes.size();
         if (atEnd && !playbackRuntime_->configuration().loop)
         {
             playbackRuntime_->pause();
-            (void)reconcileAudioOutputState(false);
+            audioControl_->requestTransport(*this, true);
             logSync();
-            finishAudioOutputRouting();
-            return;
+                return;
         }
 
         const std::size_t nextSceneIndex = atEnd ? 0 : activeSceneIndex + 1;
@@ -1739,14 +1432,8 @@ void Engine::update(float deltaTime)
                 if (video != nullptr && video->frameAt(previousVideoFrameTime))
                 {
                     const Resources::DecodedFrame& frame = video->currentFrame();
-                    if (renderer_->updateFrame(
-                            frame.data,
-                            frame.width,
-                            frame.height,
-                            frame.channels,
-                            frame.rowStride,
-                            frame.byteSize)
-                        != MediaUpdateResult::ResourceFailure)
+                    const auto view = currentMediaView(mediaResource_.get());
+                    if (view && stageMedia(*view, PresentationFrameKind::Video))
                     {
                         videoFrameTime_ = previousVideoFrameTime;
                         videoPresentedTime_ = presentedTimeOrFallback(
@@ -1758,7 +1445,6 @@ void Engine::update(float deltaTime)
         }
 
         logSync();
-        finishAudioOutputRouting();
         return;
     }
 
@@ -1770,42 +1456,57 @@ void Engine::update(float deltaTime)
             auto* video = dynamic_cast<VideoResource*>(mediaResource_.get());
             if (video == nullptr || !video->frameAt(currentTime))
             {
-                playbackRuntime_->restoreTime(previousPlaybackTime);
+                const Resources::DecodedFrame* const heldFrame = video != nullptr
+                    ? &video->currentFrame() : nullptr;
+                const bool canHoldFinalFrame = video != nullptr
+                    && video->lastFrameAtReachedEndOfStream()
+                    && std::isfinite(previousVideoFrameTime)
+                    && previousVideoFrameTime >= 0.0F
+                    && std::isfinite(previousVideoPresentedTime)
+                    && previousVideoPresentedTime >= 0.0
+                    && heldFrame != nullptr && heldFrame->data != nullptr
+                    && heldFrame->width > 0 && heldFrame->height > 0
+                    && heldFrame->channels > 0 && heldFrame->rowStride > 0U
+                    && heldFrame->byteSize > 0U
+                    && presentedTimeOrFallback(*heldFrame, previousVideoPresentedTime)
+                        == previousVideoPresentedTime
+                    && video->verifyBufferGuard("at-playback-end-of-stream");
+                // A drained decoder has no replacement for the last uploaded
+                // frame. Keep it while the native clock reaches scene duration.
+                if (!canHoldFinalFrame)
+                {
+                    playbackRuntime_->restoreTime(previousPlaybackTime);
+                    audioControl_->holdFailure(*this, previousPlaybackTime, progressionTarget);
+                }
+                else audioControl_->lastConfirmedPosition = progressionTarget;
                 logSync();
-                finishAudioOutputRouting();
-                return;
+                        return;
             }
 
             const Resources::DecodedFrame& frame = video->currentFrame();
             if (!video->verifyBufferGuard("before-renderer-update"))
             {
                 playbackRuntime_->restoreTime(previousPlaybackTime);
+                    audioControl_->holdFailure(*this, previousPlaybackTime, progressionTarget);
                 logSync();
-                finishAudioOutputRouting();
-                return;
+                        return;
             }
 
-            const MediaUpdateResult updateResult = renderer_->updateFrame(
-                    frame.data,
-                    frame.width,
-                    frame.height,
-                    frame.channels,
-                    frame.rowStride,
-                    frame.byteSize);
-            if (updateResult == MediaUpdateResult::ResourceFailure)
+            const auto view = currentMediaView(mediaResource_.get());
+            if (!view || !stageMedia(*view, PresentationFrameKind::Video))
             {
                 playbackRuntime_->restoreTime(previousPlaybackTime);
+                    audioControl_->holdFailure(*this, previousPlaybackTime, progressionTarget);
                 logSync();
-                finishAudioOutputRouting();
-                return;
+                        return;
             }
 
             if (!video->verifyBufferGuard("after-renderer-update"))
             {
                 playbackRuntime_->restoreTime(previousPlaybackTime);
+                    audioControl_->holdFailure(*this, previousPlaybackTime, progressionTarget);
                 logSync();
-                finishAudioOutputRouting();
-                return;
+                        return;
             }
 
             ++videoFrameUpdates;
@@ -1819,6 +1520,7 @@ void Engine::update(float deltaTime)
                 std::fflush(stderr);
             }
 
+            audioControl_->recoverFailure(*this, progressionTarget);
             videoFrameTime_ = currentTime;
             videoPresentedTime_ = presentedTimeOrFallback(
                 frame,
@@ -1826,12 +1528,21 @@ void Engine::update(float deltaTime)
         }
     }
 
+    if (!asynchronousVideo)
+        audioControl_->lastConfirmedPosition = progressionTarget;
     logSync();
-    finishAudioOutputRouting();
 }
 
 bool Engine::seek(float sceneTimeSeconds)
 {
+    if (mediaProducer_) return false;
+    pollAudioExecution();
+    const bool needsAdmission = !audioControl_->capture;
+    const auto implicit = needsAdmission ? beginAudioEffect(AudioEffectScope::Structural) : std::nullopt;
+    if (needsAdmission && !implicit) return false;
+    bool logicalAccepted = false;
+    const auto operationExit = ScopeExit{[&] { if (implicit) (void)finishAudioEffect(*implicit, logicalAccepted); }};
+
     if (!initialized_
         || !projectBound_
         || boundProject_ == nullptr
@@ -1860,16 +1571,9 @@ bool Engine::seek(float sceneTimeSeconds)
         }
     }
 
-    const Resources::DecodedFrame* targetFrame = nullptr;
-    VideoResource* video = nullptr;
     if (mediaResource_ && mediaResource_->type() == MediaType::Video)
     {
-        if (!renderer_)
-        {
-            return false;
-        }
-
-        video = dynamic_cast<VideoResource*>(mediaResource_.get());
+        auto* video = dynamic_cast<VideoResource*>(mediaResource_.get());
         if (video == nullptr || !video->frameAt(targetTime))
         {
             return false;
@@ -1881,73 +1585,40 @@ bool Engine::seek(float sceneTimeSeconds)
             return false;
         }
 
-        targetFrame = &frame;
-    }
-
-    const bool requiresSharedOutputFlush = embeddedAudioInputHandleValue_ != 0U;
-    if (requiresSharedOutputFlush)
-    {
-        // V1 flush policy: discard queued mixed embedded samples before a
-        // seek. BGM inputs stay registered and resume from their cursors.
-        stopSharedAudioOutput();
-    }
-    embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-    removeEmbeddedAudioInput();
-    if (audioResource_
-        && !configureEmbeddedAudioInputAt(
-            targetTime,
-            playbackRuntime_->configuration().speed))
-    {
-        (void)reconcileAudioOutputState(requiresSharedOutputFlush);
-        return false;
-    }
-
-    if (video != nullptr && targetFrame != nullptr)
-    {
-        const MediaUpdateResult updateResult = renderer_->updateFrame(
-                targetFrame->data,
-                targetFrame->width,
-                targetFrame->height,
-                targetFrame->channels,
-                targetFrame->rowStride,
-                targetFrame->byteSize);
-        if (updateResult == MediaUpdateResult::ResourceFailure)
+        const auto view = currentMediaView(mediaResource_.get());
+        if (!view || !stageMedia(*view, PresentationFrameKind::Video))
         {
-            removeEmbeddedAudioInput();
-            (void)reconcileAudioOutputState(requiresSharedOutputFlush);
             return false;
         }
 
         if (!video->verifyBufferGuard("after-seek-renderer-update"))
         {
-            removeEmbeddedAudioInput();
-            (void)reconcileAudioOutputState(requiresSharedOutputFlush);
             return false;
         }
 
         videoFrameTime_ = targetTime;
         videoPresentedTime_ = presentedTimeOrFallback(
-            *targetFrame,
+            frame,
             static_cast<double>(targetTime));
     }
 
-    playbackRuntime_->restoreTime(targetTime);
+    audioControl_->requestSeek(*this, targetTime);
     pendingNaturalSceneCompletion_ = false;
     naturalSceneCompletionHalted_ = false;
-    (void)reconcileAudioOutputState(requiresSharedOutputFlush);
+    logicalAccepted = true;
     return true;
 }
 
 void Engine::render()
 {
     const auto mediaView = currentMediaView(mediaResource_.get());
-    if (!initialized_ || !renderer_
-        || !renderer_->prepareFrame(mediaView ? &*mediaView : nullptr))
+    if (!initialized_ || !presentation_
+        || !renderer().prepareFrame(mediaView ? &*mediaView : nullptr))
     {
         return;
     }
 
-    const auto targetInfo = renderer_->presentationTargetInfo();
+    const auto targetInfo = renderer().presentationTargetInfo();
     const auto targetAspect = Domain::AspectRatio::from(
         targetInfo.viewportWidth,
         targetInfo.viewportHeight);
@@ -1956,7 +1627,7 @@ void Engine::render()
         sceneRuntime_.get(),
         currentMediaDimensions(),
         targetAspect.value_or(Domain::AspectRatio{}));
-    renderer_->renderPrepared(renderData);
+    renderer().renderPrepared(renderData);
 }
 
 void Engine::render(const Domain::AspectRatio& canvasAspect)
@@ -1968,7 +1639,7 @@ void Engine::render(
     const Domain::AspectRatio& canvasAspect,
     std::optional<CanvasOutsideInstruction> canvasOutside)
 {
-    if (!initialized_ || !renderer_)
+    if (!initialized_ || !presentation_)
     {
         return;
     }
@@ -1983,194 +1654,159 @@ void Engine::render(
         : 0.0;
     renderData.canvasOutside = canvasOutside;
     const auto mediaView = currentMediaView(mediaResource_.get());
-    renderer_->render(renderData, mediaView ? &*mediaView : nullptr);
+    renderer().render(renderData, mediaView ? &*mediaView : nullptr);
 }
 
 bool Engine::processEvents()
 {
-    if (!desktopWindowHost_ || !desktopWindowHost_->processMessages())
-    {
-        return false;
-    }
-
-    return true;
+    return presentation_ ? presentation_->processEvents() : initialized_;
 }
 
 bool Engine::consumeKeyPress(unsigned int virtualKey)
 {
-    return desktopWindowHost_
-        && desktopWindowHost_->consumeKeyPress(virtualKey);
+    return presentation_ && presentation_->consumeKeyPress(virtualKey);
 }
 
 bool Engine::consumeVolumeSlider(float& volume) noexcept
 {
-    return desktopWindowHost_
-        && desktopWindowHost_->consumeVolumeSlider(volume);
+    return presentation_ && presentation_->consumeVolumeSlider(volume);
 }
 
 void Engine::togglePause()
 {
-    if (naturalSceneCompletionHalted_)
-    {
-        return;
-    }
-
-    if (playbackRuntime_ && playbackRuntime_->isConfigured())
-    {
-        playbackRuntime_->togglePause();
-        (void)reconcileAudioOutputState(true);
-        if (desktopWindowHost_)
-        {
-            desktopWindowHost_->setStatusText(
-                playbackRuntime_->isPaused() ? "Paused" : "Playing");
-        }
-        std::fprintf(
-            stderr,
-            "[Engine] playback-pause=%s logical=%.6f\n",
-            playbackRuntime_->isPaused() ? "paused" : "resumed",
-            static_cast<double>(playbackRuntime_->currentTime()));
-        std::fflush(stderr);
-    }
+    pollAudioExecution();
+    if (naturalSceneCompletionHalted_ || !playbackRuntime_ || !playbackRuntime_->isConfigured()) return;
+    const bool own = !audioControl_->capture;
+    const auto token = own ? beginAudioEffect(AudioEffectScope::Structural) : std::nullopt;
+    if (own && !token) return;
+    audioControl_->requestTransport(*this, !isPaused());
+    if (token) (void)finishAudioEffect(*token);
 }
 
 void Engine::setPlaybackSpeed(float speed)
 {
-    if (playbackRuntime_ && playbackRuntime_->isConfigured()
-        && std::isfinite(speed) && speed >= 0.5F && speed <= 2.0F)
+    pollAudioExecution();
+    if (!playbackRuntime_ || !playbackRuntime_->isConfigured()
+        || !std::isfinite(speed) || speed < 0.5F || speed > 2.0F || speed == playbackSpeed()) return;
+    const bool own = !audioControl_->capture;
+    const auto token = own ? beginAudioEffect(AudioEffectScope::Structural) : std::nullopt;
+    if (own && !token) return;
+    if (!audioControl_->embeddedPath.empty())
+        audioControl_->prepareEmbedded(*this, audioControl_->embeddedPath, speed, AudioControl::SourcePurpose::EmbeddedRate);
+    else
     {
-        const float previousSpeed = playbackRuntime_->configuration().speed;
-        const float currentTime = playbackRuntime_->currentTime();
-        const bool requiresSharedOutputFlush = embeddedAudioInputHandleValue_ != 0U;
-        if (requiresSharedOutputFlush)
-        {
-            // V1 flush policy: tempo replacement must not drain samples from
-            // the previous embedded-audio configuration. BGM inputs persist.
-            stopSharedAudioOutput();
-        }
-        embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-        removeEmbeddedAudioInput();
-        if (audioResource_
-            && (!setEmbeddedAudioTempo(speed)
-                || !configureEmbeddedAudioInputAt(
-                    currentTime,
-                    speed)))
-        {
-            removeEmbeddedAudioInput();
-            const bool rollbackSucceeded = setEmbeddedAudioTempo(previousSpeed)
-                && configureEmbeddedAudioInputAt(
-                    currentTime,
-                    previousSpeed);
-            if (!rollbackSucceeded)
-            {
-                removeEmbeddedAudioInput();
-            }
-
-            std::fprintf(
-                stderr,
-                "[Engine] unsupported audio playback speed %.6f; keeping %.6f\n",
-                static_cast<double>(speed),
-                static_cast<double>(previousSpeed));
-            std::fflush(stderr);
-            (void)reconcileAudioOutputState(requiresSharedOutputFlush);
-            return;
-        }
-
-        playbackRuntime_->setSpeed(speed);
-        std::fprintf(
-            stderr,
-            "[Engine] playback-speed=%.6f logical=%.6f\n",
-            static_cast<double>(playbackRuntime_->configuration().speed),
-            static_cast<double>(playbackRuntime_->currentTime()));
-        std::fflush(stderr);
-        (void)reconcileAudioOutputState(requiresSharedOutputFlush);
+        Audio::AudioCommand cmd{};
+        cmd.kind = Audio::AudioCommandKind::ReplaceEmbedded;
+        cmd.playbackLifetime = audioControl_->playbackLifetime;
+        cmd.replacement = Audio::AudioEmbeddedReplacement::RateContinuous;
+        cmd.clock = audioControl_->plannedClock;
+        cmd.clock.rate = speed; cmd.clock.timingVersion = ++audioControl_->timing;
+        cmd.expectedTimingVersion = audioControl_->plannedClock.timingVersion;
+        cmd.embeddedPresent = false;
+        cmd.transport = isPaused() ? Audio::AudioTransport::Paused : Audio::AudioTransport::Playing;
+        if (audioControl_->pendingBinding)
+        { audioControl_->pendingBinding->clock.rate = speed; audioControl_->plannedClock.rate = speed; }
+        else if (audioControl_->command(cmd, AudioEffectScope::Structural)) audioControl_->plannedClock = cmd.clock;
     }
+    if (token) (void)finishAudioEffect(*token);
 }
 
-void Engine::setVolume(float volume) noexcept
+void Engine::setVolume(float value) noexcept
 {
-    embeddedAudioGain_ = std::isfinite(volume)
-        ? std::clamp(volume, 0.0F, 1.0F)
-        : 1.0F;
-    if (audioMixer_ && embeddedAudioInputHandleValue_ != 0U
-        && !audioMixer_->setInputGain(
-            AudioInputHandle{embeddedAudioInputHandleValue_},
-            embeddedAudioGain_))
+    pollAudioExecution();
+    const bool own = !audioControl_->capture;
+    const auto token = own ? beginAudioEffect(AudioEffectScope::EmbeddedGain) : std::nullopt;
+    if (own && !token) return;
+    audioControl_->desiredEmbeddedGain = std::isfinite(value) ? std::clamp(value, 0.0F, 1.0F) : 1.0F;
+    for (auto& source : audioControl_->sources)
     {
-        embeddedAudioInputHandleValue_ = 0U;
-        embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-        (void)reconcileAudioOutputState(false);
+        if (!source.occupied || source.retiring || source.key.lane != Audio::AudioLane::Embedded) continue;
+        source.gain = audioControl_->desiredEmbeddedGain;
+        if (!source.submitted) continue;
+        Audio::AudioCommand cmd{}; cmd.kind = Audio::AudioCommandKind::SetSourceGain;
+        cmd.source = source.key; cmd.gain = source.gain;
+        (void)audioControl_->command(cmd, AudioEffectScope::EmbeddedGain);
     }
-    if (audioOutput_)
-    {
-        audioOutput_->setVolume(1.0F);
-    }
-    if (desktopWindowHost_)
-    {
-        desktopWindowHost_->setVolumeControl(this->volume());
-    }
+    if (token) (void)finishAudioEffect(*token);
+    if (presentation_) presentation_->setVolumeControl(volume());
 }
 
-float Engine::volume() const noexcept
-{
-    return embeddedAudioGain_;
-}
+float Engine::volume() const noexcept { return audioControl_->desiredEmbeddedGain; }
 
 void Engine::toggleMute() noexcept
 {
-    if (audioOutput_)
+    pollAudioExecution();
+    const bool own = !audioControl_->capture;
+    const auto token = own ? beginAudioEffect(AudioEffectScope::OutputMute) : std::nullopt;
+    if (own && !token) return;
+    Audio::AudioCommand cmd{}; cmd.kind = Audio::AudioCommandKind::SetOutputMute;
+    cmd.muted = !audioControl_->desiredMuted;
+    if (audioControl_->command(cmd, AudioEffectScope::OutputMute)) audioControl_->desiredMuted = cmd.muted;
+    if (token) (void)finishAudioEffect(*token);
+}
+bool Engine::isMuted() const noexcept { return audioControl_->execution.snapshot().muteApplied; }
+
+bool Engine::processBackgroundMusicControl(const BackgroundMusicControl::Event& event)
+{
+    pollAudioExecution();
+    const bool stopped = std::holds_alternative<BackgroundMusicControl::PlaybackStopped>(event);
+    const bool own = !audioControl_->capture && !stopped;
+    const auto token = own ? beginAudioEffect(AudioEffectScope::Structural) : std::nullopt;
+    if (own && !token) return false;
+    const auto operationExit = ScopeExit{[&] { if (token) (void)finishAudioEffect(*token); }};
+    const auto internal = toInternalMusicEvent(event,
+        isPaused() ? Music::PlaybackActivity::Paused : Music::PlaybackActivity::Playing);
+    if (!internal) return false;
+    const auto result = processBackgroundMusicEventInternal(backgroundMusicOrchestrator_.get(), *internal);
+    if (stopped)
     {
-        audioOutput_->toggleMute();
+        audioControl_->retireAll();
+        (void)audioControl_->execution.requestRetirePlayback(audioControl_->playbackLifetime);
+        if (audioControl_->capture)
+            for (auto& operation : audioControl_->effects)
+                if (operation.result.token == *audioControl_->capture) operation.requiredRetirement = audioControl_->playbackLifetime;
+        ++audioControl_->playbackLifetime;
     }
-    if (desktopWindowHost_)
-    {
-        desktopWindowHost_->setMuteControl(isMuted());
-    }
+    // C's BGM policy and A's physical pause are distinct but ordered in the
+    // same structural operation. Config/gain changes do not reset transport.
+    if (std::holds_alternative<BackgroundMusicControl::PlaybackPaused>(event))
+        audioControl_->requestTransport(*this, true);
+    else if (std::holds_alternative<BackgroundMusicControl::PlaybackResumed>(event))
+        audioControl_->requestTransport(*this, false);
+    return result && (*result == Music::MusicProcessResult::Completed || *result == Music::MusicProcessResult::Enqueued);
 }
 
-bool Engine::isMuted() const noexcept
+std::optional<Engine::AudioEffectToken> Engine::beginAudioEffect(AudioEffectScope scope) noexcept
+{ return audioControl_->begin(scope); }
+Engine::AudioEffectResult Engine::finishAudioEffect(AudioEffectToken token, bool accepted)
+{ return audioControl_->finish(token, accepted); }
+Engine::AudioEffectResult Engine::audioEffect(AudioEffectToken token) const
+{ return audioControl_->effect(token); }
+void Engine::pollAudioExecution() { audioControl_->poll(*this); }
+Engine::AudioExecutionState Engine::audioExecutionState() const { return audioControl_->state(); }
+Engine::PlaybackClockSample Engine::playbackClockSample() const
 {
-    return audioOutput_ && audioOutput_->isMuted();
+    const_cast<Engine*>(this)->pollAudioExecution();
+    const auto& control = *audioControl_;
+    PlaybackClockSample sample{};
+    sample.asOfEffectSequence = control.observedExecution.lastEffectSequence;
+    sample.asOfTimeNs = control.observationTime;
+    const bool confirmed = control.clock.valid() && control.clock.binding == control.binding;
+    sample.position = projectBound_ && confirmed ? Audio::resolveAudioClockPosition(control.clock, sample.asOfTimeNs) : 0;
+    sample.duration = effectiveDuration();
+    sample.rate = confirmed ? control.clock.rate : projectBound_ ? 0 : 1;
+    sample.paused = playbackRuntime_ && playbackRuntime_->isPaused();
+    sample.outputMuted = control.observedExecution.muteApplied;
+    sample.muteKnown = control.observedExecution.muteKnown;
+    return sample;
 }
+void Engine::beginAudioShutdown() noexcept { audioControl_->beginShutdown(); }
+bool Engine::audioShutdownComplete() const noexcept { return audioControl_->stopped(); }
 
-bool Engine::processBackgroundMusicControl(
-    const BackgroundMusicControl::Event& event
-)
+BackgroundMusicObservation::Snapshot Engine::backgroundMusicObservation() const
 {
-    const bool playbackStopped = std::holds_alternative<
-        BackgroundMusicControl::PlaybackStopped>(event);
-    const Music::PlaybackActivity activity = isPaused()
-        ? Music::PlaybackActivity::Paused
-        : Music::PlaybackActivity::Playing;
-    const std::optional<Music::MusicRuntimeEvent> internalEvent = toInternalMusicEvent(
-        event,
-        activity);
-    if (!internalEvent.has_value())
-    {
-        return false;
-    }
-
-    const std::optional<Music::MusicProcessResult> result = processBackgroundMusicEventInternal(
-        backgroundMusicOrchestrator_.get(),
-        *internalEvent);
-    if (!result.has_value())
-    {
-        return false;
-    }
-
-    if (*result == Music::MusicProcessResult::Completed)
-    {
-        if (playbackStopped)
-        {
-            stopSharedAudioOutput();
-            removeEmbeddedAudioInput();
-            embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-            audioOutputRetryElapsedSeconds_ = 0.0;
-        }
-        (void)reconcileAudioOutputState(true);
-    }
-
-    return *result == Music::MusicProcessResult::Completed
-        || *result == Music::MusicProcessResult::Enqueued;
+    return backgroundMusicRuntime_ ? backgroundMusicRuntime_->backgroundMusicObservation()
+        : BackgroundMusicObservation::Snapshot{};
 }
 
 std::optional<BackgroundMusicControl::TrackId>
@@ -2203,12 +1839,14 @@ Engine::currentItemBackgroundMusicTrackId() const
 
 bool Engine::isPaused() const noexcept
 {
+    const_cast<Engine*>(this)->pollAudioExecution();
     return playbackRuntime_ != nullptr && playbackRuntime_->isPaused();
 }
 
 float Engine::playbackTime() const noexcept
 {
-    return playbackRuntime_ ? playbackRuntime_->currentTime() : 0.0F;
+    const_cast<Engine*>(this)->pollAudioExecution();
+    return projectBound_ ? static_cast<float>(audioControl_->position()) : 0.0F;
 }
 
 float Engine::effectiveDuration() const noexcept
@@ -2218,7 +1856,10 @@ float Engine::effectiveDuration() const noexcept
 
 float Engine::playbackSpeed() const noexcept
 {
-    return playbackRuntime_ ? playbackRuntime_->configuration().speed : 1.0F;
+    const_cast<Engine*>(this)->pollAudioExecution();
+    if (!projectBound_) return 1.0F;
+    return audioControl_->clock.valid() && audioControl_->clock.binding == audioControl_->binding
+        ? static_cast<float>(audioControl_->clock.rate) : 0.0F;
 }
 
 std::size_t Engine::activeSceneIndex() const noexcept
@@ -2248,6 +1889,7 @@ std::size_t Engine::sceneCount() const noexcept
 
 Engine::MediaKind Engine::mediaKind() const noexcept
 {
+    if (mediaProducer_) return detachedMediaKind_;
     if (!mediaResource_)
     {
         return MediaKind::Unknown;
@@ -2266,6 +1908,9 @@ Engine::MediaKind Engine::mediaKind() const noexcept
 
 std::optional<Engine::MediaDimensions> Engine::currentMediaDimensions() const noexcept
 {
+    if (mediaProducer_)
+        return detachedFrame_ ? std::optional{MediaDimensions{detachedFrame_->width, detachedFrame_->height}}
+                              : std::nullopt;
     if (!mediaResource_)
     {
         return std::nullopt;
@@ -2307,10 +1952,7 @@ std::optional<Engine::MediaDimensions> Engine::currentMediaDimensions() const no
 
 void Engine::setStatusText(const std::string& text) noexcept
 {
-    if (desktopWindowHost_)
-    {
-        desktopWindowHost_->setStatusText(text);
-    }
+    if (presentation_) presentation_->setStatusText(text);
 }
 
 bool Engine::switchToNextScene()
@@ -2373,42 +2015,21 @@ bool Engine::switchToPreviousScene()
 
 void Engine::shutdown()
 {
+    // Normal Session Close waits asynchronously before calling shutdown().
+    // The synchronous RAII boundary is containment for exceptional callers;
+    // it never frees a source still read by A/P or claims a timeout success.
+    beginMediaShutdown();
+    beginAudioShutdown();
+    while (!audioShutdownComplete() || !mediaShutdownComplete())
+    {
+        pollAudioExecution();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (presentation_) renderer().invalidateHostedCompositionContent();
     detachProject();
+    mediaProducer_.reset();
     playbackRuntime_.reset();
-
-    if (defaultAudioEndpointWatcher_)
-    {
-        defaultAudioEndpointWatcher_->shutdown();
-    }
-    defaultAudioEndpointWatcherAvailable_ = false;
-    lastSeenDefaultAudioEndpointGeneration_ = 0U;
-    defaultAudioEndpointRerouteRequested_ = false;
-
-    if (audioOutput_)
-    {
-        audioOutput_->shutdown();
-    }
-    audioOutputOperationalState_ = Core::AudioOutputOperationalState::Healthy;
-    audioOutputRetryElapsedSeconds_ = 0.0;
-    embeddedAudioNeedsResyncAfterOutputRecovery_ = false;
-
-    if (renderer_)
-    {
-        renderer_->shutdown();
-    }
-    defaultPresentationTargetId_ = {};
-
-    if (desktopWindowHost_)
-    {
-        desktopWindowHost_->shutdown();
-        desktopWindowHost_.reset();
-    }
-
-    if (!initialized_)
-    {
-        return;
-    }
-
+    if (presentation_) presentation_->shutdown();
     initialized_ = false;
 }
 

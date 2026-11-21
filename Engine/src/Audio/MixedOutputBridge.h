@@ -41,6 +41,7 @@ public:
     MixedOutputBridge& operator=(MixedOutputBridge&&) = delete;
 
     [[nodiscard]] MixedOutputBridgeResult pump() noexcept;
+    [[nodiscard]] bool prepareDeadlineMode(std::size_t maximumFrames) noexcept;
 
 private:
     [[nodiscard]] bool prepareBuffers(std::size_t frameCount) noexcept;
@@ -56,6 +57,7 @@ private:
     AudioBlockSink& sink_;
     std::vector<float> mixedF32_{};
     std::vector<std::int16_t> deviceS16_{};
+    std::size_t deadlineMaximumFrames_ = 0U;
 };
 
 // A3a-local test seam for the AudioMixer ResourceFailure path, which A2

@@ -20,7 +20,7 @@ namespace DesktopSceneEngine::Rendering
 class CanvasTargetFitTestAccess
 {
 public:
-    static GraphicsBackend& backend(Engine& engine) { return engine.renderer_->backend_; }
+    static GraphicsBackend& backend(Engine& engine) { return engine.renderer().backend_; }
 };
 }
 

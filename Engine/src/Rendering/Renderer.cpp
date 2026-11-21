@@ -42,6 +42,48 @@ PresentationTargetId Renderer::attachPresentationTarget(
                         : PresentationTargetId{};
 }
 
+PresentationTargetId Renderer::initialize(const HostedCompositionTarget& target)
+{
+    if (initialized_)
+    {
+        return {};
+    }
+
+    const PresentationTargetId id = backend_.initialize(target);
+    if (!id.isValid())
+    {
+        return {};
+    }
+
+    initialized_ = true;
+    return id;
+}
+
+PresentationTargetId Renderer::attachPresentationTarget(
+    const HostedCompositionTarget& target)
+{
+    return initialized_ ? backend_.attachPresentationTarget(target)
+                        : PresentationTargetId{};
+}
+
+bool Renderer::setHostedPresentationExtent(
+    PresentationTargetId id, PresentationExtent extent) noexcept
+{
+    return initialized_ && backend_.setHostedPresentationExtent(id, extent);
+}
+
+CompositionContentLease Renderer::acquireHostedCompositionContent(
+    PresentationTargetId id) const noexcept
+{
+    return initialized_ ? backend_.acquireHostedCompositionContent(id)
+                        : CompositionContentLease{};
+}
+
+void Renderer::invalidateHostedCompositionContent() noexcept
+{
+    backend_.invalidateHostedCompositionContent();
+}
+
 bool Renderer::detachPresentationTarget(PresentationTargetId id) noexcept
 {
     return initialized_ && backend_.detachPresentationTarget(id);
@@ -116,14 +158,14 @@ bool Renderer::prepareFrame(const Detail::MediaView* currentMedia)
         == Detail::FramePreparationResult::ReadyTargetsAvailable;
 }
 
-void Renderer::renderPrepared(const RenderData& data)
+std::uint64_t Renderer::deviceGeneration() const noexcept
 {
-    if (!initialized_)
-    {
-        return;
-    }
+    return initialized_ ? backend_.deviceGeneration() : 0;
+}
 
-    backend_.renderPrepared(data);
+bool Renderer::renderPrepared(const RenderData& data, PresentationTargetId onlyTarget)
+{
+    return initialized_ && backend_.renderPrepared(data, onlyTarget);
 }
 
 void Renderer::render(

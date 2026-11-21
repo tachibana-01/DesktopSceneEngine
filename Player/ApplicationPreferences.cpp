@@ -24,18 +24,6 @@ constexpr auto HighlightCanvasBoundaryKey = "preview/highlightCanvasBoundary";
 constexpr auto EnglishLanguageValue = "en";
 constexpr auto SimplifiedChineseLanguageValue = "zh_CN";
 
-std::unique_ptr<QSettings> settingsOperation(const QSettings& source)
-{
-    // A fresh status belongs to this operation, not an earlier failed write.
-    auto operation = source.organizationName().isEmpty() && !source.fileName().isEmpty()
-        ? std::make_unique<QSettings>(source.fileName(), source.format())
-        : std::make_unique<QSettings>(source.format(), source.scope(),
-            source.organizationName(), source.applicationName());
-    operation->setFallbacksEnabled(source.fallbacksEnabled());
-    operation->setAtomicSyncRequired(source.isAtomicSyncRequired());
-    return operation;
-}
-
 std::optional<QString> canvasOutsideModeKey(const DisplayId& displayId)
 {
     if (!displayId.isPersistentOwnerCapable())
@@ -225,6 +213,23 @@ ApplicationPreferencesStore::ApplicationPreferencesStore(QSettings& settings) no
 {
 }
 
+std::unique_ptr<QSettings> ApplicationPreferencesStore::Location::open() const
+{
+    // A fresh status belongs to this operation, not an earlier failed write.
+    auto settings = organization.isEmpty() && !fileName.isEmpty()
+        ? std::make_unique<QSettings>(fileName, format)
+        : std::make_unique<QSettings>(format, scope, organization, application);
+    settings->setFallbacksEnabled(fallbacksEnabled);
+    settings->setAtomicSyncRequired(atomicSyncRequired);
+    return settings;
+}
+
+ApplicationPreferencesStore::Location ApplicationPreferencesStore::location() const
+{
+    return {settings_.format(), settings_.scope(), settings_.fileName(), settings_.organizationName(),
+        settings_.applicationName(), settings_.fallbacksEnabled(), settings_.isAtomicSyncRequired()};
+}
+
 ApplicationPreferences ApplicationPreferencesStore::load() const
 {
     settings_.sync();
@@ -239,7 +244,7 @@ QSettings::Status ApplicationPreferencesStore::saveLanguage(UiLanguage language)
 {
     if (language != UiLanguage::English && language != UiLanguage::SimplifiedChinese)
         return QSettings::FormatError;
-    auto operation = settingsOperation(settings_);
+    auto operation = location().open();
     operation->setValue(QString::fromLatin1(LanguageKey), languageValue(language));
     operation->sync();
     return operation->status();
@@ -247,7 +252,7 @@ QSettings::Status ApplicationPreferencesStore::saveLanguage(UiLanguage language)
 
 std::optional<UiLanguage> ApplicationPreferencesStore::reloadLanguage() const
 {
-    auto operation = settingsOperation(settings_);
+    auto operation = location().open();
     operation->sync();
     const auto value = operation->value(QString::fromLatin1(LanguageKey));
     if (operation->status() != QSettings::NoError) return std::nullopt;
@@ -271,7 +276,7 @@ CanvasOutsidePreferenceRead ApplicationPreferencesStore::loadCanvasOutsideMode(
     const auto storageStatus = validateIniStorage(settings_);
     if (storageStatus != QSettings::NoError)
         return {std::nullopt, storageStatus};
-    auto operation = settingsOperation(settings_);
+    auto operation = location().open();
     operation->setFallbacksEnabled(false);
     operation->sync();
     if (operation->status() != QSettings::NoError)
@@ -303,7 +308,7 @@ QSettings::Status ApplicationPreferencesStore::saveCanvasOutsideMode(
     const auto key = canvasOutsideModeKey(displayId);
     if (!key)
         return QSettings::FormatError;
-    auto operation = settingsOperation(settings_);
+    auto operation = location().open();
     operation->setFallbacksEnabled(false);
     operation->setValue(*key, mode == CanvasOutsideMode::Opaque
         ? QStringLiteral("opaque") : QStringLiteral("transparent"));

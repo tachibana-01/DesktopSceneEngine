@@ -1,6 +1,7 @@
 #include "TimelinePreviewProvider.h"
 
 #include <QApplication>
+#include <QImage>
 
 #include <chrono>
 #include <filesystem>
@@ -195,6 +196,22 @@ bool verifyVideoProvider(
 int main(int argc, char* argv[])
 {
     QApplication application(argc, argv);
+    if (application.arguments().contains(QStringLiteral("--generated")))
+    {
+        const TemporaryDirectory media;
+        const auto imagePath = media.path() / L"generated-preview.png";
+        QImage image{23, 17, QImage::Format_RGB32};
+        image.fill(qRgb(12, 79, 150));
+        return require(image.save(QString::fromStdWString(imagePath.native())),
+                   "Write the generated image fixture")
+                && verifyImageProvider(imagePath)
+            ? 0 : 1;
+    }
+    if (QStringLiteral(DESKTOP_SCENE_ENGINE_TEST_RESOURCES_DIR).isEmpty())
+    {
+        std::cerr << "External timeline-provider media unavailable; use --generated for the public case.\n";
+        return 77;
+    }
 
     const std::filesystem::path imagePath = findFixture(".png");
     const std::filesystem::path videoPath = findFixture(".mp4");

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <DesktopSceneEngine/BackgroundMusicObservation.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -46,11 +48,7 @@ struct TrackId
     friend bool operator==(const TrackId&, const TrackId&) = default;
 };
 
-enum class MusicScope
-{
-    PlaylistGlobal,
-    Item
-};
+using MusicScope = BackgroundMusicObservation::Scope;
 
 enum class PlaybackActivity
 {
@@ -58,12 +56,7 @@ enum class PlaybackActivity
     Paused
 };
 
-enum class BackgroundMusicPlaybackState
-{
-    Stopped,
-    Playing,
-    Paused
-};
+using BackgroundMusicPlaybackState = BackgroundMusicObservation::PlaybackState;
 
 enum class MusicQueueMode
 {
@@ -182,6 +175,8 @@ struct MusicSourceFailed
 {
     MusicSourceToken token{};
     MusicSourceFailureClass failure = MusicSourceFailureClass::UnplayableTrack;
+    BackgroundMusicObservation::FailureStage stage = BackgroundMusicObservation::FailureStage::Unknown;
+    BackgroundMusicObservation::FailureCode code = BackgroundMusicObservation::FailureCode::Unknown;
 };
 
 struct MusicExecutionAvailable

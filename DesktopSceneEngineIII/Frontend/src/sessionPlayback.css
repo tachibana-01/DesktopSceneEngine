@@ -1,0 +1,33 @@
+.library-policy { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 20px 4px 22px; min-height: 34px; flex-shrink: 0; }
+.library-policy > span { color: #5e6c7e; font-size: 7px; letter-spacing: .12em; }
+.playback-phase-c .rail-status { gap: 18px; }
+.rail-runtime-status { display: grid; grid-template-columns: auto auto auto; align-items: center; justify-content: end; column-gap: 9px; row-gap: 4px; }
+.rail-runtime-status .playback-time { grid-column: span 2; }
+.rail-scene { font-size: 8px; color: #69798d; }
+.rail-rate { color: #9ba9bd; font-size: 9px; }
+.rail-audio { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.rail-audio[hidden] { display: none; }
+.rail-mute { display: flex; align-items: center; justify-content: center; gap: 6px; min-width: 28px; min-height: 30px; border: 0; border-radius: 2px; background: transparent; color: #8492a6; font-size: 9px; }
+.rail-mute:hover { color: #c1ccdb; background: #202731; }
+.rail-mute[aria-pressed="true"] { color: #c0b0aa; }
+.rail-mute svg { stroke-width: 1; }
+.playback-dev-facts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.playback-dev-facts button { min-height: 32px; padding: 5px 9px; border: 1px solid #343e4c; border-radius: 2px; background: transparent; color: #a2b0c3; font-size: 11px; }
+@media (max-width:1180px) { .library-policy { padding-left: 18px; padding-right: 18px; } .playback-phase-c .rail-status { gap: 12px; } .rail-mute > span { display: none; } }
+@media (max-width:760px) { .rail-runtime-status { display: block; } .rail-runtime-status :is(.rail-rate,.rail-scene) { display: none; } .rail-audio { gap: 7px; } .playback-phase-c .rail-status { gap: 10px; } }
+@media (max-width:520px) { .rail-runtime-status { display: none; } .playback-phase-c .rail-status { gap: 0; } .rail-audio { gap: 5px; } }
+
+/* Rail width now comes from the Preview column, including splitter resizing.
+   Query the Rail itself so the fixed Timeline hover overlay keeps its original
+   containing block. Existing compact rules follow available control width. */
+.preview-workspace > .playback-rail { min-width: 0; container-name: preview-transport; container-type: inline-size; gap: clamp(4px, 3%, 24px); padding-inline: clamp(10px, 3%, 26px); }
+.preview-workspace .rail-display > span:first-child { display: block; overflow: hidden; text-overflow: ellipsis; }
+@container preview-transport (max-width:760px) {
+  .rail-runtime-status { display: block; }
+  .rail-runtime-status :is(.rail-rate,.rail-scene), .rail-fps, .rail-mute > span { display: none; }
+  .playback-phase-c .rail-status { gap: 10px; }
+}
+@container preview-transport (max-width:520px) {
+  .rail-runtime-status, .rail-dot, .rail-resolution { display: none; }
+  .playback-phase-c .rail-status { gap: 5px; }
+}

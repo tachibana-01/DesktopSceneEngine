@@ -1281,10 +1281,278 @@ bool verifyExecutionAvailableStateMatrixAndOrdering()
         "ExecutionAvailable must recover PlaylistGlobal before Item");
 }
 
+// C1A: real Runtime/Session transitions, no observation DTO or source mock.
+bool verifyNoPlayableIdentityAndHistory()
+{
+    const ShufflePermutationProvider ordered = [](std::span<const TrackId> ids)
+    {
+        return std::vector<TrackId>{ids.begin(), ids.end()};
+    };
+    for (const MusicQueueMode mode : {MusicQueueMode::ListLoop,
+             MusicQueueMode::CurrentSingleLoop, MusicQueueMode::Shuffle})
+    {
+        BackgroundMusicRuntime runtime{ordered};
+        const auto config = queue({track("a", "a.mp3"), track("b", "b.mp3")}, 1.0F, mode);
+        const auto start = runtime.apply(PlaybackSessionStarted{scope("npt", std::nullopt, config, std::nullopt)});
+        if (!require(start.size() == 1U && startAction(start[0]), "NPT setup emits A")) return false;
+        const auto tokenA = startAction(start[0])->token;
+        if (!require(runtime.playlistSession()->phase() == MusicSessionPhase::PendingStart
+                && runtime.playlistSession()->currentTrackId() == std::optional<TrackId>{trackId("a")},
+            "PendingStart retains logical Current")) return false;
+        (void)runtime.apply(MusicSourceStarted{tokenA});
+        if (!require(runtime.playlistSession()->phase() == MusicSessionPhase::Playing
+                && runtime.playlistSession()->currentTrackId() == std::optional<TrackId>{trackId("a")},
+            "Playing retains logical Current")) return false;
+        const auto next = runtime.apply(MusicSourceFailed{tokenA, MusicSourceFailureClass::UnplayableTrack});
+        if (!require(next.size() == 2U && startAction(next[1])
+                && startAction(next[1])->trackId == trackId("b"), "Failure A advances to B")) return false;
+        const auto tokenB = startAction(next[1])->token;
+        const auto end = runtime.apply(MusicSourceFailed{tokenB, MusicSourceFailureClass::UnplayableTrack});
+        const auto* session = runtime.playlistSession();
+        std::cout << "C1A exhaustion mode=" << static_cast<int>(mode)
+                  << " current=" << (session->currentTrackId() ? session->currentTrackId()->value : "<none>") << '\n';
+        if (!require(end.size() == 1U && stopAction(end[0])
+                && session->phase() == MusicSessionPhase::NoPlayableTrack
+                && !session->currentTrackId() && !session->sourceToken(),
+            "RED A: exhausted NoPlayableTrack must have neither Current nor source token")) return false;
+
+        auto edited = config;
+        edited.queueVolume = 0.4F;
+        edited.tracks[0].trackVolume = 0.3F;
+        if (!require(runtime.apply(PlaylistMusicConfigChanged{playlistId("npt"), edited}).empty(),
+            "Queue/track gain alone cannot retry exhausted IDs")) return false;
+        std::swap(edited.tracks[0], edited.tracks[1]);
+        if (!require(runtime.apply(PlaylistMusicConfigChanged{playlistId("npt"), edited}).empty(),
+            "Reorder alone cannot retry exhausted IDs")) return false;
+        for (const auto changedMode : {MusicQueueMode::ListLoop, MusicQueueMode::Shuffle, MusicQueueMode::CurrentSingleLoop})
+        {
+            edited.mode = changedMode;
+            if (!require(runtime.apply(PlaylistMusicConfigChanged{playlistId("npt"), edited}).empty(),
+                "Mode-only edit cannot retry exhausted IDs")) return false;
+        }
+        edited.mode = mode;
+        edited.tracks.erase(edited.tracks.begin()); // Remove failed B; A remains attempted.
+        if (!require(runtime.apply(PlaylistMusicConfigChanged{playlistId("npt"), edited}).empty()
+                && runtime.apply(MusicExecutionAvailable{}).empty(),
+            "Failed-entry removal and ExecutionAvailable cannot retry exhausted IDs")) return false;
+        if (!require(runtime.apply(MusicSourceStarted{tokenA}).empty()
+                && runtime.apply(MusicSourceFailed{tokenB, MusicSourceFailureClass::UnplayableTrack}).empty()
+                && !runtime.playlistSession()->currentTrackId(), "Retired terminal facts cannot restore Current")) return false;
+
+        edited.tracks.push_back(track("c", "a.mp3")); // Duplicate path, distinct new opportunity.
+        const auto revival = runtime.apply(PlaylistMusicConfigChanged{playlistId("npt"), edited});
+        if (!require(revival.size() == 1U && startAction(revival[0])
+                && startAction(revival[0])->trackId == trackId("c")
+                && startAction(revival[0])->token.value == tokenB.value + 1U,
+            "Only new unattempted C starts, with the next unused token")) return false;
+        const auto tokenC = startAction(revival[0])->token;
+        if (!require(runtime.apply(PlaylistMusicConfigChanged{playlistId("npt"), edited}).empty(),
+            "Repeated same configuration cannot start C twice")) return false;
+        (void)runtime.apply(MusicSourceFailed{tokenC, MusicSourceFailureClass::UnplayableTrack});
+        if (!require(!runtime.playlistSession()->currentTrackId()
+                && runtime.playlistSession()->phase() == MusicSessionPhase::NoPlayableTrack,
+            "Failed C exhausts only its new opportunity; old A does not retry")) return false;
+        edited.tracks.clear();
+        if (!require(runtime.apply(PlaylistMusicConfigChanged{playlistId("npt"), edited}).empty()
+                && runtime.playlistSession()->phase() == MusicSessionPhase::SilentEmptyQueue
+                && !runtime.playlistSession()->currentTrackId() && !runtime.playlistSession()->sourceToken(),
+            "Empty queue has no Current or token")) return false;
+        (void)runtime.apply(PlaybackStopped{});
+        if (!require(!runtime.playlistSession() && !runtime.activePlaylistId(),
+            "Stop retires the active owner/session")) return false;
+    }
+    std::cout << "PASS C1A identity/history/reconciliation: all three modes\n";
+    return true;
 }
 
-int main()
+bool verifyNoPlayableManualSwitchDoesNotAllocate()
 {
+    MusicSession session{MusicScope::PlaylistGlobal,
+        queue({track("a", "a.mp3"), track("b", "b.mp3")})};
+    const auto first = session.selectInitialTrack();
+    session.beginStart(*first, MusicSourceToken{1U});
+    const auto second = session.selectNextTrackAfterUnplayableFailure();
+    if (!require(second == std::optional<TrackId>{trackId("b")}, "NPT switch setup reaches B")) return false;
+    session.beginStart(*second, MusicSourceToken{2U});
+    (void)session.selectNextTrackAfterUnplayableFailure();
+    std::size_t allocations = 0U;
+    const auto actions = session.switchToTrack(trackId("a"), PlaybackActivity::Playing,
+        [&]() -> std::optional<MusicSourceToken> { ++allocations; return MusicSourceToken{3U}; });
+    std::cout << "C1A manual switch allocations=" << allocations << " actions=" << actions.size() << '\n';
+    if (!require(actions.empty() && allocations == 0U
+            && session.phase() == MusicSessionPhase::NoPlayableTrack
+            && !session.currentTrackId() && !session.sourceToken(),
+        "RED B: NoPlayableTrack manual switch must not allocate or emit StartSource")) return false;
+    std::cout << "PASS C1A NPT manual switch: no allocation/no action\n";
+    return true;
+}
+
+bool verifyNoPlayableScopeIsolationAndValidSwitches()
+{
+    for (const bool failPlaylist : {true, false})
+    {
+        BackgroundMusicRuntime runtime{};
+        const auto failedQueue = queue({track("a", "a.mp3"), track("b", "b.mp3")});
+        const auto healthyQueue = queue({track("healthy", "healthy.mp3"), track("other", "other.mp3")});
+        const auto startup = runtime.apply(PlaybackSessionStarted{scope("both", "item",
+            failPlaylist ? failedQueue : healthyQueue, failPlaylist ? healthyQueue : failedQueue)});
+        if (!require(startup.size() == 2U && startAction(startup[0]) && startAction(startup[1]),
+            "Isolation setup starts two independent scopes")) return false;
+        const auto failedToken = startAction(startup[failPlaylist ? 0 : 1])->token;
+        const auto healthyToken = startAction(startup[failPlaylist ? 1 : 0])->token;
+        (void)runtime.apply(MusicSourceStarted{failedToken});
+        (void)runtime.apply(MusicSourceStarted{healthyToken});
+        const auto next = runtime.apply(MusicSourceFailed{failedToken, MusicSourceFailureClass::UnplayableTrack});
+        if (!require(next.size() == 2U && startAction(next[1]), "Isolation failure advances once")) return false;
+        (void)runtime.apply(MusicSourceFailed{startAction(next[1])->token, MusicSourceFailureClass::UnplayableTrack});
+        const auto* failed = failPlaylist ? runtime.playlistSession() : runtime.itemSession();
+        const auto* healthy = failPlaylist ? runtime.itemSession() : runtime.playlistSession();
+        if (!require(failed && healthy && failed->phase() == MusicSessionPhase::NoPlayableTrack
+                && !failed->currentTrackId() && !failed->sourceToken()
+                && healthy->phase() == MusicSessionPhase::Playing && healthy->sourceToken() == healthyToken
+                && healthy->currentTrackId() == std::optional<TrackId>{trackId("healthy")},
+            "Exhaustion clears only the failed scope; other scope remains Playing")) return false;
+        const auto switched = failPlaylist
+            ? runtime.apply(PlaylistMusicTrackSwitchRequested{playlistId("both"), trackId("a")})
+            : runtime.apply(ItemMusicTrackSwitchRequested{playlistId("both"), itemId("item"), trackId("a")});
+        if (!require(switched.empty() && runtime.activePlaylistId() == std::optional<PlaylistId>{playlistId("both")}
+                && runtime.activeItemId() == std::optional<ItemId>{itemId("item")},
+            "Real Runtime switch event cannot revive NPT or change active owner")) return false;
+    }
+    for (const auto activity : {PlaybackActivity::Playing, PlaybackActivity::Paused})
+    {
+        MusicSession session{MusicScope::PlaylistGlobal, queue({track("a", "a.mp3"), track("b", "b.mp3")})};
+        const auto first = session.selectInitialTrack();
+        session.beginStart(*first, MusicSourceToken{10U});
+        // Each legitimate state retains its own current. Switching still works.
+        for (int state = 0; state != 3; ++state)
+        {
+            MusicSession candidate{session};
+            if (state == 1) (void)candidate.acknowledgeStarted(MusicSourceToken{10U});
+            if (state == 2) candidate.enterWaitingForExecutor();
+            std::size_t allocations = 0U;
+            const auto same = candidate.switchToTrack(trackId("a"), activity,
+                [&]() -> std::optional<MusicSourceToken> { ++allocations; return MusicSourceToken{11U}; });
+            const auto change = candidate.switchToTrack(trackId("b"), activity,
+                [&]() -> std::optional<MusicSourceToken> { ++allocations; return MusicSourceToken{11U}; });
+            const auto* start = change.empty() ? nullptr : startAction(change.back());
+            if (!require(same.empty() && allocations == 1U && start && start->trackId == trackId("b")
+                    && start->activity == activity && candidate.currentTrackId() == std::optional<TrackId>{trackId("b")},
+                "Pending/Playing/Waiting and paused switches survive; same-current never allocates")) return false;
+        }
+    }
+    std::cout << "PASS C1A both-scope isolation and six valid-state/activity switch combinations\n";
+    return true;
+}
+
+}
+
+bool verifyBgmObservationFencingAndLifetime()
+{
+    namespace Obs = DesktopSceneEngine::BackgroundMusicObservation;
+    BackgroundMusicRuntime runtime{};
+    const auto playlist = queue({track("a", "a.mp3"), track("b", "b.mp3"), track("c", "c.mp3")});
+    const auto item = queue({track("x", "x.mp3")});
+    const auto startup = runtime.apply(PlaybackSessionStarted{scope("observed", "item", playlist, item)});
+    if (!require(startup.size() == 2U && startAction(startup[0]) && startAction(startup[1]),
+        "Observation setup starts real scoped native sessions")) return false;
+    const auto tokenA = startAction(startup[0])->token, tokenX = startAction(startup[1])->token;
+    (void)runtime.apply(MusicSourceStarted{tokenA});
+    (void)runtime.apply(MusicSourceStarted{tokenX});
+    const auto successor = runtime.apply(MusicSourceFailed{tokenA, MusicSourceFailureClass::UnplayableTrack,
+        Obs::FailureStage::SourceOpen, Obs::FailureCode::OpenFailure});
+    if (!require(successor.size() == 2U && startAction(successor[1]) && startAction(successor[1])->trackId == trackId("b"),
+        "A failure preserves existing successor policy")) return false;
+    const auto tokenB = startAction(successor[1])->token;
+    (void)runtime.apply(MusicSourceStarted{tokenB});
+    const auto ready = runtime.backgroundMusicObservation();
+    if (!require(ready.playlist.phase == Obs::Phase::Playing && ready.playlist.currentTrackId->value == "b"
+            && ready.playlist.lastFailedAttempt && ready.playlist.lastFailedAttempt->trackId.value == "a"
+            && ready.item.phase == Obs::Phase::Playing && ready.item.currentTrackId->value == "x"
+            && !ready.item.lastFailedAttempt, "Playing B and failed A coexist without Item leakage")) return false;
+    (void)runtime.apply(MusicSourceFailed{tokenA, MusicSourceFailureClass::TransientResourceFailure,
+        Obs::FailureStage::Playback, Obs::FailureCode::InputFailed});
+    (void)runtime.apply(MusicSourceStarted{tokenA});
+    if (!require(runtime.backgroundMusicObservation() == ready,
+        "Late retired-token failure/success cannot corrupt phase/current/failure")) return false;
+    const auto advance = runtime.apply(MusicSourceEnded{tokenB});
+    if (!require(advance.size() == 2U && startAction(advance[1]) && startAction(advance[1])->trackId == trackId("c"),
+        "Ordinary EOF remains an automatic configured successor")) return false;
+    const auto tokenC = startAction(advance[1])->token;
+    (void)runtime.apply(MusicSourceStarted{tokenC});
+    if (!require(runtime.backgroundMusicObservation().playlist.lastFailedAttempt == ready.playlist.lastFailedAttempt,
+        "Automatic progression/success cannot clear the last failed attempt")) return false;
+
+    (void)runtime.apply(MusicSourceFailed{tokenX, MusicSourceFailureClass::UnplayableTrack,
+        Obs::FailureStage::Playback, Obs::FailureCode::InputFailed});
+    const auto isolated = runtime.backgroundMusicObservation();
+    if (!require(isolated.item.phase == Obs::Phase::NoPlayableTrack && !isolated.item.currentTrackId
+            && !isolated.item.switchEligible && isolated.item.lastFailedAttempt->trackId.value == "x"
+            && isolated.playlist.phase == Obs::Phase::Playing && isolated.playlist.currentTrackId->value == "c"
+            && isolated.playlist.switchEligible && isolated.playlist.lastFailedAttempt->trackId.value == "a",
+        "Item NPT/failure remains independent of healthy Playlist and its different failure")) return false;
+
+    auto withoutA = playlist; withoutA.tracks.erase(withoutA.tracks.begin());
+    if (!require(runtime.apply(PlaylistMusicConfigChanged{playlistId("observed"), withoutA}).empty()
+            && !runtime.backgroundMusicObservation().playlist.lastFailedAttempt
+            && runtime.playlistSession()->sourceToken() == tokenC,
+        "Removing the failed non-current entry clears only its bounded fact without restart")) return false;
+    (void)runtime.apply(MusicSourceFailed{tokenC, MusicSourceFailureClass::TransientResourceFailure,
+        Obs::FailureStage::MixerRegistration, Obs::FailureCode::RegistrationFailure});
+    const auto waiting = runtime.backgroundMusicObservation();
+    if (!require(waiting.playlist.phase == Obs::Phase::WaitingForExecutor
+            && waiting.playlist.currentTrackId->value == "c" && waiting.playlist.switchEligible
+            && waiting.playlist.lastFailedAttempt->trackId.value == "c", "Resource failure records reason but retains waiting semantics")) return false;
+    const auto recovery = runtime.apply(MusicExecutionAvailable{});
+    if (!require(recovery.size() == 1U && startAction(recovery[0]), "ExecutionAvailable retains existing recovery action")) return false;
+    const auto recoveredToken = startAction(recovery[0])->token;
+    (void)runtime.apply(MusicSourceStarted{recoveredToken});
+    if (!require(runtime.backgroundMusicObservation().playlist.lastFailedAttempt == waiting.playlist.lastFailedAttempt,
+        "Automatic resource recovery retains its bounded failed-attempt fact")) return false;
+    (void)runtime.apply(MusicSourceFailed{recoveredToken, MusicSourceFailureClass::UnplayableTrack,
+        Obs::FailureStage::Playback, Obs::FailureCode::InputFailed});
+    const auto latest = runtime.backgroundMusicObservation();
+    if (!require(latest.playlist.lastFailedAttempt->stage == Obs::FailureStage::Playback
+            && latest.playlist.lastFailedAttempt->code == Obs::FailureCode::InputFailed,
+        "A new authoritative failure replaces the one bounded fact")) return false;
+    const auto currentToken = runtime.playlistSession()->sourceToken();
+    if (!require(currentToken.has_value(), "Unplayable C must retain a pending B opportunity")) return false;
+    (void)runtime.apply(MusicSourceStarted{*currentToken});
+    (void)runtime.apply(PlaybackPaused{});
+    const auto switched = runtime.apply(PlaylistMusicTrackSwitchRequested{playlistId("observed"), trackId("c")});
+    if (!require(switched.size() == 2U && startAction(switched[1])
+            && startAction(switched[1])->activity == PlaybackActivity::Paused
+            && !runtime.backgroundMusicObservation().playlist.lastFailedAttempt
+            && runtime.backgroundMusicObservation().item.lastFailedAttempt == isolated.item.lastFailedAttempt,
+        "Actual paused explicit fresh switch supersedes Playlist fact only")) return false;
+    const auto afterSwitch = runtime.backgroundMusicObservation();
+    (void)runtime.apply(MusicSourceFailed{*currentToken, MusicSourceFailureClass::UnplayableTrack,
+        Obs::FailureStage::SourceOpen, Obs::FailureCode::NoAudioStream});
+    (void)runtime.apply(MusicSourceStarted{tokenX});
+    if (!require(runtime.backgroundMusicObservation() == afterSwitch,
+        "Late former-current/other-scope success cannot resurrect old facts")) return false;
+    (void)runtime.apply(PlaybackStopped{});
+    const auto stopped = runtime.backgroundMusicObservation();
+    if (!require(!stopped.playlist.lastFailedAttempt && !stopped.item.lastFailedAttempt
+            && !stopped.playlist.exists && !stopped.item.exists, "Owner retirement clears both bounded facts")) return false;
+    (void)runtime.apply(PlaybackSessionStarted{scope("fresh", std::nullopt, playlist, std::nullopt)});
+    const auto fresh = runtime.backgroundMusicObservation();
+    (void)runtime.apply(MusicSourceFailed{recoveredToken, MusicSourceFailureClass::UnplayableTrack,
+        Obs::FailureStage::Playback, Obs::FailureCode::InputFailed});
+    if (!require(runtime.backgroundMusicObservation() == fresh && !fresh.playlist.lastFailedAttempt,
+        "Fresh identity activation cannot inherit retired owner's failure")) return false;
+    return require(ready.playlist.lastFailedAttempt->trackId.value == "a",
+        "Detached observation and repeated hydration do not bind state to a view lifecycle");
+}
+
+int main(int argc, char** argv)
+{
+    if (argc == 2 && std::string{argv[1]} == "--bgm-observation-only") return verifyBgmObservationFencingAndLifetime() ? 0 : 1;
+    if (argc == 2 && std::string{argv[1]} == "--npt-identity-only") return verifyNoPlayableIdentityAndHistory() ? 0 : 1;
+    if (argc == 2 && std::string{argv[1]} == "--npt-switch-only") return verifyNoPlayableManualSwitchDoesNotAllocate() ? 0 : 1;
+    if (argc == 2 && std::string{argv[1]} == "--npt-focused")
+        return verifyNoPlayableIdentityAndHistory() && verifyNoPlayableManualSwitchDoesNotAllocate()
+            && verifyNoPlayableScopeIsolationAndValidSwitches() ? 0 : 1;
     const bool success = verifySnapshotValidation()
         && verifySessionStartAndPauseResume()
         && verifyEmptyScopesAndInvalidStart()
@@ -1299,6 +1567,10 @@ int main()
         && verifyManualTrackSwitching()
         && verifyTerminalRoutingStalenessAndPausedReplacement()
         && verifyExecutionAvailableRecoversWaitingSession()
-        && verifyExecutionAvailableStateMatrixAndOrdering();
+        && verifyExecutionAvailableStateMatrixAndOrdering()
+        && verifyNoPlayableIdentityAndHistory()
+        && verifyNoPlayableManualSwitchDoesNotAllocate()
+        && verifyNoPlayableScopeIsolationAndValidSwitches()
+        && verifyBgmObservationFencingAndLifetime();
     return success ? 0 : 1;
 }

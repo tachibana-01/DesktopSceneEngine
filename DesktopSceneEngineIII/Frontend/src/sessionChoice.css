@@ -1,0 +1,7 @@
+.session-choice { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 7px; border: 1px solid #2b333e; border-radius: 2px; background: #151a21; color: #cad3df; font-size: 10px; }
+.session-choice > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-choice > span:last-child { color: #7d8b9c; }
+.session-choice:hover { border-color: #465465; }
+.inspector-choice-menu { width: 190px; }
+.inspector-choice-menu [role="option"] { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 35px; padding: 8px 11px; border: 0; border-radius: 2px; background: transparent; color: #b8c4d4; text-align: left; font-size: 11px; }
+.inspector-choice-menu [role="option"]:is(:hover,:focus-visible) { background: #222a35; color: #e9edf3; outline-offset: -1px; }

@@ -4,8 +4,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 namespace DesktopSceneEngine::Resources
 {
@@ -16,6 +18,13 @@ enum class AudioOpenStatus
     Ready,
     NoAudioStream,
     DecodeFailure
+};
+
+struct AudioPcmStorage
+{
+    std::vector<std::int16_t> original;
+    std::vector<std::int16_t> output;
+    float tempo = 1.0F;
 };
 
 // Decodes one audio stream into the stable PCM format used by AudioOutput:
@@ -36,11 +45,22 @@ public:
 
     // Opens the first audio stream and decodes it synchronously into PCM.
     // A media file without an audio stream returns false without throwing.
-    [[nodiscard]] bool open(const std::filesystem::path& path) noexcept;
+    // A supplied cooperative cancellation flag outlives this resource; FFmpeg
+    // interrupt support does not promise a bound for every backend/codec call.
+    [[nodiscard]] bool open(const std::filesystem::path& path,
+        const std::atomic_bool* cancellation = nullptr) noexcept;
 
     // Rebuilds the output PCM for a supported playback tempo while keeping
     // the decoded media PCM available for later speed transitions.
-    [[nodiscard]] bool setTempo(float tempo) noexcept;
+    [[nodiscard]] bool setTempo(float tempo,
+        const std::atomic_bool* cancellation = nullptr) noexcept;
+
+    // Resource-owner only. Move the owning vectors out; no borrowed PCM survives
+    // this operation. FFmpeg state remains confined to this resource owner.
+    [[nodiscard]] AudioPcmStorage releasePcm() noexcept;
+    [[nodiscard]] static bool prepareTempoPcm(const std::vector<std::int16_t>& original,
+        float tempo, std::vector<std::int16_t>& output,
+        const std::atomic_bool* cancellation = nullptr) noexcept;
 
     [[nodiscard]] float tempo() const noexcept;
 

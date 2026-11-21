@@ -10,14 +10,7 @@
 namespace DesktopSceneEngine::Music
 {
 
-enum class MusicSessionPhase
-{
-    SilentEmptyQueue,
-    PendingStart,
-    Playing,
-    NoPlayableTrack,
-    WaitingForExecutor
-};
+using MusicSessionPhase = BackgroundMusicObservation::Phase;
 
 using ShufflePermutationProvider = std::function<std::vector<TrackId>(
     std::span<const TrackId> candidates)>;
@@ -42,6 +35,10 @@ public:
     [[nodiscard]] const std::optional<TrackId>& currentTrackId() const noexcept;
 
     [[nodiscard]] const std::optional<MusicSourceToken>& sourceToken() const noexcept;
+
+    [[nodiscard]] const std::optional<BackgroundMusicObservation::FailedAttempt>&
+    lastFailedAttempt() const noexcept;
+    void recordFailedAttempt(const MusicSourceFailed& event);
 
     [[nodiscard]] std::optional<TrackId> selectInitialTrack();
 
@@ -137,6 +134,7 @@ private:
     MusicSessionPhase phase_ = MusicSessionPhase::SilentEmptyQueue;
     std::optional<TrackId> currentTrackId_{};
     std::optional<MusicSourceToken> sourceToken_{};
+    std::optional<BackgroundMusicObservation::FailedAttempt> lastFailedAttempt_{};
     std::vector<TrackId> attemptedTrackIds_{};
     std::vector<TrackId> shuffleBag_{};
     std::optional<TrackId> lastSuccessfullyPlayedTrack_{};

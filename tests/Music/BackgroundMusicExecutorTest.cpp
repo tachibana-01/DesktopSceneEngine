@@ -210,14 +210,19 @@ bool verifyStartValidationAndMissingPath()
     BackgroundMusicExecutor executor{mixer};
     std::vector<float> silence(2U, 9.0F);
     const std::filesystem::path missing = fixturePath().parent_path() / "missing-background-track.wav";
+    const auto missingFact = executor.execute(startAction(2U, MusicScope::PlaylistGlobal, 1.0F, missing));
     if (!require(isFailure(
-            executor.execute(startAction(2U, MusicScope::PlaylistGlobal, 1.0F, missing)),
+            missingFact,
             2U,
             MusicSourceFailureClass::UnplayableTrack),
         "A missing source must be classified as an unplayable track"))
     {
         return false;
     }
+    const auto& detail = std::get<MusicSourceFailed>(*missingFact);
+    if (!require(detail.stage == DesktopSceneEngine::BackgroundMusicObservation::FailureStage::SourceOpen
+            && detail.code == DesktopSceneEngine::BackgroundMusicObservation::FailureCode::OpenFailure,
+        "Executor preserves the known OpenFailure without guessing FileMissing or codec")) return false;
 
     silence.assign(2U, 9.0F);
     return require(mixFrames(mixer, silence)
@@ -238,11 +243,15 @@ bool verifyRegistrationFailure()
         }};
 
     std::vector<float> silence(2U, 9.0F);
+    const auto registration = executor.execute(startAction(3U));
     return require(isFailure(
-                executor.execute(startAction(3U)),
+                registration,
                 3U,
                 MusicSourceFailureClass::TransientResourceFailure),
             "Mixer registration failure must remain transient")
+        && require(std::get<MusicSourceFailed>(*registration).stage == DesktopSceneEngine::BackgroundMusicObservation::FailureStage::MixerRegistration
+                && std::get<MusicSourceFailed>(*registration).code == DesktopSceneEngine::BackgroundMusicObservation::FailureCode::RegistrationFailure,
+            "Diagnostic registration reason does not change transient policy")
         && require(mixFrames(mixer, silence)
                 && silence == std::vector<float>(2U, 0.0F),
             "Registration failure must not leave a Mixer input")
@@ -280,7 +289,9 @@ bool verifyTerminalFailure()
         : nullptr;
     return require(failed != nullptr
             && failed->token == MusicSourceToken{30U}
-            && failed->failure == MusicSourceFailureClass::UnplayableTrack,
+            && failed->failure == MusicSourceFailureClass::UnplayableTrack
+            && failed->stage == DesktopSceneEngine::BackgroundMusicObservation::FailureStage::Playback
+            && failed->code == DesktopSceneEngine::BackgroundMusicObservation::FailureCode::InputFailed,
         "A terminal input failure must map to UnplayableTrack after cleanup")
         && require(executor.collectTerminalEvents().empty(),
             "A terminal input failure must be harvested exactly once");

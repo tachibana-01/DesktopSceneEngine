@@ -9,73 +9,25 @@
 #include <DesktopSceneEngine/Domain/Scene.h>
 #include <DesktopSceneEngine/Engine.h>
 
-#include "Core/AudioOutputRecoveryTestHooks.h"
-#include "Core/SharedAudioOutputRecoveryPolicy.h"
-#include "Music/BackgroundMusicExecutor.h"
-#include "Music/BackgroundMusicRuntime.h"
+#include "AudioExecutionEngineFixture.h"
+#include "Resources/AudioResource.h"
+#include "Resources/VideoResource.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
-namespace DesktopSceneEngine::Core
-{
-
-class BackgroundMusicEngineTestAccess final
-{
-public:
-    [[nodiscard]] static const Music::BackgroundMusicRuntime& runtime(
-        const Engine& engine
-    ) noexcept
-    {
-        return *engine.backgroundMusicRuntime_;
-    }
-
-    [[nodiscard]] static const Music::BackgroundMusicExecutor& executor(
-        const Engine& engine
-    ) noexcept
-    {
-        return *engine.backgroundMusicExecutor_;
-    }
-
-    [[nodiscard]] static bool hasEmbeddedAudioInput(const Engine& engine) noexcept
-    {
-        return engine.embeddedAudioInputHandleValue_ != 0U;
-    }
-};
-
-class AudioOutputRecoveryEngineTestAccess final
-{
-public:
-    static void installHooks(Engine& engine, AudioOutputRecoveryTestHooks hooks)
-    {
-        engine.audioOutputRecoveryTestHooks_ = std::make_unique<AudioOutputRecoveryTestHooks>(
-            std::move(hooks));
-    }
-
-    [[nodiscard]] static AudioOutputOperationalState operationalState(
-        const Engine& engine
-    ) noexcept
-    {
-        return engine.audioOutputOperationalState_;
-    }
-
-    [[nodiscard]] static std::uint64_t embeddedInputHandle(const Engine& engine) noexcept
-    {
-        return engine.embeddedAudioInputHandleValue_;
-    }
-};
-
-}
 
 namespace
 {
@@ -96,10 +48,9 @@ using DesktopSceneEngine::BackgroundMusicControl::TrackId;
 using DesktopSceneEngine::BackgroundMusicControl::TrackSnapshot;
 using DesktopSceneEngine::Core::BackgroundMusicEngineTestAccess;
 using DesktopSceneEngine::Core::AudioOutputRecoveryEngineTestAccess;
-using DesktopSceneEngine::Core::AudioOutputRecoveryTestHooks;
-using DesktopSceneEngine::Core::AudioOutputOperationalState;
-using DesktopSceneEngine::Audio::MixedOutputBridgeResult;
-using DesktopSceneEngine::Audio::MixedOutputBridgeStatus;
+namespace Tests = DesktopSceneEngine::Tests;
+using DesktopSceneEngine::Audio::AudioLane;
+using DesktopSceneEngine::Audio::AudioOutputHealth;
 
 bool require(bool condition, const char* message)
 {
@@ -115,6 +66,41 @@ bool require(bool condition, const char* message)
 bool nearlyEqual(float left, float right, float tolerance = 0.01F)
 {
     return std::fabs(left - right) <= tolerance;
+}
+
+bool readMatchesNativeClock(DesktopSceneEngine::Engine& engine,
+    const DesktopSceneEngine::Audio::AudioClockAnchor& anchor)
+{
+    const auto before = DesktopSceneEngine::Audio::audioMonotonicNow();
+    const double actual = engine.playbackTime();
+    const auto after = DesktopSceneEngine::Audio::audioMonotonicNow();
+    const double lower = DesktopSceneEngine::Audio::resolveAudioClockPosition(anchor, before);
+    const double upper = DesktopSceneEngine::Audio::resolveAudioClockPosition(anchor, after);
+    // Only the float public return conversion is tolerated. The scheduling
+    // interval is measured in the same native domain, not a guessed delay.
+    constexpr double FloatRounding = 0.000002;
+    const bool matches = actual >= lower - FloatRounding && actual <= upper + FloatRounding;
+    if (!matches) std::cerr << "Seek clock read actual=" << actual << " envelope=[" << lower << ',' << upper
+        << "] anchor=" << anchor.position << " version=" << anchor.timingVersion << '\n';
+    return matches;
+}
+
+bool committedSeekAnchorIs(DesktopSceneEngine::Engine& engine, float target)
+{
+    if (!Tests::waitUntil(engine, [&] {
+        const auto& clock = AudioOutputRecoveryEngineTestAccess::control(engine).clock;
+        const auto applied = Tests::audioState(engine).clock;
+        return clock.valid() && applied.binding == clock.binding && applied.timingVersion == clock.timingVersion;
+    })) return false;
+    const auto clock = AudioOutputRecoveryEngineTestAccess::control(engine).clock;
+    const auto applied = Tests::audioState(engine).clock;
+    const bool matching = clock.position == static_cast<double>(target)
+        && applied.position == static_cast<double>(target)
+        && applied.timingVersion == clock.timingVersion
+        && applied.binding == clock.binding;
+    if (!matching) std::cerr << "Seek anchor target=" << target << " C=" << clock.position
+        << " A=" << applied.position << " versions=" << clock.timingVersion << ',' << applied.timingVersion << '\n';
+    return matching && readMatchesNativeClock(engine, clock);
 }
 
 std::string utf8Path(const std::filesystem::path& path)
@@ -174,37 +160,6 @@ Event makePlaylistBgmStartEvent()
         std::nullopt}};
 }
 
-struct EmbeddedRecoveryOutputScript
-{
-    std::size_t initializeCalls = 0U;
-    std::size_t beginCalls = 0U;
-    std::size_t pumpCalls = 0U;
-
-    [[nodiscard]] AudioOutputRecoveryTestHooks hooks()
-    {
-        AudioOutputRecoveryTestHooks result{};
-        result.initialize = [this]()
-        {
-            ++initializeCalls;
-            return true;
-        };
-        result.beginBlockMode = [this](auto)
-        {
-            ++beginCalls;
-            return DesktopSceneEngine::Audio::AudioBlockStatus::Success;
-        };
-        result.pump = [this]()
-        {
-            ++pumpCalls;
-            return MixedOutputBridgeResult{
-                0U,
-                pumpCalls == 2U
-                    ? MixedOutputBridgeStatus::DeviceFailure
-                    : MixedOutputBridgeStatus::WroteFrames};
-        };
-        return result;
-    }
-};
 
 Project makeMediaProject(
     const std::filesystem::path& resourcePath,
@@ -249,7 +204,7 @@ bool testImageSeek(const std::filesystem::path& imagePath)
         EntityId{std::string{"image-media"}},
         10.0F);
 
-    DesktopSceneEngine::Engine engine{};
+    Tests::AwaitAudioEngine engine{};
     if (!require(
             !engine.seek(1.0F),
             "Seek must fail before Engine initialization")
@@ -283,8 +238,8 @@ bool testImageSeek(const std::filesystem::path& imagePath)
 
     if (!require(engine.seek(3.5F), "Image seek to the middle should succeed")
         || !require(
-            nearlyEqual(engine.playbackTime(), 3.5F),
-            "Image seek should commit scene-local playback time")
+            committedSeekAnchorIs(engine, 3.5F),
+            "Image seek commits the exact matching C/A target anchor and reads its QPC progression")
         || !require(
             engine.activeSceneIndex() == preservedSceneIndex,
             "Image seek must preserve the active scene")
@@ -298,10 +253,14 @@ bool testImageSeek(const std::filesystem::path& imagePath)
         return false;
     }
 
-    engine.update(0.25F);
+    const auto beforeElapsed = DesktopSceneEngine::Audio::audioMonotonicNow();
+    const auto beforePosition = engine.playbackTime();
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    engine.update(0.25F); // Compatibility argument is not the clock authority.
+    const double elapsed = static_cast<double>(DesktopSceneEngine::Audio::audioMonotonicNow() - beforeElapsed) / 1e9;
     if (!require(
-            nearlyEqual(engine.playbackTime(), 4.0F),
-            "Update should advance from the sought image time at the preserved speed"))
+            std::fabs(engine.playbackTime() - (beforePosition + elapsed * preservedSpeed)) < 0.03,
+            "Update evaluates elapsed QPC time from the sought position at the preserved speed"))
     {
         engine.shutdown();
         return false;
@@ -375,7 +334,7 @@ bool testZeroDurationSeek()
     const Project project = makeZeroDurationProject();
     const EntityId sceneId{std::string{"zero-duration-scene"}};
 
-    DesktopSceneEngine::Engine engine{};
+    Tests::AwaitAudioEngine engine{};
     engine.initialize();
     const bool passed = require(
         engine.bindProject(project, sceneId),
@@ -400,9 +359,8 @@ bool testVideoSeek(const std::filesystem::path& videoPath)
         0.0F,
         1.25F);
 
-    DesktopSceneEngine::Engine engine{};
-    EmbeddedRecoveryOutputScript recoveryOutput{};
-    AudioOutputRecoveryEngineTestAccess::installHooks(engine, recoveryOutput.hooks());
+    Tests::AwaitAudioEngine engine{};
+    auto& recoveryOutput = engine.device;
     engine.initialize();
     if (!require(
             engine.bindProject(project, sceneId),
@@ -425,13 +383,13 @@ bool testVideoSeek(const std::filesystem::path& videoPath)
     const float backwardTarget = 0.25F;
 
     if (!require(
-            BackgroundMusicEngineTestAccess::hasEmbeddedAudioInput(engine),
+            Tests::lane(engine, AudioLane::Embedded).has_value(),
             "The seek fixture must create the embedded input required to exercise V1 shared-stream flushes")
         || !require(
             engine.processBackgroundMusicControl(makePlaylistBgmStartEvent()),
             "Seek continuity setup must start a Playlist BGM source")
         || !require(
-            BackgroundMusicEngineTestAccess::executor(engine).hasActiveSources(),
+            Tests::lane(engine, AudioLane::PlaylistBgm).has_value(),
             "Playlist BGM setup must register an Executor-owned Mixer source"))
     {
         engine.shutdown();
@@ -454,46 +412,40 @@ bool testVideoSeek(const std::filesystem::path& videoPath)
         const auto* const currentSession = BackgroundMusicEngineTestAccess::runtime(engine)
             .playlistSession();
         return require(
-            BackgroundMusicEngineTestAccess::executor(engine).hasActiveSources()
+            Tests::lane(engine, AudioLane::PlaylistBgm).has_value()
                 && currentSession != nullptr
                 && currentSession->sourceToken() == bgmToken,
             message);
     };
 
-    const std::uint64_t embeddedHandleBeforeOutage =
-        AudioOutputRecoveryEngineTestAccess::embeddedInputHandle(engine);
-    engine.update(0.0F);
-    if (!require(
-            AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::DeviceUnavailable
-                && AudioOutputRecoveryEngineTestAccess::embeddedInputHandle(engine)
-                    == embeddedHandleBeforeOutage
-                && requireBgmContinuity(
-                    "Device outage entry must retain embedded and BGM mixer registrations"),
-            "The scripted device failure must preserve embedded presence until recovery"))
-    {
-        engine.shutdown();
-        return false;
-    }
-
-    engine.update(0.5F);
-    if (!require(
-            AudioOutputRecoveryEngineTestAccess::operationalState(engine)
-                == AudioOutputOperationalState::Healthy
-                && AudioOutputRecoveryEngineTestAccess::embeddedInputHandle(engine) != 0U
-                && AudioOutputRecoveryEngineTestAccess::embeddedInputHandle(engine)
-                    != embeddedHandleBeforeOutage
-                && recoveryOutput.initializeCalls == 3U
-                && recoveryOutput.beginCalls == 2U
-                && recoveryOutput.pumpCalls == 3U
-                && nearlyEqual(engine.playbackTime(), 0.625F, 0.02F)
-                && requireBgmContinuity(
-                    "Embedded rebuild must preserve the Playlist BGM registration and token"),
-            "Recovery must rebuild embedded audio at the current visual logical time"))
-    {
-        engine.shutdown();
-        return false;
-    }
+    const auto embeddedBeforeOutage = *Tests::lane(engine, AudioLane::Embedded);
+    const auto opensBeforeOutage = recoveryOutput.openCalls.load();
+    const auto configuresBeforeOutage = recoveryOutput.configureCalls.load();
+    const auto recoveriesBeforeOutage = Tests::audioState(engine).recoveryAttempts;
+    recoveryOutput.availabilityResult.store(DesktopSceneEngine::Audio::AudioBlockStatus::DeviceFailure);
+    if (!require(Tests::waitUntil(engine, [&] {
+            return Tests::audioState(engine).health == AudioOutputHealth::DeviceUnavailable;
+        }), "A must observe the injected sink failure independently of Engine update")
+        || !require(Tests::lane(engine, AudioLane::Embedded).has_value()
+            && Tests::lane(engine, AudioLane::Embedded)->source == embeddedBeforeOutage.source
+            && requireBgmContinuity("Device outage retains embedded and BGM source identity"),
+            "Device outage does not retire registered sources")) return false;
+    if (!require(Tests::waitUntil(engine, [&] {
+            return Tests::audioState(engine).health == AudioOutputHealth::Healthy
+                && Tests::audioState(engine).recoveryAttempts > recoveriesBeforeOutage;
+        }), "A recovers after native elapsed cooldown without GUI delta")
+        || !require(recoveryOutput.openCalls.load() == opensBeforeOutage + 1
+            && recoveryOutput.configureCalls.load() == configuresBeforeOutage + 1
+            && Tests::audioState(engine).recoveryAttempts == recoveriesBeforeOutage + 1,
+            "Outage causes exactly one reopen/configure attempt")
+        || !require(Tests::lane(engine, AudioLane::Embedded).has_value()
+            && Tests::lane(engine, AudioLane::Embedded)->source == embeddedBeforeOutage.source
+            && requireBgmContinuity("Recovery preserves Playlist BGM registration and token"),
+            "Recovery resynchronizes the same immutable embedded allocation and surviving BGM")) return false;
+    const auto recovered = *Tests::lane(engine, AudioLane::Embedded);
+    const double expectedCursor = engine.playbackTime() / engine.playbackSpeed() * 48000.0;
+    if (!require(std::fabs(static_cast<double>(recovered.cursorFrames) - expectedCursor) < 4800,
+        "Recovered embedded cursor agrees with latest committed clock within the device horizon")) return false;
 
     if (!require(
             forwardTarget > 2.0F && engine.seek(forwardTarget),
@@ -501,14 +453,14 @@ bool testVideoSeek(const std::filesystem::path& videoPath)
         || !requireBgmContinuity(
             "V1 seek flush must preserve the Playlist BGM registration and token")
         || !require(
-            nearlyEqual(engine.playbackTime(), forwardTarget, 0.02F),
-            "Large-forward video seek should commit the requested media time")
+            committedSeekAnchorIs(engine, forwardTarget),
+            "Large-forward video seek commits the exact C/A media anchor and its native elapsed position")
         || !require(
             engine.seek(backwardTarget),
             "Backward video seek should reuse the existing random-access path")
         || !require(
-            nearlyEqual(engine.playbackTime(), backwardTarget, 0.02F),
-            "Backward video seek should commit the requested media time")
+            committedSeekAnchorIs(engine, backwardTarget),
+            "Backward video seek commits the exact C/A media anchor and its native elapsed position")
         || !require(
             engine.activeSceneIndex() == sceneIndex,
             "Video seek must preserve the active scene identity")
@@ -520,7 +472,7 @@ bool testVideoSeek(const std::filesystem::path& videoPath)
         return false;
     }
 
-    const float timeBeforeEndSeek = engine.playbackTime();
+    const auto clockBeforeEndSeek = AudioOutputRecoveryEngineTestAccess::control(engine).clock;
     const bool endSeekSucceeded = engine.seek(duration + 10.0F);
     if (!require(
             engine.activeSceneIndex() == sceneIndex,
@@ -528,14 +480,16 @@ bool testVideoSeek(const std::filesystem::path& videoPath)
         || !require(
             endSeekSucceeded
                 ? engine.playbackTime() < duration
-                : nearlyEqual(engine.playbackTime(), timeBeforeEndSeek, 0.02F),
-            "Video end seek must either clamp before EOF or preserve prior logical time"))
+                : AudioOutputRecoveryEngineTestAccess::control(engine).clock.timingVersion == clockBeforeEndSeek.timingVersion
+                    && readMatchesNativeClock(engine, clockBeforeEndSeek),
+            "Video end seek must clamp before EOF or preserve the committed native clock and its progression"))
     {
         engine.shutdown();
         return false;
     }
 
     const float timeBeforeSpeedChanges = engine.playbackTime();
+    const auto speedChangesBegan = DesktopSceneEngine::Audio::audioMonotonicNow();
     engine.setPlaybackSpeed(1.0F);
     if (!require(
             nearlyEqual(engine.playbackSpeed(), 1.0F),
@@ -572,8 +526,9 @@ bool testVideoSeek(const std::filesystem::path& videoPath)
     engine.setPlaybackSpeed(1.0F);
     if (!require(
             nearlyEqual(engine.playbackSpeed(), 1.0F)
-                && nearlyEqual(engine.playbackTime(), timeBeforeSpeedChanges, 0.02F),
-            "Repeated video speed changes must preserve the logical media time"))
+                && engine.playbackTime() >= timeBeforeSpeedChanges
+                && engine.playbackTime() <= timeBeforeSpeedChanges + 2.0 * static_cast<double>(DesktopSceneEngine::Audio::audioMonotonicNow() - speedChangesBegan) / 1e9 + 0.03,
+            "RateContinuous preparations never rewind or add time beyond actual elapsed progression"))
     {
         engine.shutdown();
         return false;
@@ -616,12 +571,203 @@ bool testVideoSeek(const std::filesystem::path& videoPath)
     return true;
 }
 
+bool testRejectedEmbeddedSeekDoesNotCreateTimingAuthority(const std::filesystem::path& videoPath)
+{
+    using Engine = DesktopSceneEngine::Engine;
+    const EntityId sceneId{std::string{"short-audio-video-scene"}};
+    const auto project = makeMediaProject(videoPath, sceneId,
+        EntityId{std::string{"short-audio-video-media"}}, 0.0F);
+    Tests::AwaitAudioEngine engine;
+    engine.initialize();
+    if (!require(engine.bindProject(project, sceneId) && engine.effectiveDuration() > 2,
+        "Precommit rejection fixture binds a real video with a valid later frame")) return false;
+    engine.togglePause();
+    if (!require(engine.isPaused() && engine.seek(0), "Short embedded fixture is positioned while paused")) return false;
+    auto& control = AudioOutputRecoveryEngineTestAccess::control(engine);
+    // This fixture substitutes a different real PCM asset under the existing
+    // video clock. Retire the old lease first: same-binding replacement otherwise
+    // deliberately reuses its immutable original for tempo preparation.
+    if (!require(Tests::effect(engine, [&] {
+        control.retire(AudioLane::Embedded); return true;
+    }) && !Tests::lane(engine, AudioLane::Embedded),
+        "Old video PCM fully retires before the fixture substitutes a different real short asset")) return false;
+    const auto shortPcm = std::filesystem::path{DESKTOP_SCENE_ENGINE_SEQUENTIAL_AUDIO_TEST_DATA_DIR}
+        / "SequentialAudioSourceStereo48k.wav";
+    if (!require(Tests::effect(engine, [&] {
+        AudioOutputRecoveryEngineTestAccess::prepareEmbedded(engine, shortPcm); return true;
+    }) && Tests::lane(engine, AudioLane::Embedded), "Real prepared short PCM replaces the video embedded lane")) return false;
+    const auto source = Tests::lane(engine, AudioLane::Embedded)->source;
+    const auto view = control.preparation.view(source);
+    std::cerr << "Short-PCM fixture source=" << source.sourceToken
+        << " path=" << shortPcm << " actual-duration=" << (view ? view->durationSeconds : -1)
+        << " sample-count=" << (view ? view->sampleCount : 0) << '\n';
+    if (!require(view && view->durationSeconds < 1,
+        "The real embedded PCM ends before the valid one-second video target")) return false;
+    if (!require(Tests::settle(engine), "Prior embedded replacement fully drains before the next admission")) return false;
+    const auto before = control.clock;
+    const auto confirmed = control.lastConfirmedPosition;
+    const auto operation = engine.beginAudioEffect(Engine::AudioEffectScope::Structural);
+    if (!require(operation.has_value(), "Rejected seek reserves a real structural operation")) return false;
+    const bool admitted = engine.Engine::seek(1.0F);
+    (void)engine.finishAudioEffect(*operation, admitted);
+    if (!require(admitted && Tests::waitUntil(engine, [&] { return engine.audioEffect(*operation).terminal(); })
+        && Tests::settle(engine) && engine.audioEffect(*operation).phase == Engine::AudioEffectPhase::Failed,
+        "Valid video target is admitted by C and rejected by A before shorter-PCM seek commit")) return false;
+    const auto applied = Tests::audioState(engine).clock;
+    const auto survivingSource=Tests::lane(engine,AudioLane::Embedded);
+    if (!require(control.clock.binding == before.binding && control.clock.timingVersion == before.timingVersion
+        && control.clock.position == before.position && control.clock.time == before.time
+        && applied.binding == before.binding && applied.timingVersion == before.timingVersion
+        && applied.position == before.position && applied.time == before.time
+        && control.lastConfirmedPosition == confirmed && control.plannedClock.timingVersion == before.timingVersion
+        && control.plannedClock.position == before.position && survivingSource && survivingSource->source == source,
+        "Precommit failure preserves actual C/A anchor, confirmed position, source identity and future admission authority")) return false;
+    if (!require(engine.seek(0) && committedSeekAnchorIs(engine, 0),
+        "A later valid seek succeeds after rejection instead of failing against a phantom future version")) return false;
+    engine.togglePause();
+    if (!require(!engine.isPaused(), "Resume remains admissible after rejected seek")) return false;
+    engine.togglePause();
+    return require(engine.isPaused() && Tests::audioState(engine).transport == DesktopSceneEngine::Audio::AudioTransport::Paused
+        && control.clock.mode == DesktopSceneEngine::Audio::AudioClockMode::Paused,
+        "A subsequent Pause commits through the same actual timing authority");
 }
 
-int main()
+bool testBindingClockWaitsForActualAudioEffect(const std::filesystem::path& imagePath)
 {
+    using Engine=DesktopSceneEngine::Engine;
+    const EntityId sceneId{std::string{"blocked-bind-scene"}};
+    const auto project=makeMediaProject(imagePath,sceneId,EntityId{std::string{"blocked-bind-media"}},10,1.25F);
+    Tests::AwaitAudioEngine engine;engine.initialize();
+    if (!require(engine.processBackgroundMusicControl(makePlaylistBgmStartEvent())
+        && Tests::lane(engine,AudioLane::PlaylistBgm),"A real prepared BGM source makes the native write boundary reachable"))return false;
+    struct ReleaseWrite
+    {
+        Tests::AudioCaptureDevice& device;
+        ~ReleaseWrite(){device.releaseWrite();}
+    } release{engine.device};
+    // Model an empty device buffer, so the render horizon admits a write.
+    // A tiny writable credit instead represents padding above that horizon.
+    engine.device.armBlockedWrite();engine.device.grant(engine.device.bufferFrames());
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{2};
+    while(!engine.device.blockedWriteEntered.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    if(!require(engine.device.blockedWriteEntered.load()&&!engine.device.blockedWriteTimedOut.load(),
+        "A is deterministically inside the bounded external native-write call before Bind admission"))return false;
+    auto& control=AudioOutputRecoveryEngineTestAccess::control(engine);
+    const auto oldConfirmed=control.clock;
+    const auto operation=engine.beginAudioEffect(Engine::AudioEffectScope::Structural);
+    if(!require(operation.has_value(),"Bind reserves capacity while A is in the external device call"))return false;
+    const auto admittedAt=DesktopSceneEngine::Audio::audioMonotonicNow();
+    const bool admitted=engine.Engine::bindProject(project,sceneId);
+    (void)engine.finishAudioEffect(*operation,admitted);
+    const auto first=engine.playbackClockSample();
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    const auto held=engine.playbackClockSample();
+    if(!require(admitted&&engine.audioEffect(*operation).pending()
+        && control.clock.binding==oldConfirmed.binding&&control.clock.timingVersion==oldConfirmed.timingVersion
+        && control.clock.time==oldConfirmed.time&&control.clock.position==oldConfirmed.position
+        && control.plannedClock.binding!=oldConfirmed.binding
+        && first.position==0&&held.position==0&&first.rate==0&&held.rate==0
+        && engine.playbackTime()==0&&engine.playbackSpeed()==0
+        && held.asOfTimeNs>=first.asOfTimeNs&&!engine.device.blockedWriteTimedOut.load(),
+        "Pending new Bind exposes no Running rate or elapsed position and does not overwrite the confirmed clock before A ACK"))return false;
+    const auto releasedAt=DesktopSceneEngine::Audio::audioMonotonicNow();engine.device.releaseWrite();
+    if(!require(Tests::waitUntil(engine,[&]{return engine.audioEffect(*operation).terminal();})&&Tests::settle(engine)
+        && engine.audioEffect(*operation).phase==Engine::AudioEffectPhase::Applied,
+        "Releasing the real A device boundary allows the queued Bind to apply"))return false;
+    const auto actual=control.clock;
+    const auto receipt=engine.audioEffect(*operation);
+    return require(actual.binding==control.binding&&actual.binding!=oldConfirmed.binding
+        && actual.position==0&&actual.rate==1.25&&actual.time>=releasedAt&&actual.time>admittedAt
+        && actual.time==receipt.effectTimeNs&&engine.playbackTime()>=held.position
+        && readMatchesNativeClock(engine,actual)&&!engine.device.blockedWriteTimedOut.load(),
+        "New anchor starts at the true post-release A effect time, with no admission-elapsed progression or ACK-time rollback");
+}
+
+std::string aviWord(std::uint32_t value)
+{
+    std::string bytes;for(unsigned shift=0;shift<32;shift+=8)bytes.push_back(static_cast<char>((value>>shift)&0xff));return bytes;
+}
+std::string aviChunk(const char* tag,const std::string& payload)
+{
+    std::string bytes{tag,4};bytes+=aviWord(static_cast<std::uint32_t>(payload.size()));bytes+=payload;
+    if(payload.size()%2)bytes.push_back('\0');return bytes;
+}
+struct OwnedSilentAvi
+{
+    std::filesystem::path directory=std::filesystem::temp_directory_path()
+        /("DSE-CP1-SilentVideo-"+std::to_string(DesktopSceneEngine::Audio::audioMonotonicNow()));
+    std::filesystem::path path=directory/"owned-silent.avi";
+    bool owned=false;
+    ~OwnedSilentAvi(){if(owned){std::error_code error;std::filesystem::remove(path,error);std::filesystem::remove(directory,error);}}
+    bool write()
+    {
+        if(!std::filesystem::create_directory(directory))return false;owned=true;
+        constexpr unsigned width=64,height=36,fps=10,frames=30,frameBytes=width*height*3;
+        std::string main;for(const auto value:{100000U,frameBytes*fps,0U,0x10U,frames,0U,1U,frameBytes,width,height,0U,0U,0U,0U})main+=aviWord(value);
+        std::string video{"vidsDIB ",8};for(const auto value:{0U,0U,0U,1U,fps,0U,frames,frameBytes,0xffffffffU,0U})video+=aviWord(value);
+        video+=std::string(4,'\0');video.push_back(static_cast<char>(width));video.push_back('\0');video.push_back(static_cast<char>(height));video.push_back('\0');
+        std::string format;for(const auto value:{40U,width,height,0x00180001U,0U,frameBytes,0U,0U,0U,0U})format+=aviWord(value);
+        const auto header=aviChunk("LIST",std::string{"hdrl",4}+aviChunk("avih",main)
+            +aviChunk("LIST",std::string{"strl",4}+aviChunk("strh",video)+aviChunk("strf",format)));
+        std::string movie{"movi",4},index;
+        for(unsigned frame=0;frame<frames;++frame)
+        {
+            std::string pixels(frameBytes,'\0');for(unsigned pixel=0;pixel<frameBytes;++pixel)pixels[pixel]=static_cast<char>((pixel+frame*7)%256);
+            index+=std::string{"00db",4}+aviWord(0x10)+aviWord(static_cast<std::uint32_t>(movie.size()))+aviWord(frameBytes);
+            movie+=aviChunk("00db",pixels);
+        }
+        const auto bytes=aviChunk("RIFF",std::string{"AVI ",4}+header+aviChunk("LIST",movie)+aviChunk("idx1",index));
+        std::ofstream output{path,std::ios::binary};output.write(bytes.data(),static_cast<std::streamsize>(bytes.size()));return output.good();
+    }
+};
+
+bool testSilentVideoOptionalPreparationAndRate()
+{
+    using Engine=DesktopSceneEngine::Engine;
+    OwnedSilentAvi media;if(!require(media.write(),"Own a real valid single-stream AVI fixture"))return false;
+    {
+        DesktopSceneEngine::Resources::VideoResource video;
+        DesktopSceneEngine::Resources::AudioResource audio;
+        if(!require(video.open(media.path)&&video.frameAt(0)&&!audio.open(media.path),
+            "Owned AVI really decodes video and has no decodable audio stream"))return false;
+    }
+    const EntityId sceneId{std::string{"silent-video-scene"}};
+    const auto project=makeMediaProject(media.path,sceneId,EntityId{std::string{"silent-video-media"}},0);
+    Tests::AwaitAudioEngine engine;engine.initialize();
+    const auto bind=engine.beginAudioEffect(Engine::AudioEffectScope::Structural);
+    if(!require(bind.has_value(),"Silent video Bind admits its optional real audio preparation"))return false;
+    const bool admitted=engine.Engine::bindProject(project,sceneId);(void)engine.finishAudioEffect(*bind,admitted);
+    if(!require(admitted&&Tests::waitUntil(engine,[&]{return engine.audioEffect(*bind).terminal();})&&Tests::settle(engine)
+        && engine.audioEffect(*bind).phase==Engine::AudioEffectPhase::Applied&&!Tests::lane(engine,AudioLane::Embedded),
+        "Optional no-audio preparation leaves the valid visual Bind Applied, not Cancelled or Failed"))return false;
+    auto& control=AudioOutputRecoveryEngineTestAccess::control(engine);
+    if(!require(control.embeddedPath.empty(),"A current silent binding retains no decoder path to retry"))return false;
+    const auto sourceCounter=control.nextSource;
+    const auto rate=engine.beginAudioEffect(Engine::AudioEffectScope::Structural);
+    if(!require(rate.has_value(),"Optional unused reservation was released for a later rate operation"))return false;
+    engine.Engine::setPlaybackSpeed(1.25F);(void)engine.finishAudioEffect(*rate);
+    if(!require(Tests::waitUntil(engine,[&]{return engine.audioEffect(*rate).terminal();})&&Tests::settle(engine)
+        && engine.audioEffect(*rate).phase==Engine::AudioEffectPhase::Applied
+        && engine.playbackSpeed()==1.25F&&engine.playbackClockSample().rate==1.25
+        && control.nextSource==sourceCounter&&control.embeddedPath.empty()&&!Tests::lane(engine,AudioLane::Embedded),
+        "Silent video's1.25x rate physically applies without another doomed P decode or an inherited old path"))return false;
+    return true;
+}
+
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc == 2 && std::string_view{argv[1]} == "--generated")
+        return testZeroDurationSeek() && testSilentVideoOptionalPreparationAndRate() ? 0 : 1;
     const std::filesystem::path resourceRoot{
         DESKTOP_SCENE_ENGINE_TEST_RESOURCES_DIR};
+    if (resourceRoot.empty())
+    {
+        std::cerr << "External seek media unavailable; use --generated for the public cases.\n";
+        return 77;
+    }
     const auto images = filesWithExtensions(
         resourceRoot / "Images", {".jpg", ".jpeg", ".png"});
     const auto videos = filesWithExtensions(
@@ -636,5 +782,8 @@ int main()
     return testImageSeek(images.front())
             && testZeroDurationSeek()
             && testVideoSeek(videos.front())
+            && testRejectedEmbeddedSeekDoesNotCreateTimingAuthority(videos.front())
+            && testBindingClockWaitsForActualAudioEffect(images.front())
+            && testSilentVideoOptionalPreparationAndRate()
         ? 0 : 1;
 }

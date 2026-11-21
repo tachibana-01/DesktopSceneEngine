@@ -51,6 +51,23 @@ namespace
         : MusicSourceFailureClass::UnplayableTrack;
 }
 
+[[nodiscard]] BackgroundMusicObservation::FailureCode sourceFailureCode(Resources::AudioSourceStatus status) noexcept
+{
+    using Code = BackgroundMusicObservation::FailureCode;
+    switch (status)
+    {
+    case Resources::AudioSourceStatus::OpenFailure: return Code::OpenFailure;
+    case Resources::AudioSourceStatus::NoAudioStream: return Code::NoAudioStream;
+    case Resources::AudioSourceStatus::DecoderUnavailable: return Code::DecoderUnavailable;
+    case Resources::AudioSourceStatus::DecodeFailure: return Code::DecodeFailure;
+    case Resources::AudioSourceStatus::ResampleFailure: return Code::ResampleFailure;
+    case Resources::AudioSourceStatus::ResourceFailure: return Code::ResourceFailure;
+    case Resources::AudioSourceStatus::NotOpened:
+    case Resources::AudioSourceStatus::Ready: return Code::Unknown;
+    }
+    return Code::Unknown;
+}
+
 }
 
 BackgroundMusicExecutor::BackgroundMusicExecutor(Audio::AudioMixer& mixer) noexcept
@@ -139,7 +156,9 @@ std::vector<MusicRuntimeEvent> BackgroundMusicExecutor::collectTerminalEvents()
         case Audio::AudioInputState::Failed:
             events.emplace_back(MusicSourceFailed{
                 source.token,
-                MusicSourceFailureClass::UnplayableTrack});
+                MusicSourceFailureClass::UnplayableTrack,
+                BackgroundMusicObservation::FailureStage::Playback,
+                BackgroundMusicObservation::FailureCode::InputFailed});
             break;
 
         case Audio::AudioInputState::Active:
@@ -173,14 +192,18 @@ std::optional<MusicRuntimeEvent> BackgroundMusicExecutor::executeAction(
     }
     catch (const std::bad_alloc&)
     {
-        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure};
+        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure,
+            BackgroundMusicObservation::FailureStage::ResourceAllocation,
+            BackgroundMusicObservation::FailureCode::AllocationFailure};
     }
 
     if (!source->open(action.sourcePath))
     {
         return MusicSourceFailed{
             action.token,
-            classifySourceOpenFailure(source->status())};
+            classifySourceOpenFailure(source->status()),
+            BackgroundMusicObservation::FailureStage::SourceOpen,
+            sourceFailureCode(source->status())};
     }
 
     std::unique_ptr<SequentialAudioMixerInput> input{};
@@ -190,7 +213,9 @@ std::optional<MusicRuntimeEvent> BackgroundMusicExecutor::executeAction(
     }
     catch (const std::bad_alloc&)
     {
-        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure};
+        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure,
+            BackgroundMusicObservation::FailureStage::ResourceAllocation,
+            BackgroundMusicObservation::FailureCode::AllocationFailure};
     }
 
     try
@@ -199,11 +224,15 @@ std::optional<MusicRuntimeEvent> BackgroundMusicExecutor::executeAction(
     }
     catch (const std::bad_alloc&)
     {
-        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure};
+        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure,
+            BackgroundMusicObservation::FailureStage::ResourceAllocation,
+            BackgroundMusicObservation::FailureCode::AllocationFailure};
     }
     catch (const std::length_error&)
     {
-        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure};
+        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure,
+            BackgroundMusicObservation::FailureStage::ResourceAllocation,
+            BackgroundMusicObservation::FailureCode::ResourceFailure};
     }
 
     const Audio::AudioInputHandle handle = registrar_(
@@ -213,7 +242,9 @@ std::optional<MusicRuntimeEvent> BackgroundMusicExecutor::executeAction(
     if (!handle)
     {
         activeSources_.pop_back();
-        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure};
+        return MusicSourceFailed{action.token, MusicSourceFailureClass::TransientResourceFailure,
+            BackgroundMusicObservation::FailureStage::MixerRegistration,
+            BackgroundMusicObservation::FailureCode::RegistrationFailure};
     }
 
     activeSources_.back().mixerHandle = handle;

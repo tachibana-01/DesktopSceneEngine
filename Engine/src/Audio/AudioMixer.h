@@ -59,6 +59,13 @@ public:
         float gain = 1.0F
     ) noexcept;
 
+    // Called on the sole mixer owner before deadline servicing starts.
+    // Production uses borrowed, fixed-lifetime endpoints and a fixed capacity.
+    [[nodiscard]] bool prepareDeadlineMode(std::size_t maximumInputs,
+        std::size_t maximumFrames) noexcept;
+    [[nodiscard]] AudioInputHandle addBorrowedInput(AudioMixerInput& input,
+        float gain = 1.0F) noexcept;
+
     [[nodiscard]] bool removeInput(AudioInputHandle handle) noexcept;
 
     [[nodiscard]] bool setInputGain(AudioInputHandle handle, float gain) noexcept;
@@ -77,6 +84,7 @@ private:
     {
         AudioInputHandle handle{};
         std::unique_ptr<AudioMixerInput> input{};
+        AudioMixerInput* borrowedInput = nullptr;
         float gain = 1.0F;
         AudioInputState state = AudioInputState::Active;
         bool terminalNotificationPending = false;
@@ -89,6 +97,8 @@ private:
     std::vector<InputSlot> inputs_{};
     std::vector<float> scratch_{};
     std::uint64_t nextHandleValue_ = 1U;
+    std::size_t deadlineMaximumInputs_ = 0U;
+    std::size_t deadlineMaximumFrames_ = 0U;
 };
 
 }

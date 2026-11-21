@@ -1,28 +1,14 @@
 #pragma once
 
 #include <DesktopSceneEngine/PresentationTarget.h>
+#include <DesktopSceneEngine/Presentation/PresentationGeometry.h>
 
 #include <optional>
 
 namespace DesktopSceneEngine::Rendering
 {
 
-struct NormalizedRectangle
-{
-    float x = 0.0F;
-    float y = 0.0F;
-    float width = 1.0F;
-    float height = 1.0F;
-};
-
-// Immutable, non-owning presentation state for one render call.
-// sourceUv addresses the media texture; destination is normalized authored
-// Canvas geometry, independent of the native presentation target.
-struct RenderPresentation
-{
-    NormalizedRectangle sourceUv{};
-    NormalizedRectangle destination{};
-};
+using RenderPresentation = Presentation::ResolvedPresentationGeometry;
 
 // Internal render input boundary. It intentionally carries no domain or GPU state.
 struct RenderData

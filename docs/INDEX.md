@@ -49,6 +49,9 @@ docs/
 ├── 03_DEVELOPMENT_GUIDE.md
 ├── 04_JSON_SPECIFICATION.md
 ├── 05_ROADMAP.md
+├── 06_AUTHORED_PROJECT_JSON_V2.md
+├── 07_LEGACY_V1_IMPORT.md
+├── 08_PROJECT_FILE_IO.md
 └── ADR/
 ```
 
@@ -157,7 +160,7 @@ Independent of implementation.
 
 ## 04_JSON_SPECIFICATION.md
 
-Defines how the data model is serialized into JSON.
+Defines serialization, versioning and validation for the frozen legacy v1.0 project format.
 
 Topics include:
 
@@ -167,6 +170,9 @@ Topics include:
 - Validation
 
 Does not define business concepts.
+
+For current projects, read [Authored Project JSON v2](06_AUTHORED_PROJECT_JSON_V2.md),
+[Legacy v1 Import](07_LEGACY_V1_IMPORT.md), and [Project File I/O](08_PROJECT_FILE_IO.md).
 
 ---
 
